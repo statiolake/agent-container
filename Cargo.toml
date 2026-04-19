@@ -20,6 +20,7 @@ rustix = { version = "0.38", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "fs", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-appender = "0.2"

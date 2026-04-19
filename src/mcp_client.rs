@@ -132,10 +132,11 @@ pub async fn fetch_tools_stdio(server: &StdioMcpServer) -> Result<Vec<Tool>> {
         }
     });
     let init_bytes = serde_json::to_vec(&init)?;
-    let init_resp = handle.call(init_bytes).await?;
-    if !init_resp.is_empty() {
-        let parsed: Value = serde_json::from_slice(&init_resp)
-            .context("initialize response was not valid JSON")?;
+    let init_outcome = handle.submit_post(init_bytes).await?;
+    if let Some(rx) = init_outcome.response {
+        let parsed = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("stdio worker dropped initialize response"))?;
         ensure_no_error(&parsed, "initialize")?;
     }
 
@@ -143,17 +144,21 @@ pub async fn fetch_tools_stdio(server: &StdioMcpServer) -> Result<Vec<Tool>> {
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
     });
-    // Fire-and-forget; worker returns empty for notifications.
-    let _ = handle.call(serde_json::to_vec(&initialized)?).await;
+    // Fire-and-forget; notifications have no response.
+    let _ = handle.submit_post(serde_json::to_vec(&initialized)?).await;
 
     let list_req = json!({
         "jsonrpc": "2.0",
         "id": next_id(),
         "method": "tools/list"
     });
-    let list_bytes = handle.call(serde_json::to_vec(&list_req)?).await?;
-    let parsed: Value =
-        serde_json::from_slice(&list_bytes).context("tools/list response was not valid JSON")?;
+    let list_outcome = handle.submit_post(serde_json::to_vec(&list_req)?).await?;
+    let rx = list_outcome
+        .response
+        .ok_or_else(|| anyhow::anyhow!("tools/list did not register a response waiter"))?;
+    let parsed = rx
+        .await
+        .map_err(|_| anyhow::anyhow!("stdio worker dropped tools/list response"))?;
     ensure_no_error(&parsed, "tools/list")?;
     let tools = parsed
         .get("result")
@@ -162,6 +167,7 @@ pub async fn fetch_tools_stdio(server: &StdioMcpServer) -> Result<Vec<Tool>> {
         .ok_or_else(|| anyhow::anyhow!("tools/list response missing result.tools"))?;
     let tools: Vec<Tool> =
         serde_json::from_value(tools).context("tools/list response has unexpected shape")?;
+    drop(handle);
     Ok(tools)
 }
 

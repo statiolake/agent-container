@@ -1,63 +1,105 @@
-//! Bridge stdio-transport MCP servers over HTTP so the container can
-//! address them the same way it addresses HTTP MCP servers.
+//! Bridge stdio-transport MCP servers over MCP Streamable-HTTP.
 //!
-//! For each stdio server declared on the host, we spawn the subprocess
-//! once and keep it alive for the lifetime of the broker. An mpsc channel
-//! queues one request at a time; the worker writes the JSON-RPC payload
-//! to the child's stdin (LF-framed per the MCP spec) and reads the next
-//! response line from stdout. Server-initiated notifications (messages
-//! without an `id`) are logged and skipped so they don't desynchronise
-//! the request/response pairing — routing them back to the HTTP client
-//! would require a streaming response and is out of scope for this first
-//! pass.
+//! A single per-server subprocess runs for the lifetime of the broker.
+//! Three background tasks manage it:
+//!
+//! - **writer**: drains a shared mpsc and writes each payload to the
+//!   child's stdin (LF-framed, re-serialised compact so embedded newlines
+//!   in pretty-printed bodies never desynchronise the stream).
+//! - **reader**: continuously reads stdout lines, classifies each line
+//!   as either a *response* (carries `id`, no `method`) or a
+//!   *server-initiated message* (carries `method`). Responses are routed
+//!   to the waiting oneshot by id; server-initiated messages are
+//!   broadcast to every open `GET` subscriber.
+//! - **stderr drain**: pipes stderr into tracing so the child can't
+//!   deadlock on an unread error pipe.
+//!
+//! From HTTP side, `POST /mcp/<name>` uses `submit_post` which buffers a
+//! client request, writes it to stdin, and hands back either the matching
+//! response (for requests) or nothing (for notifications / responses to
+//! a server-initiated request). `GET /mcp/<name>` uses `subscribe` which
+//! returns a broadcast receiver that yields every server-initiated
+//! JSON-RPC message in order; the broker wraps that receiver into an
+//! SSE response.
 
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::mcp::StdioMcpServer;
 
-/// Thin handle posted into the broker's router. Clones share one worker.
+/// Handle shared by every HTTP request targeting a given stdio MCP server.
 #[derive(Clone)]
 pub struct StdioHandle {
-    tx: mpsc::Sender<Call>,
+    writer: mpsc::UnboundedSender<Vec<u8>>,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+    server_broadcast: broadcast::Sender<Value>,
+}
+
+pub struct PostOutcome {
+    /// `None` means the caller's body was a notification or a reply to a
+    /// server-initiated request; the HTTP side should answer 202 Accepted.
+    /// `Some(rx)` will resolve with the JSON-RPC response whose id matches
+    /// the caller's request.
+    pub response: Option<oneshot::Receiver<Value>>,
 }
 
 impl StdioHandle {
-    /// Send a JSON-RPC request (or notification) to the stdio server and
-    /// await the matching response line. Notifications resolve with an
-    /// empty body — HTTP 204-equivalent.
-    pub async fn call(&self, body: Vec<u8>) -> Result<Vec<u8>> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(Call {
-                body,
-                response: resp_tx,
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("stdio MCP worker has stopped"))?;
-        resp_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("stdio MCP worker dropped response channel"))?
+    /// Submit a client-originated JSON-RPC payload. Returns a handle that
+    /// the HTTP side awaits for the response, if one is expected.
+    pub async fn submit_post(&self, body: Vec<u8>) -> Result<PostOutcome> {
+        let parsed: Value = serde_json::from_slice(&body).context("request is not valid JSON")?;
+        let compact = serde_json::to_vec(&parsed).context("re-serialising request")?;
+
+        let has_method = parsed.get("method").is_some();
+        let id = parsed.get("id").cloned();
+
+        let response = if has_method {
+            // Client → server request: register a waiter keyed by id.
+            if let Some(id_value) = id {
+                let key = id_key(&id_value);
+                let (tx, rx) = oneshot::channel();
+                self.pending.lock().await.insert(key, tx);
+                Some(rx)
+            } else {
+                // Client → server notification (no id): nothing to wait on.
+                None
+            }
+        } else {
+            // Client → server response (has id but no method): the stdio
+            // server is consuming it; we have nothing to return.
+            None
+        };
+
+        tracing::debug!(
+            request = %String::from_utf8_lossy(&compact),
+            "→ stdin (client POST)",
+        );
+        self.writer
+            .send(compact)
+            .map_err(|_| anyhow::anyhow!("stdio writer has stopped"))?;
+
+        Ok(PostOutcome { response })
+    }
+
+    /// Subscribe to server-initiated messages. Used to back a `GET`
+    /// SSE stream: every `Ok(Value)` yielded should be wrapped as
+    /// `data: <json>\n\n` on the wire.
+    pub fn subscribe(&self) -> broadcast::Receiver<Value> {
+        self.server_broadcast.subscribe()
     }
 }
 
-struct Call {
-    body: Vec<u8>,
-    response: oneshot::Sender<Result<Vec<u8>>>,
-}
-
-/// Spawn a worker task for a stdio server. The child process starts
-/// eagerly here so any misconfiguration (missing binary, wrong args)
-/// surfaces at broker startup rather than on the first request.
+/// Spawn the subprocess and its attendant reader/writer tasks. Failures
+/// here surface immediately so misconfigured servers don't cause late
+/// mysterious hangs.
 pub fn spawn_worker(spec: StdioMcpServer) -> Result<StdioHandle> {
-    let (tx, rx) = mpsc::channel::<Call>(16);
-
     let mut cmd = Command::new(&spec.command);
     cmd.args(&spec.args)
         .envs(spec.env.iter())
@@ -70,18 +112,37 @@ pub fn spawn_worker(spec: StdioMcpServer) -> Result<StdioHandle> {
         .spawn()
         .with_context(|| format!("failed to spawn stdio MCP server '{}'", spec.name))?;
 
-    let stdin = child
-        .stdin
-        .take()
-        .context("child has no stdin")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("child has no stdout")?;
+    let stdin = child.stdin.take().context("child has no stdin")?;
+    let stdout = child.stdout.take().context("child has no stdout")?;
     let stderr = child.stderr.take();
 
-    // Drain stderr into tracing so a misbehaving server surfaces warnings
-    // instead of filling up an unread pipe and deadlocking the child.
+    // Shared state.
+    let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let (server_broadcast, _) = broadcast::channel::<Value>(128);
+    let (writer_tx, writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    // Keep a handle to the child so we can reap it on shutdown.
+    let child = Arc::new(Mutex::new(Some(child)));
+
+    // Writer task.
+    let writer_child = child.clone();
+    tokio::spawn(writer_loop(
+        stdin,
+        writer_rx,
+        spec.name.clone(),
+        writer_child,
+    ));
+
+    // Reader task.
+    tokio::spawn(reader_loop(
+        stdout,
+        pending.clone(),
+        server_broadcast.clone(),
+        spec.name.clone(),
+    ));
+
+    // Stderr drain.
     if let Some(stderr) = stderr {
         let server_name = spec.name.clone();
         tokio::spawn(async move {
@@ -92,152 +153,106 @@ pub fn spawn_worker(spec: StdioMcpServer) -> Result<StdioHandle> {
         });
     }
 
-    let name = spec.name.clone();
-    tokio::spawn(async move {
-        let stdin = Arc::new(Mutex::new(stdin));
-        let mut stdout_lines = BufReader::new(stdout).lines();
-        if let Err(e) = run(rx, stdin, &mut stdout_lines, &name).await {
-            tracing::error!(mcp = %name, error = %e, "stdio MCP worker terminating");
+    Ok(StdioHandle {
+        writer: writer_tx,
+        pending,
+        server_broadcast,
+    })
+}
+
+async fn writer_loop(
+    mut stdin: tokio::process::ChildStdin,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    server_name: String,
+    child: Arc<Mutex<Option<tokio::process::Child>>>,
+) {
+    while let Some(bytes) = rx.recv().await {
+        if let Err(e) = stdin.write_all(&bytes).await {
+            tracing::error!(mcp = %server_name, error = %e, "stdin write failed");
+            break;
         }
-        // Reaping the child guarantees we don't leak zombies.
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    });
-
-    Ok(StdioHandle { tx })
+        if let Err(e) = stdin.write_all(b"\n").await {
+            tracing::error!(mcp = %server_name, error = %e, "stdin write failed");
+            break;
+        }
+        if let Err(e) = stdin.flush().await {
+            tracing::debug!(mcp = %server_name, error = %e, "stdin flush failed");
+        }
+    }
+    // Reap the child when the writer drains (which means the handle was
+    // dropped everywhere).
+    if let Some(mut c) = child.lock().await.take() {
+        let _ = c.kill().await;
+        let _ = c.wait().await;
+    }
 }
 
-async fn run(
-    mut rx: mpsc::Receiver<Call>,
-    stdin: Arc<Mutex<tokio::process::ChildStdin>>,
-    stdout_lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    server_name: &str,
-) -> Result<()> {
-    while let Some(call) = rx.recv().await {
-        let outcome = handle_one(&call.body, &stdin, stdout_lines, server_name).await;
-        let _ = call.response.send(outcome);
-    }
-    Ok(())
-}
-
-async fn handle_one(
-    body: &[u8],
-    stdin: &Arc<Mutex<tokio::process::ChildStdin>>,
-    stdout_lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    server_name: &str,
-) -> Result<Vec<u8>> {
-    // Flatten the body to a single line — MCP stdio framing is LF-delimited
-    // JSON, so any embedded newline in a pretty-printed request would
-    // desynchronise the server. serde_json re-serialises compact on round-
-    // trip, which is the standard way to normalise.
-    let parsed: Value = serde_json::from_slice(body).context("request is not valid JSON")?;
-    let compact = serde_json::to_vec(&parsed).context("re-serialising request")?;
-    tracing::debug!(
-        mcp = %server_name,
-        request = %String::from_utf8_lossy(&compact),
-        "→ stdin",
-    );
-    write_line(stdin, &compact).await?;
-
-    // Notifications (no `id`) get no response — tell the caller immediately
-    // so the HTTP handler can return 204-equivalent.
-    if parsed.get("id").is_none() {
-        return Ok(Vec::new());
-    }
-
+async fn reader_loop(
+    stdout: tokio::process::ChildStdout,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+    server_broadcast: broadcast::Sender<Value>,
+    server_name: String,
+) {
+    let mut lines = BufReader::new(stdout).lines();
     loop {
-        let Some(line) = stdout_lines
-            .next_line()
-            .await
-            .context("reading MCP stdout line")?
-        else {
-            bail!("stdio MCP '{server_name}' closed its stdout");
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                tracing::warn!(mcp = %server_name, "stdio MCP closed its stdout");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(mcp = %server_name, error = %e, "reading stdio stdout failed");
+                return;
+            }
         };
         if line.is_empty() {
             continue;
         }
-
-        let parsed_line = serde_json::from_str::<Value>(&line).ok();
-
-        // Anything with a `method` field is a server→client request or
-        // notification. Those are NOT the response we're waiting for; drop
-        // them from the response pipeline and, when they are requests
-        // (i.e. they carry an id), auto-reply so the server doesn't stall
-        // waiting for something we have no way to surface back through
-        // the HTTP bridge.
-        if let Some(v) = &parsed_line {
-            if let Some(method) = v.get("method").and_then(Value::as_str) {
-                let id = v.get("id").cloned();
-                tracing::debug!(
-                    mcp = %server_name,
-                    method = %method,
-                    has_id = id.is_some(),
-                    raw = %line,
-                    "stdio MCP server-initiated message; handling locally",
-                );
-                if let Some(id) = id {
-                    let reply = synthesise_server_reply(method, id);
-                    let bytes = serde_json::to_vec(&reply)?;
-                    tracing::debug!(
-                        mcp = %server_name,
-                        method = %method,
-                        response = %String::from_utf8_lossy(&bytes),
-                        "→ stdin (auto-reply to server request)",
-                    );
-                    write_line(stdin, &bytes).await?;
-                }
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(mcp = %server_name, line = %line, error = %e, "non-JSON line on stdout");
                 continue;
             }
+        };
+
+        if value.get("method").is_some() {
+            // Server-initiated request or notification → broadcast.
+            tracing::debug!(
+                mcp = %server_name,
+                message = %line,
+                "← stdout (server-initiated)",
+            );
+            let _ = server_broadcast.send(value);
+            continue;
         }
 
-        tracing::debug!(
-            mcp = %server_name,
-            response = %String::from_utf8_lossy(line.as_bytes()),
-            "← stdout",
-        );
-        return Ok(line.into_bytes());
+        if let Some(id) = value.get("id") {
+            tracing::debug!(
+                mcp = %server_name,
+                response = %line,
+                "← stdout (response)",
+            );
+            let key = id_key(id);
+            let mut guard = pending.lock().await;
+            if let Some(tx) = guard.remove(&key) {
+                let _ = tx.send(value);
+            } else {
+                tracing::warn!(
+                    mcp = %server_name,
+                    id = %key,
+                    "response for unknown id — dropping",
+                );
+            }
+        } else {
+            tracing::warn!(mcp = %server_name, line = %line, "stdout line with neither method nor id");
+        }
     }
 }
 
-async fn write_line(
-    stdin: &Arc<Mutex<tokio::process::ChildStdin>>,
-    bytes: &[u8],
-) -> Result<()> {
-    let mut stdin = stdin.lock().await;
-    stdin.write_all(bytes).await.context("write to MCP stdin")?;
-    stdin
-        .write_all(b"\n")
-        .await
-        .context("write newline to MCP stdin")?;
-    stdin.flush().await.ok();
-    Ok(())
-}
-
-/// Build a canned JSON-RPC reply for server-initiated requests the broker
-/// cannot round-trip to the real client. For `roots/list` we know the
-/// container's workspace layout and can serve an accurate answer locally;
-/// anything else turns into a `-32601 method not found` error so the
-/// server proceeds gracefully instead of waiting for a reply.
-fn synthesise_server_reply(method: &str, id: Value) -> Value {
-    match method {
-        "roots/list" => serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "roots": [
-                    {"uri": "file:///workspace", "name": "workspace"}
-                ]
-            }
-        }),
-        _ => serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {
-                "code": -32601,
-                "message": format!(
-                    "agent-container does not forward server-initiated MCP request '{method}' to the client"
-                )
-            }
-        }),
-    }
+fn id_key(v: &Value) -> String {
+    // JSON-RPC ids are either numbers or strings; the canonical JSON
+    // repr is unambiguous for either case and works as a HashMap key.
+    serde_json::to_string(v).unwrap_or_default()
 }

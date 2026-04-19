@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -315,24 +315,30 @@ async fn forward_stdio(
         _ => bail!("internal: expected stdio backend for '{server_name}'"),
     };
 
-    // stdio MCP servers only understand JSON-RPC requests; they have no
-    // notion of the optional streamable-HTTP GET channel. Returning 405
-    // matches the spec's guidance for servers that do not support
-    // server-initiated streaming, and prevents Claude Code's MCP client
-    // from hanging on a connection that would never receive events.
     let method = req.method().clone();
-    if method != axum::http::Method::POST {
-        tracing::debug!(
-            server = %server_name,
-            method = %method,
-            "non-POST request to stdio MCP endpoint; responding 405",
-        );
-        return Ok(Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .header(axum::http::header::ALLOW, "POST")
-            .body(Body::from("stdio MCP backend only accepts POST"))?);
+    match method.as_str() {
+        "POST" => forward_stdio_post(state, server_name, handle, req).await,
+        "GET" => forward_stdio_get(server_name, handle).await,
+        _ => {
+            tracing::debug!(
+                server = %server_name,
+                method = %method,
+                "unsupported method on stdio MCP endpoint; responding 405",
+            );
+            Ok(Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header(axum::http::header::ALLOW, "GET, POST")
+                .body(Body::from("stdio MCP backend accepts GET or POST"))?)
+        }
     }
+}
 
+async fn forward_stdio_post(
+    state: Arc<BrokerState>,
+    server_name: &str,
+    handle: StdioHandle,
+    req: Request,
+) -> Result<Response> {
     let (_parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX)
         .await
@@ -347,25 +353,31 @@ async fn forward_stdio(
         server = %server_name,
         method = parse_method(&body_bytes).as_deref().unwrap_or("<unparsed>"),
         body_len = body_bytes.len(),
-        "forwarding to stdio MCP",
+        "forwarding POST to stdio MCP",
     );
-    let response_bytes = handle
-        .call(body_bytes.to_vec())
+
+    let outcome = handle
+        .submit_post(body_bytes.to_vec())
         .await
-        .context("stdio MCP call failed")?;
+        .context("stdio MCP submit failed")?;
+
+    // Notifications / responses to server-initiated requests: nothing to
+    // wait on, confirm receipt to the HTTP caller.
+    let Some(response_rx) = outcome.response else {
+        return Ok(Response::builder()
+            .status(StatusCode::ACCEPTED)
+            .body(Body::empty())?);
+    };
+
+    let response_value = response_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("stdio MCP dropped the response channel before answering"))?;
+    let response_bytes = serde_json::to_vec(&response_value)?;
     tracing::debug!(
         server = %server_name,
         bytes = response_bytes.len(),
         "stdio MCP response ready",
     );
-
-    // Notifications come back empty — respond with 204 so the Claude Code
-    // MCP client does not try to parse an empty body as JSON.
-    if response_bytes.is_empty() {
-        return Ok(Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(Body::empty())?);
-    }
 
     let body_bytes = if is_tools_list {
         match filter_tools_list_body(
@@ -390,6 +402,46 @@ async fn forward_stdio(
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .body(Body::from(body_bytes))?)
+}
+
+async fn forward_stdio_get(server_name: &str, handle: StdioHandle) -> Result<Response> {
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    tracing::debug!(
+        server = %server_name,
+        "opening SSE channel for server-initiated messages",
+    );
+
+    let rx = handle.subscribe();
+    let sn = server_name.to_string();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| match item {
+        Ok(value) => {
+            tracing::debug!(
+                server = %sn,
+                message = %serde_json::to_string(&value).unwrap_or_default(),
+                "→ SSE (server → client)",
+            );
+            let payload = serde_json::to_string(&value).unwrap_or_default();
+            let frame = format!("data: {payload}\n\n");
+            Some(Ok::<_, std::io::Error>(Bytes::from(frame)))
+        }
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+            tracing::warn!(
+                server = %sn,
+                skipped = n,
+                "SSE subscriber lagged; some server-initiated messages were dropped",
+            );
+            None
+        }
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(stream))?)
 }
 
 /// Run the tool-call allowlist gate. Returns a pre-built JSON-RPC error
