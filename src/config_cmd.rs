@@ -4,8 +4,11 @@
 use anyhow::{Context, Result};
 use inquire::MultiSelect;
 
+use std::sync::Arc;
+
 use crate::mcp::HttpMcpServer;
 use crate::mcp_client::{Tool, fetch_tools};
+use crate::oauth::{OAuthStore, load_from_keychain};
 use crate::paths::HostPaths;
 use crate::policy::{McpPolicy, config_path};
 
@@ -21,10 +24,14 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
+    let oauth = Arc::new(OAuthStore::new(
+        load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
+    ));
+
     let mut policy = McpPolicy::load().context("failed to load existing MCP allowlist")?;
 
     for server in &servers {
-        configure_server(server, &mut policy).await?;
+        configure_server(server, &mut policy, &oauth).await?;
     }
 
     let path = policy.save().context("failed to save MCP allowlist")?;
@@ -36,13 +43,28 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn configure_server(server: &HttpMcpServer, policy: &mut McpPolicy) -> Result<()> {
+async fn configure_server(
+    server: &HttpMcpServer,
+    policy: &mut McpPolicy,
+    oauth: &OAuthStore,
+) -> Result<()> {
     println!();
     println!("── {} ──", server.name);
     println!("   upstream: {}", server.url);
 
+    let bearer = match oauth.access_token(&server.name).await {
+        Ok(tok) => tok,
+        Err(e) => {
+            eprintln!(
+                "   ✗ OAuth refresh for '{}' failed: {e:#}\n     skipping; existing policy kept intact.",
+                server.name
+            );
+            return Ok(());
+        }
+    };
+
     println!("   fetching tools/list from upstream...");
-    let tools = match fetch_tools(server).await {
+    let tools = match fetch_tools(server, bearer.as_deref()).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!(

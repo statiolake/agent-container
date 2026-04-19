@@ -49,7 +49,10 @@ impl Tool {
     }
 }
 
-pub async fn fetch_tools(server: &HttpMcpServer) -> Result<Vec<Tool>> {
+pub async fn fetch_tools(
+    server: &HttpMcpServer,
+    bearer: Option<&str>,
+) -> Result<Vec<Tool>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -70,7 +73,7 @@ pub async fn fetch_tools(server: &HttpMcpServer) -> Result<Vec<Tool>> {
             },
         }
     });
-    let init_resp = post(&client, server, &init_req, session_id.as_deref()).await?;
+    let init_resp = post(&client, server, &init_req, session_id.as_deref(), bearer).await?;
     if let Some(v) = init_resp.headers.get("mcp-session-id") {
         session_id = Some(v.clone());
     }
@@ -82,14 +85,21 @@ pub async fn fetch_tools(server: &HttpMcpServer) -> Result<Vec<Tool>> {
     });
     // Notifications have no response body, but some servers still answer
     // with 200 + empty body; fire-and-forget is fine.
-    let _ = post(&client, server, &initialized, session_id.as_deref()).await;
+    let _ = post(
+        &client,
+        server,
+        &initialized,
+        session_id.as_deref(),
+        bearer,
+    )
+    .await;
 
     let list_req = json!({
         "jsonrpc": "2.0",
         "id": next_id(),
         "method": "tools/list"
     });
-    let list_resp = post(&client, server, &list_req, session_id.as_deref()).await?;
+    let list_resp = post(&client, server, &list_req, session_id.as_deref(), bearer).await?;
     ensure_no_error(&list_resp.body, "tools/list")?;
     let tools = list_resp
         .body
@@ -112,6 +122,7 @@ async fn post(
     server: &HttpMcpServer,
     payload: &Value,
     session_id: Option<&str>,
+    bearer: Option<&str>,
 ) -> Result<RpcResponse> {
     let mut req = client
         .post(&server.url)
@@ -119,6 +130,9 @@ async fn post(
         .json(payload);
     for (k, v) in &server.headers {
         req = req.header(k, v);
+    }
+    if let Some(token) = bearer {
+        req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
     }
     if let Some(id) = session_id {
         req = req.header("mcp-session-id", id);

@@ -31,6 +31,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::aws::{BedrockCredentials, BedrockSetup, resolve_credentials};
 use crate::mcp::HttpMcpServer;
+use crate::oauth::OAuthStore;
 use crate::policy::McpPolicy;
 
 struct BrokerState {
@@ -39,6 +40,7 @@ struct BrokerState {
     mcp: HashMap<String, HttpMcpServer>,
     policy: RwLock<McpPolicy>,
     annotations: Mutex<HashMap<String, HashMap<String, Option<bool>>>>,
+    oauth: Arc<OAuthStore>,
     http_client: reqwest::Client,
 }
 
@@ -51,6 +53,7 @@ pub async fn spawn(
     bedrock: Option<(BedrockSetup, Option<String>)>,
     mcp_servers: Vec<HttpMcpServer>,
     policy: McpPolicy,
+    oauth: Arc<OAuthStore>,
 ) -> Result<RunningServer> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -73,6 +76,7 @@ pub async fn spawn(
         mcp,
         policy: RwLock::new(policy),
         annotations: Mutex::new(HashMap::new()),
+        oauth,
         http_client,
     });
 
@@ -169,6 +173,18 @@ async fn forward_inner(
     let mut headers = reqwest::header::HeaderMap::new();
     copy_request_headers(&parts.headers, &mut headers);
     apply_server_auth(&server.headers, &mut headers)?;
+    if let Some(token) = state
+        .oauth
+        .access_token(server_name)
+        .await
+        .with_context(|| format!("refreshing OAuth token for '{server_name}'"))?
+    {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .context("building OAuth Bearer header")?,
+        );
+    }
 
     let body_bytes = axum::body::to_bytes(body, usize::MAX)
         .await

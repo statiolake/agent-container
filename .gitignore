@@ -1,2 +1,6 @@
 /target
 /.claude/settings.local.json
+/diag-mcp-auth.sh
+/diag-mcp-auth.out
+/diag-mcp-oauth.sh
+/diag-mcp-oauth.out

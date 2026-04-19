@@ -46,6 +46,9 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
         .context("failed to load MCP servers from ~/.claude.json")?;
     let policy = policy::McpPolicy::load()
         .context("failed to load MCP allowlist policy; fix or remove ~/.config/agent-container/mcp.toml")?;
+    let oauth = std::sync::Arc::new(oauth::OAuthStore::new(
+        oauth::load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
+    ));
 
     if let Some(setup) = &bedrock {
         eprintln!(
@@ -94,6 +97,7 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
         bedrock.clone().map(|b| (b, refresh.clone())),
         mcp_servers.clone(),
         policy,
+        oauth.clone(),
     )
     .await?;
     tracing::info!(addr = %broker.addr, "host broker listening");

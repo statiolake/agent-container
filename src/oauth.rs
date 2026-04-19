@@ -8,15 +8,21 @@
 //! and exposes it per-server so the broker and the TUI can inject a
 //! fresh `Authorization: Bearer <access_token>` before forwarding.
 //!
-//! Refreshing is handled via `refresh_and_persist` (see
-//! `refresh_and_persist::perform`) once we need it; loading alone does
-//! not touch the network.
+//! A shared `OAuthStore` owns the live entries behind per-server
+//! tokio mutexes. `access_token()` hands back a valid bearer, refreshing
+//! via `grant_type=refresh_token` when the cached copy is within 30s of
+//! its expiry. Refreshed tokens stay in memory — we never write back to
+//! the Keychain so Claude Code's own bookkeeping keeps owning the
+//! canonical copy.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct McpOAuthEntry {
@@ -159,6 +165,140 @@ fn parse_entry(keychain_key: &str, value: &Value) -> Result<McpOAuthEntry> {
             .and_then(|d| d.authorization_server_url),
         scope: raw.scope,
     })
+}
+
+/// Live-refresh wrapper over the Keychain snapshot.
+pub struct OAuthStore {
+    entries: HashMap<String, Arc<Mutex<McpOAuthEntry>>>,
+    http: reqwest::Client,
+}
+
+impl OAuthStore {
+    pub fn new(entries: HashMap<String, McpOAuthEntry>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("build reqwest client");
+        let entries = entries
+            .into_iter()
+            .map(|(k, v)| (k, Arc::new(Mutex::new(v))))
+            .collect();
+        Self { entries, http }
+    }
+
+    pub fn server_names(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
+    /// Return a currently-valid access token for an MCP server, refreshing
+    /// silently when it's about to expire. `Ok(None)` means the server
+    /// has no OAuth record and the caller should fall back to static
+    /// headers from `.claude.json`.
+    pub async fn access_token(&self, server: &str) -> Result<Option<String>> {
+        let Some(slot) = self.entries.get(server) else {
+            return Ok(None);
+        };
+        let mut guard = slot.lock().await;
+        if guard.is_expiring_soon() {
+            refresh_entry(&mut guard, &self.http)
+                .await
+                .with_context(|| format!("failed to refresh OAuth token for '{server}'"))?;
+        }
+        Ok(Some(guard.access_token.clone()))
+    }
+}
+
+async fn refresh_entry(
+    entry: &mut McpOAuthEntry,
+    http: &reqwest::Client,
+) -> Result<()> {
+    let refresh_token = entry
+        .refresh_token
+        .clone()
+        .context("entry has no refresh_token; re-run Claude Code's OAuth flow")?;
+    let as_url = entry
+        .authorization_server_url
+        .clone()
+        .context("entry has no authorizationServerUrl")?;
+    let client_id = entry
+        .client_id
+        .clone()
+        .context("entry has no clientId")?;
+
+    let token_endpoint = discover_token_endpoint(http, &as_url).await?;
+
+    let form: [(&str, &str); 3] = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", &refresh_token),
+        ("client_id", &client_id),
+    ];
+    let resp = http
+        .post(&token_endpoint)
+        .form(&form)
+        .send()
+        .await
+        .with_context(|| format!("POST {token_endpoint} failed"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("token refresh failed ({status}): {body}");
+    }
+    let parsed: RefreshResponse = resp
+        .json()
+        .await
+        .context("parsing token refresh response")?;
+
+    entry.access_token = parsed.access_token;
+    if let Some(new_refresh) = parsed.refresh_token {
+        entry.refresh_token = Some(new_refresh);
+    }
+    if let Some(expires_in) = parsed.expires_in {
+        entry.expires_at_ms = Some(now_ms() + expires_in * 1000);
+    }
+    if let Some(scope) = parsed.scope {
+        entry.scope = Some(scope);
+    }
+    Ok(())
+}
+
+async fn discover_token_endpoint(http: &reqwest::Client, as_url: &str) -> Result<String> {
+    let base = as_url.trim_end_matches('/');
+
+    for suffix in &[
+        "/.well-known/oauth-authorization-server",
+        "/.well-known/openid-configuration",
+    ] {
+        let url = format!("{base}{suffix}");
+        let Ok(resp) = http.get(&url).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(meta) = resp.json::<Value>().await else {
+            continue;
+        };
+        if let Some(ep) = meta.get("token_endpoint").and_then(Value::as_str) {
+            return Ok(ep.to_string());
+        }
+    }
+
+    // Conservative fall-back: some issuers advertise their token endpoint
+    // only via an un-documented path, so `/token` is the least surprising
+    // guess once discovery has failed.
+    Ok(format!("{base}/token"))
+}
+
+#[derive(Deserialize)]
+struct RefreshResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[cfg(test)]
