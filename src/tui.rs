@@ -298,20 +298,24 @@ fn render_row(entry: &ToolEntry) -> ListItem<'static> {
         first_line.to_string()
     };
 
-    // Small, out-of-the-way annotation tag after the description.
+    // Small annotation tag right after the tool name so it reads
+    // `[x] tool_name [RO]  description`.
     let annotation: Option<Span<'static>> = match entry.read_only_hint {
         Some(true) => Some(Span::styled(" [RO]", Style::default().fg(Color::Green))),
         Some(false) => Some(Span::styled(" [W]", Style::default().fg(Color::Yellow))),
         None => None,
     };
 
-    let mut spans = vec![
+    let mut spans: Vec<Span<'static>> = vec![
         Span::raw(format!("{cb} ")),
-        Span::raw(format!("{:<32}", entry.tool_name)),
-        Span::styled(desc, Style::default().fg(Color::DarkGray)),
+        Span::raw(entry.tool_name.clone()),
     ];
     if let Some(tag) = annotation {
         spans.push(tag);
+    }
+    if !desc.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(desc, Style::default().fg(Color::DarkGray)));
     }
     ListItem::new(Line::from(spans))
 }
