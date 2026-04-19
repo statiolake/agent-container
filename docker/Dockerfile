@@ -12,6 +12,7 @@ RUN apt-get update \
         procps \
         ripgrep \
         tini \
+        vim \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g @anthropic-ai/claude-code@latest @openai/codex \
@@ -32,6 +33,10 @@ RUN mkdir -p /home/agent/.claude /home/agent/.codex \
 
 ENV HOME=/home/agent
 ENV NODE_OPTIONS=--max-old-space-size=4096
+# Claude Code opens $EDITOR for Ctrl+G prompt editing; pick vim by default
+# so pressing the shortcut actually lands in a working editor.
+ENV EDITOR=vim
+ENV VISUAL=vim
 
 WORKDIR /workspace
 
