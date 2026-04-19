@@ -5,6 +5,9 @@
 # --- Claude / Anthropic ---
 ^api\.anthropic\.com$
 ^statsig\.anthropic\.com$
+^platform\.claude\.com$
+^claude\.ai$
+^console\.anthropic\.com$
 
 # --- Rust toolchain ---
 ^crates\.io$
