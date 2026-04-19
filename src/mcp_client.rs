@@ -118,7 +118,7 @@ pub async fn fetch_tools(
 /// the worker so the child exits. Used by the TUI to preview what tools
 /// a stdio server advertises without having to boot the full broker.
 pub async fn fetch_tools_stdio(server: &StdioMcpServer) -> Result<Vec<Tool>> {
-    let handle = stdio_mcp::spawn_worker(server.clone())
+    let handle = stdio_mcp::spawn_worker(server.clone(), None)
         .with_context(|| format!("failed to start stdio MCP '{}'", server.name))?;
 
     let init = json!({

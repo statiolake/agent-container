@@ -125,11 +125,16 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
         .await
         .context("failed to build or locate container images")?;
 
+    let stdio_bridge = stdio_mcp::PathBridge {
+        container_root: "/workspace".to_string(),
+        host_root: host.workspace.display().to_string(),
+    };
     let broker = server::spawn(
         bedrock.clone().map(|b| (b, refresh.clone())),
         mcp_servers.clone(),
         policy,
         oauth_store.clone(),
+        Some(stdio_bridge),
     )
     .await?;
     tracing::info!(addr = %broker.addr, "host broker listening");
@@ -219,11 +224,16 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
         .await
         .context("failed to build or locate container images")?;
 
+    let stdio_bridge = stdio_mcp::PathBridge {
+        container_root: "/workspace".to_string(),
+        host_root: host.workspace.display().to_string(),
+    };
     let broker = server::spawn(
         bedrock.clone().map(|b| (b, refresh.clone())),
         mcp_servers.clone(),
         policy,
         oauth_store,
+        Some(stdio_bridge),
     )
     .await?;
     let broker_url_from_container =

@@ -33,7 +33,7 @@ use crate::aws::{BedrockCredentials, BedrockSetup, resolve_credentials};
 use crate::mcp::{HttpMcpServer, McpServer};
 use crate::oauth::OAuthStore;
 use crate::policy::McpPolicy;
-use crate::stdio_mcp::{self, StdioHandle};
+use crate::stdio_mcp::{self, PathBridge, StdioHandle};
 
 enum McpBackend {
     Http(HttpMcpServer),
@@ -60,6 +60,7 @@ pub async fn spawn(
     mcp_servers: Vec<McpServer>,
     policy: McpPolicy,
     oauth: Arc<OAuthStore>,
+    stdio_bridge: Option<PathBridge>,
 ) -> Result<RunningServer> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -78,7 +79,7 @@ pub async fn spawn(
             McpServer::Http(h) => {
                 mcp.insert(name, McpBackend::Http(h));
             }
-            McpServer::Stdio(s) => match stdio_mcp::spawn_worker(s.clone()) {
+            McpServer::Stdio(s) => match stdio_mcp::spawn_worker(s.clone(), stdio_bridge.clone()) {
                 Ok(handle) => {
                     mcp.insert(name, McpBackend::Stdio(handle));
                 }
