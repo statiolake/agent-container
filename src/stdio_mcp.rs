@@ -132,19 +132,12 @@ async fn handle_one(
     // trip, which is the standard way to normalise.
     let parsed: Value = serde_json::from_slice(body).context("request is not valid JSON")?;
     let compact = serde_json::to_vec(&parsed).context("re-serialising request")?;
-
-    {
-        let mut stdin = stdin.lock().await;
-        stdin
-            .write_all(&compact)
-            .await
-            .context("write to MCP stdin")?;
-        stdin
-            .write_all(b"\n")
-            .await
-            .context("write newline to MCP stdin")?;
-        stdin.flush().await.ok();
-    }
+    tracing::debug!(
+        mcp = %server_name,
+        request = %String::from_utf8_lossy(&compact),
+        "→ stdin",
+    );
+    write_line(stdin, &compact).await?;
 
     // Notifications (no `id`) get no response — tell the caller immediately
     // so the HTTP handler can return 204-equivalent.
@@ -163,14 +156,88 @@ async fn handle_one(
         if line.is_empty() {
             continue;
         }
-        // Skip server-initiated notifications so the response we hand back
-        // is always the one matching the caller's request.
-        match serde_json::from_str::<Value>(&line) {
-            Ok(v) if v.get("id").is_none() => {
-                tracing::debug!(mcp = %server_name, notification = %line);
+
+        let parsed_line = serde_json::from_str::<Value>(&line).ok();
+
+        // Anything with a `method` field is a server→client request or
+        // notification. Those are NOT the response we're waiting for; drop
+        // them from the response pipeline and, when they are requests
+        // (i.e. they carry an id), auto-reply so the server doesn't stall
+        // waiting for something we have no way to surface back through
+        // the HTTP bridge.
+        if let Some(v) = &parsed_line {
+            if let Some(method) = v.get("method").and_then(Value::as_str) {
+                let id = v.get("id").cloned();
+                tracing::debug!(
+                    mcp = %server_name,
+                    method = %method,
+                    has_id = id.is_some(),
+                    raw = %line,
+                    "stdio MCP server-initiated message; handling locally",
+                );
+                if let Some(id) = id {
+                    let reply = synthesise_server_reply(method, id);
+                    let bytes = serde_json::to_vec(&reply)?;
+                    tracing::debug!(
+                        mcp = %server_name,
+                        method = %method,
+                        response = %String::from_utf8_lossy(&bytes),
+                        "→ stdin (auto-reply to server request)",
+                    );
+                    write_line(stdin, &bytes).await?;
+                }
                 continue;
             }
-            _ => return Ok(line.into_bytes()),
         }
+
+        tracing::debug!(
+            mcp = %server_name,
+            response = %String::from_utf8_lossy(line.as_bytes()),
+            "← stdout",
+        );
+        return Ok(line.into_bytes());
+    }
+}
+
+async fn write_line(
+    stdin: &Arc<Mutex<tokio::process::ChildStdin>>,
+    bytes: &[u8],
+) -> Result<()> {
+    let mut stdin = stdin.lock().await;
+    stdin.write_all(bytes).await.context("write to MCP stdin")?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .context("write newline to MCP stdin")?;
+    stdin.flush().await.ok();
+    Ok(())
+}
+
+/// Build a canned JSON-RPC reply for server-initiated requests the broker
+/// cannot round-trip to the real client. For `roots/list` we know the
+/// container's workspace layout and can serve an accurate answer locally;
+/// anything else turns into a `-32601 method not found` error so the
+/// server proceeds gracefully instead of waiting for a reply.
+fn synthesise_server_reply(method: &str, id: Value) -> Value {
+    match method {
+        "roots/list" => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "roots": [
+                    {"uri": "file:///workspace", "name": "workspace"}
+                ]
+            }
+        }),
+        _ => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32601,
+                "message": format!(
+                    "agent-container does not forward server-initiated MCP request '{method}' to the client"
+                )
+            }
+        }),
     }
 }
