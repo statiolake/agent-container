@@ -23,17 +23,27 @@ use crate::paths::HostPaths;
 
 const CONTAINER_WORKSPACE: &str = "/workspace";
 
-/// Top-level keys removed from `.claude.json` before copying.
-const TOP_LEVEL_STRIP: &[&str] = &["mcpServers"];
-
-/// Per-project keys removed from the surviving project entry.
-const PROJECT_STRIP: &[&str] = &[
+/// Keys stripped from every object we copy over (top-level of `.claude.json`,
+/// per-project entries, and `settings.json`). Each of these either references
+/// host-only state, holds policy that stops making sense inside the
+/// container, or would be bypassed regardless:
+/// - `mcpServers` + friends: handled separately by the container's proxy path.
+/// - `env`: exports can reference host tool paths that don't exist here.
+/// - `hooks`: shell commands that typically shell out to host binaries.
+/// - `permissions`: we run with `--dangerously-skip-permissions` anyway.
+/// - `sandbox`: Claude Code's in-process sandbox is redundant (and bypassed)
+///   inside the container.
+const COMMON_STRIP: &[&str] = &[
     "mcpServers",
     "mcpContextUris",
     "enabledMcpjsonServers",
     "disabledMcpjsonServers",
     "enabledMcpServers",
     "disabledMcpServers",
+    "env",
+    "hooks",
+    "permissions",
+    "sandbox",
 ];
 
 pub fn sync_host_state(host: &HostPaths) -> Result<()> {
@@ -61,9 +71,7 @@ fn sync_claude_json(host: &HostPaths) -> Result<()> {
         .with_context(|| format!("failed to parse {} as JSON", src.display()))?;
 
     if let Some(obj) = cfg.as_object_mut() {
-        for key in TOP_LEVEL_STRIP {
-            obj.remove(*key);
-        }
+        strip_keys(obj);
 
         // Keep only the current workspace's entry, rewritten to /workspace.
         if let Some(Value::Object(projects)) = obj.get_mut("projects") {
@@ -71,9 +79,7 @@ fn sync_claude_json(host: &HostPaths) -> Result<()> {
             let surviving = projects.remove(&workspace_key).unwrap_or(Value::Null);
             let mut filtered = serde_json::Map::new();
             if let Value::Object(mut entry) = surviving {
-                for key in PROJECT_STRIP {
-                    entry.remove(*key);
-                }
+                strip_keys(&mut entry);
                 filtered.insert(CONTAINER_WORKSPACE.to_string(), Value::Object(entry));
             }
             *projects = filtered;
@@ -91,17 +97,26 @@ fn sync_settings_json(host: &HostPaths) -> Result<()> {
     if !src.is_file() {
         return Ok(());
     }
+    let raw = fs::read_to_string(&src)
+        .with_context(|| format!("failed to read {}", src.display()))?;
+    let mut settings: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {} as JSON", src.display()))?;
+    if let Some(obj) = settings.as_object_mut() {
+        strip_keys(obj);
+    }
     let dest_dir = host.container_home.join(".claude");
     fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join("settings.json");
-    fs::copy(&src, &dest).with_context(|| {
-        format!(
-            "failed to copy {} to {}",
-            src.display(),
-            dest.display()
-        )
-    })?;
+    let pretty = serde_json::to_string_pretty(&settings)?;
+    fs::write(&dest, pretty)
+        .with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
+}
+
+fn strip_keys(obj: &mut serde_json::Map<String, Value>) {
+    for key in COMMON_STRIP {
+        obj.remove(*key);
+    }
 }
 
 fn sync_skills(host: &HostPaths) -> Result<()> {
@@ -158,11 +173,19 @@ mod tests {
         let synthetic = format!(
             r#"{{
               "mcpServers": {{"github": {{"command": "foo"}}}},
+              "env": {{"HOST_ONLY": "/opt/host/bin"}},
+              "hooks": {{"PreToolUse": ["echo hi"]}},
+              "permissions": {{"allow": ["*"]}},
+              "sandbox": {{"mode": "strict"}},
               "hasCompletedOnboarding": true,
               "projects": {{
                 "{ws}": {{
                   "allowedTools": ["bash"],
                   "mcpServers": {{"x": {{}}}},
+                  "env": {{"ANOTHER": "/host/path"}},
+                  "hooks": {{"SessionStart": ["tool"]}},
+                  "permissions": {{"deny": ["git push"]}},
+                  "sandbox": {{"enabled": true}},
                   "lastCost": 1.23
                 }},
                 "{ws}-other": {{ "allowedTools": [] }}
@@ -185,13 +208,62 @@ mod tests {
             &fs::read_to_string(container_home.path().join(".claude.json")).unwrap(),
         )
         .unwrap();
-        assert!(out.get("mcpServers").is_none(), "top-level mcpServers must be removed");
+        for key in ["mcpServers", "env", "hooks", "permissions", "sandbox"] {
+            assert!(
+                out.get(key).is_none(),
+                "top-level {key} must be removed"
+            );
+        }
         assert_eq!(out["hasCompletedOnboarding"], serde_json::json!(true));
         let projects = out["projects"].as_object().unwrap();
         assert_eq!(projects.len(), 1, "only current workspace survives");
         let entry = &projects["/workspace"];
-        assert!(entry.get("mcpServers").is_none());
+        for key in ["mcpServers", "env", "hooks", "permissions", "sandbox"] {
+            assert!(
+                entry.get(key).is_none(),
+                "per-project {key} must be removed"
+            );
+        }
         assert_eq!(entry["allowedTools"], serde_json::json!(["bash"]));
         assert_eq!(entry["lastCost"], serde_json::json!(1.23));
+    }
+
+    #[test]
+    fn settings_json_is_filtered() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = tmp_home.path().join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let claude_root = tmp_home.path().join(".claude");
+        fs::create_dir_all(&claude_root).unwrap();
+        fs::write(
+            claude_root.join("settings.json"),
+            r#"{
+              "theme": "dark",
+              "env": {"FOO": "bar"},
+              "hooks": {"PreToolUse": ["echo"]},
+              "permissions": {"allow": ["*"]},
+              "sandbox": {"mode": "strict"},
+              "mcpServers": {"x": {}}
+            }"#,
+        )
+        .unwrap();
+
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root,
+            workspace,
+            container_home: container_home.path().to_path_buf(),
+        };
+        sync_settings_json(&host).unwrap();
+
+        let out: Value = serde_json::from_str(
+            &fs::read_to_string(container_home.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(out["theme"], serde_json::json!("dark"));
+        for key in ["env", "hooks", "permissions", "sandbox", "mcpServers"] {
+            assert!(out.get(key).is_none(), "{key} should be stripped");
+        }
     }
 }
