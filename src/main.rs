@@ -4,6 +4,7 @@ mod creds;
 mod docker;
 mod mcp;
 mod paths;
+mod policy;
 mod server;
 mod sync;
 
