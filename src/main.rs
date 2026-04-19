@@ -1,8 +1,10 @@
 mod aws;
 mod cli;
+mod config_cmd;
 mod creds;
 mod docker;
 mod mcp;
+mod mcp_client;
 mod paths;
 mod policy;
 mod server;
@@ -11,7 +13,7 @@ mod sync;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::cli::{Cli, Commands};
+use crate::cli::{Cli, Commands, ConfigCommands};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,6 +28,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Run { passthrough } => run_cmd(passthrough).await,
+        Commands::Config { command } => match command {
+            ConfigCommands::Mcp => config_cmd::run().await,
+        },
     }
 }
 
