@@ -3,6 +3,7 @@ mod cli;
 mod creds;
 mod docker;
 mod paths;
+mod server;
 mod sync;
 
 use anyhow::{Context, Result};
@@ -31,20 +32,15 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
 
     let bedrock = aws::detect_setup(&host.claude_root.join("settings.json"))
         .context("failed to read Bedrock settings from ~/.claude/settings.json")?;
-    let bedrock_creds = if let Some(setup) = &bedrock {
+    let refresh = aws::detect_refresh_command(&host.home.join(".claude.json"))
+        .context("failed to read awsAuthRefresh from ~/.claude.json")?;
+
+    if let Some(setup) = &bedrock {
         eprintln!(
-            "[agent-container] Bedrock mode detected (profile={}); resolving AWS credentials...",
+            "[agent-container] Bedrock mode detected (profile={}); the container will fetch fresh AWS credentials on demand through the host broker.",
             setup.profile
         );
-        let refresh = aws::detect_refresh_command(&host.home.join(".claude.json"))
-            .context("failed to read awsAuthRefresh from ~/.claude.json")?;
-        Some(
-            aws::resolve_credentials(setup, refresh.as_deref())
-                .context("failed to resolve AWS credentials for Bedrock")?,
-        )
-    } else {
-        None
-    };
+    }
 
     // When Bedrock is active the container does not need Anthropic OAuth, so
     // credential-prep failures degrade to a warning.
@@ -74,7 +70,11 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
         .await
         .context("failed to build or locate container images")?;
 
-    sync::sync_host_state(&host).context("failed to sync host Claude Code state into container")?;
+    sync::sync_host_state(&host, bedrock.is_some())
+        .context("failed to sync host Claude Code state into container")?;
+
+    let broker = server::spawn(bedrock.clone().map(|b| (b, refresh.clone()))).await?;
+    tracing::info!(addr = %broker.addr, "host broker listening");
 
     let credentials_path = credentials
         .as_ref()
@@ -84,11 +84,13 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
     let exit = docker::run(docker::RunOptions {
         host,
         credentials_path,
-        bedrock: bedrock.zip(bedrock_creds),
+        bedrock_setup: bedrock,
+        broker_addr: broker.addr,
         extra_args: passthrough,
     })
     .await?;
 
+    broker.handle.abort();
     drop(credentials);
     std::process::exit(exit);
 }

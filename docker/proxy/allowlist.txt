@@ -2,6 +2,9 @@
 # Matches destination hostnames for CONNECT requests and URLs for plain HTTP.
 # With FilterDefaultDeny=Yes, only hosts matching a pattern are reachable.
 
+# --- agent-container host broker (fresh AWS creds, MCP proxy in future) ---
+^host\.docker\.internal$
+
 # --- Claude / Anthropic ---
 ^api\.anthropic\.com$
 ^statsig\.anthropic\.com$

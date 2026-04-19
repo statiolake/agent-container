@@ -46,7 +46,7 @@ const COMMON_STRIP: &[&str] = &[
     "sandbox",
 ];
 
-pub fn sync_host_state(host: &HostPaths) -> Result<()> {
+pub fn sync_host_state(host: &HostPaths, bedrock: bool) -> Result<()> {
     fs::create_dir_all(&host.container_home).with_context(|| {
         format!(
             "failed to ensure container home {}",
@@ -54,21 +54,25 @@ pub fn sync_host_state(host: &HostPaths) -> Result<()> {
         )
     })?;
 
-    sync_claude_json(host).context("failed to sync .claude.json")?;
+    sync_claude_json(host, bedrock).context("failed to sync .claude.json")?;
     sync_settings_json(host).context("failed to sync .claude/settings.json")?;
     sync_skills(host).context("failed to sync .claude/skills")?;
+    if bedrock {
+        ensure_dummy_aws_profile(host).context("failed to prepare dummy AWS bedrock profile")?;
+    }
     Ok(())
 }
 
-fn sync_claude_json(host: &HostPaths) -> Result<()> {
+fn sync_claude_json(host: &HostPaths, bedrock: bool) -> Result<()> {
     let src = host.home.join(".claude.json");
-    if !src.is_file() {
-        return Ok(());
-    }
-    let raw = fs::read_to_string(&src)
-        .with_context(|| format!("failed to read {}", src.display()))?;
-    let mut cfg: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {} as JSON", src.display()))?;
+    let mut cfg: Value = if src.is_file() {
+        let raw = fs::read_to_string(&src)
+            .with_context(|| format!("failed to read {}", src.display()))?;
+        serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {} as JSON", src.display()))?
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
 
     if let Some(obj) = cfg.as_object_mut() {
         strip_keys(obj);
@@ -84,11 +88,42 @@ fn sync_claude_json(host: &HostPaths) -> Result<()> {
             }
             *projects = filtered;
         }
+
+        if bedrock {
+            obj.insert(
+                "awsAuthRefresh".to_string(),
+                Value::String("/usr/local/bin/agent-container-aws-refresh".to_string()),
+            );
+        } else {
+            obj.remove("awsAuthRefresh");
+        }
     }
 
     let dest = host.container_home.join(".claude.json");
     let pretty = serde_json::to_string_pretty(&cfg)?;
     fs::write(&dest, pretty).with_context(|| format!("failed to write {}", dest.display()))?;
+    Ok(())
+}
+
+/// Initialise a dummy `~/.aws/credentials` with a `[bedrock]` section if
+/// one does not already exist, so Claude Code has something to point
+/// `AWS_PROFILE=bedrock` at on first use. The placeholder values will be
+/// rejected by Bedrock, which triggers `awsAuthRefresh` to fetch real ones.
+fn ensure_dummy_aws_profile(host: &HostPaths) -> Result<()> {
+    let aws_dir = host.container_home.join(".aws");
+    fs::create_dir_all(&aws_dir)
+        .with_context(|| format!("failed to create {}", aws_dir.display()))?;
+    let creds_path = aws_dir.join("credentials");
+    if creds_path.exists() {
+        return Ok(());
+    }
+    fs::write(
+        &creds_path,
+        "[bedrock]\n\
+         aws_access_key_id = PLACEHOLDER\n\
+         aws_secret_access_key = PLACEHOLDER\n",
+    )
+    .with_context(|| format!("failed to write {}", creds_path.display()))?;
     Ok(())
 }
 
@@ -202,7 +237,7 @@ mod tests {
             container_home: container_home.path().to_path_buf(),
         };
 
-        sync_claude_json(&host).unwrap();
+        sync_claude_json(&host, false).unwrap();
 
         let out: Value = serde_json::from_str(
             &fs::read_to_string(container_home.path().join(".claude.json")).unwrap(),
@@ -226,6 +261,72 @@ mod tests {
         }
         assert_eq!(entry["allowedTools"], serde_json::json!(["bash"]));
         assert_eq!(entry["lastCost"], serde_json::json!(1.23));
+        assert!(out.get("awsAuthRefresh").is_none());
+    }
+
+    #[test]
+    fn bedrock_mode_injects_aws_auth_refresh() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = tmp_home.path().join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(tmp_home.path().join(".claude.json"), "{}").unwrap();
+
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root: tmp_home.path().join(".claude"),
+            workspace,
+            container_home: container_home.path().to_path_buf(),
+        };
+        sync_claude_json(&host, true).unwrap();
+
+        let out: Value = serde_json::from_str(
+            &fs::read_to_string(container_home.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            out["awsAuthRefresh"].as_str(),
+            Some("/usr/local/bin/agent-container-aws-refresh")
+        );
+    }
+
+    #[test]
+    fn ensures_dummy_aws_profile_when_missing() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root: tmp_home.path().join(".claude"),
+            workspace: tmp_home.path().join("work"),
+            container_home: container_home.path().to_path_buf(),
+        };
+        ensure_dummy_aws_profile(&host).unwrap();
+        let creds = fs::read_to_string(container_home.path().join(".aws/credentials")).unwrap();
+        assert!(creds.contains("[bedrock]"));
+        assert!(creds.contains("PLACEHOLDER"));
+    }
+
+    #[test]
+    fn preserves_existing_aws_credentials() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let aws_dir = container_home.path().join(".aws");
+        fs::create_dir_all(&aws_dir).unwrap();
+        fs::write(
+            aws_dir.join("credentials"),
+            "[bedrock]\naws_access_key_id = REAL\naws_secret_access_key = REAL_SECRET\n",
+        )
+        .unwrap();
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root: tmp_home.path().join(".claude"),
+            workspace: tmp_home.path().join("work"),
+            container_home: container_home.path().to_path_buf(),
+        };
+        ensure_dummy_aws_profile(&host).unwrap();
+        let creds = fs::read_to_string(aws_dir.join("credentials")).unwrap();
+        assert!(creds.contains("REAL"));
+        assert!(!creds.contains("PLACEHOLDER"));
     }
 
     #[test]

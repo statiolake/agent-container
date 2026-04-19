@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
-use crate::aws::{BedrockCredentials, BedrockSetup};
+use crate::aws::BedrockSetup;
 use crate::paths::HostPaths;
 
 const AGENT_IMAGE_TAG: &str = "agent-container:dev";
@@ -58,7 +59,8 @@ async fn ensure_one(tag: &str, context_dir: &Path, dockerfile_name: &str) -> Res
 pub struct RunOptions {
     pub host: HostPaths,
     pub credentials_path: PathBuf,
-    pub bedrock: Option<(BedrockSetup, BedrockCredentials)>,
+    pub bedrock_setup: Option<BedrockSetup>,
+    pub broker_addr: SocketAddr,
     pub extra_args: Vec<String>,
 }
 
@@ -120,38 +122,35 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     .map(|(k, v)| (k.to_string(), v))
     .collect();
 
+    // Point the container at the host broker so the in-container refresh
+    // script can fetch fresh AWS credentials on demand through the proxy.
+    env.insert(
+        "AGENT_CONTAINER_HOST_ENDPOINT".to_string(),
+        format!("http://host.docker.internal:{}", opts.broker_addr.port()),
+    );
+
     // Bedrock env vars: declared as `${VAR:-}` in compose.yml, so an unset
-    // shell var translates to an empty string in the container — which all
-    // of these AWS / Claude Code toggles treat as "not set".
+    // shell var translates to an empty string in the container.
     let mut put = |k: &str, v: String| {
         env.insert(k.to_string(), v);
     };
-    if let Some((setup, creds)) = &opts.bedrock {
+    if let Some(setup) = &opts.bedrock_setup {
         put("CLAUDE_CODE_USE_BEDROCK", "1".to_string());
+        put("AWS_PROFILE", "bedrock".to_string());
         if let Some(model) = &setup.model {
             put("ANTHROPIC_MODEL", model.clone());
         }
-        if let Some(region) = creds.region.clone().or_else(|| setup.region.clone()) {
+        if let Some(region) = &setup.region {
             put("AWS_REGION", region.clone());
-            put("AWS_DEFAULT_REGION", region);
-        }
-        put("AWS_ACCESS_KEY_ID", creds.access_key_id.clone());
-        put("AWS_SECRET_ACCESS_KEY", creds.secret_access_key.clone());
-        if let Some(token) = &creds.session_token {
-            put("AWS_SESSION_TOKEN", token.clone());
+            put("AWS_DEFAULT_REGION", region.clone());
         }
     }
-    // Always ensure compose gets values for these substitutions so an unset
-    // `${VAR:-}` resolves to an empty string rather than inheriting from the
-    // parent shell unexpectedly.
     for key in [
         "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_PROFILE",
         "ANTHROPIC_MODEL",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
     ] {
         env.entry(key.to_string()).or_insert_with(String::new);
     }

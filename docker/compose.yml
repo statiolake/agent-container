@@ -4,6 +4,10 @@ services:
     networks:
       - jail
       - egress
+    extra_hosts:
+      # Needed so the forward proxy can route the container's refresh
+      # script back to the Rust broker on the host.
+      - "host.docker.internal:host-gateway"
     volumes:
       - "${ALLOWLIST_PATH}:/etc/tinyproxy/allowlist.txt:ro"
     restart: "no"
@@ -24,15 +28,15 @@ services:
       - no_proxy=localhost,127.0.0.1,proxy
       - IS_SANDBOX=1
       - TINI_SUBREAPER=1
-      # Bedrock pathway; these are empty unless the host opted in via
-      # ~/.claude/settings.json env.CLAUDE_CODE_USE_BEDROCK + AWS_PROFILE.
+      # Bedrock pathway. Actual AWS credentials are fetched on demand by
+      # the container's awsAuthRefresh script via AGENT_CONTAINER_HOST_ENDPOINT;
+      # these toggles stay empty unless the host opted in.
       - CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-}
+      - AWS_PROFILE=${AWS_PROFILE:-}
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
       - AWS_REGION=${AWS_REGION:-}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
-      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+      - AGENT_CONTAINER_HOST_ENDPOINT=${AGENT_CONTAINER_HOST_ENDPOINT}
     volumes:
       # Persistent $HOME so onboarding, login, settings, and Claude Code's
       # ~/.claude.json survive across runs. Specific sub-mounts below
