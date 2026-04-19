@@ -36,8 +36,10 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
             "[agent-container] Bedrock mode detected (profile={}); resolving AWS credentials...",
             setup.profile
         );
+        let refresh = aws::detect_refresh_command(&host.home.join(".claude.json"))
+            .context("failed to read awsAuthRefresh from ~/.claude.json")?;
         Some(
-            aws::resolve_credentials(setup)
+            aws::resolve_credentials(setup, refresh.as_deref())
                 .context("failed to resolve AWS credentials for Bedrock")?,
         )
     } else {

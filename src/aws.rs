@@ -81,9 +81,54 @@ fn truthy(v: Option<&Value>) -> bool {
     }
 }
 
+/// Look up an optional `awsAuthRefresh` shell command from `~/.claude.json`.
+/// When present, it is invoked on the host before retrying AWS credential
+/// resolution — typically `aws sso login --profile XXX` or a thin wrapper.
+pub fn detect_refresh_command(claude_json: &Path) -> Result<Option<String>> {
+    if !claude_json.is_file() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(claude_json)
+        .with_context(|| format!("failed to read {}", claude_json.display()))?;
+    let cfg: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {} as JSON", claude_json.display()))?;
+    Ok(cfg
+        .get("awsAuthRefresh")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
+
 /// Invoke `aws configure export-credentials` on the host; works uniformly
-/// for static keys, SSO sessions, and assume-role profiles.
-pub fn resolve_credentials(setup: &BedrockSetup) -> Result<BedrockCredentials> {
+/// for static keys, SSO sessions, and assume-role profiles. If the first
+/// attempt fails and `refresh` is provided, the refresh command is run
+/// (stdio inherited so SSO prompts are visible) and the resolution is
+/// retried once.
+pub fn resolve_credentials(
+    setup: &BedrockSetup,
+    refresh: Option<&str>,
+) -> Result<BedrockCredentials> {
+    match try_export(setup) {
+        Ok(c) => Ok(c),
+        Err(first_err) => {
+            let Some(cmd) = refresh else {
+                return Err(first_err);
+            };
+            eprintln!(
+                "[agent-container] AWS credentials resolution failed; running awsAuthRefresh: {cmd}"
+            );
+            run_refresh(cmd)
+                .context("awsAuthRefresh command failed; the original credential resolution error still stands")?;
+            try_export(setup).with_context(|| {
+                format!(
+                    "credential resolution still failed after awsAuthRefresh (original error: {first_err:#})"
+                )
+            })
+        }
+    }
+}
+
+fn try_export(setup: &BedrockSetup) -> Result<BedrockCredentials> {
     let output = Command::new("aws")
         .args([
             "configure",
@@ -99,7 +144,7 @@ pub fn resolve_credentials(setup: &BedrockSetup) -> Result<BedrockCredentials> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
         bail!(
-            "`aws configure export-credentials --profile {}` failed. If you use SSO, run `aws sso login --profile {}` on the host first.\n{}",
+            "`aws configure export-credentials --profile {}` failed. If you use SSO, run `aws sso login --profile {}` on the host (or set awsAuthRefresh in ~/.claude.json) first.\n{}",
             setup.profile,
             setup.profile,
             stderr
@@ -119,7 +164,10 @@ pub fn resolve_credentials(setup: &BedrockSetup) -> Result<BedrockCredentials> {
     let parsed: ExportedCreds = serde_json::from_slice(&output.stdout)
         .context("failed to parse aws configure export-credentials JSON")?;
 
-    let region = setup.region.clone().or_else(|| lookup_profile_region(&setup.profile));
+    let region = setup
+        .region
+        .clone()
+        .or_else(|| lookup_profile_region(&setup.profile));
 
     Ok(BedrockCredentials {
         access_key_id: parsed.access_key_id,
@@ -127,6 +175,17 @@ pub fn resolve_credentials(setup: &BedrockSetup) -> Result<BedrockCredentials> {
         session_token: parsed.session_token,
         region,
     })
+}
+
+fn run_refresh(cmd: &str) -> Result<()> {
+    let status = Command::new("sh")
+        .args(["-c", cmd])
+        .status()
+        .with_context(|| format!("failed to spawn `sh -c {cmd}`"))?;
+    if !status.success() {
+        bail!("awsAuthRefresh exited with status {status}");
+    }
+    Ok(())
 }
 
 fn lookup_profile_region(profile: &str) -> Option<String> {
@@ -196,5 +255,26 @@ mod tests {
     fn no_bedrock_when_settings_missing() {
         let p = std::env::temp_dir().join("definitely-not-here-agent-container.json");
         assert!(detect_setup(&p).unwrap().is_none());
+    }
+
+    #[test]
+    fn reads_aws_auth_refresh_command() {
+        let f = write_settings(r#"{"awsAuthRefresh": "aws sso login --profile dev"}"#);
+        assert_eq!(
+            detect_refresh_command(f.path()).unwrap().as_deref(),
+            Some("aws sso login --profile dev")
+        );
+    }
+
+    #[test]
+    fn no_refresh_when_field_missing() {
+        let f = write_settings(r#"{"hasCompletedOnboarding": true}"#);
+        assert!(detect_refresh_command(f.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn ignores_blank_refresh_command() {
+        let f = write_settings(r#"{"awsAuthRefresh": "   "}"#);
+        assert!(detect_refresh_command(f.path()).unwrap().is_none());
     }
 }
