@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use directories::{ProjectDirs, UserDirs};
 
 pub struct HostPaths {
+    pub home: PathBuf,
     pub claude_root: PathBuf,
     pub workspace: PathBuf,
     pub container_home: PathBuf,
@@ -18,6 +19,7 @@ impl HostPaths {
             std::env::current_dir().context("failed to read current working directory")?;
         let container_home = detect_container_home()?;
         Ok(Self {
+            home,
             claude_root,
             workspace,
             container_home,

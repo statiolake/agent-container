@@ -2,6 +2,7 @@ mod cli;
 mod creds;
 mod docker;
 mod paths;
+mod sync;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -38,6 +39,8 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
     docker::ensure_images(&docker::default_dockerfile_dir())
         .await
         .context("failed to build or locate container images")?;
+
+    sync::sync_host_state(&host).context("failed to sync host Claude Code state into container")?;
 
     let exit = docker::run(docker::RunOptions {
         host,
