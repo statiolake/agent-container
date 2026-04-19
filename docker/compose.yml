@@ -46,6 +46,7 @@ services:
       - "${HOST_PROJECT_DIR}:/home/agent/.claude/projects/-workspace"
       - "${CREDENTIALS_PATH}:/home/agent/.claude/.credentials.json"
       - "${CLAUDE_MD_MOUNT_SRC}:/home/agent/.claude/CLAUDE.md:ro"
+      - "${CODEX_AUTH_PATH}:/home/agent/.codex/auth.json"
     user: "${HOST_UID}:${HOST_GID}"
     working_dir: /workspace
     stdin_open: true

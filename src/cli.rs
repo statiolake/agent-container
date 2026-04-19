@@ -20,6 +20,13 @@ pub enum Commands {
         passthrough: Vec<String>,
     },
 
+    /// Launch Codex (OpenAI) inside the sandbox container.
+    Codex {
+        /// Extra arguments forwarded to `codex` inside the container.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        passthrough: Vec<String>,
+    },
+
     /// Edit agent-container configuration.
     Config {
         #[command(subcommand)]

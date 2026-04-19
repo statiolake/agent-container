@@ -1,5 +1,6 @@
 mod aws;
 mod cli;
+mod codex;
 mod config_cmd;
 mod creds;
 mod docker;
@@ -29,6 +30,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Run { passthrough } => run_cmd(passthrough).await,
+        Commands::Codex { passthrough } => codex_cmd(passthrough).await,
         Commands::Config { command } => match command {
             ConfigCommands::Mcp => config_cmd::run().await,
         },
@@ -122,13 +124,50 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
     let exit = docker::run(docker::RunOptions {
         host,
         credentials_path,
+        codex_auth_path: std::path::PathBuf::from("/dev/null"),
         bedrock_setup: bedrock,
         broker_addr: broker.addr,
+        agent_command: vec![
+            "claude".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ],
         extra_args: passthrough,
     })
     .await?;
 
     broker.handle.abort();
     drop(credentials);
+    std::process::exit(exit);
+}
+
+async fn codex_cmd(passthrough: Vec<String>) -> Result<()> {
+    let host = paths::HostPaths::detect()?;
+
+    let codex_auth = codex::prepare_auth(&host.home)
+        .context("failed to prepare Codex auth; run `codex login` on the host first")?;
+
+    docker::ensure_images(&docker::default_dockerfile_dir())
+        .await
+        .context("failed to build or locate container images")?;
+
+    // Spawn an empty broker so the compose project still has a reachable
+    // AGENT_CONTAINER_HOST_ENDPOINT; Codex itself does not use /aws or
+    // /mcp routes.
+    let broker = server::spawn(None, Vec::new(), policy::McpPolicy::default(), std::sync::Arc::new(oauth::OAuthStore::new(Default::default())))
+        .await?;
+
+    let exit = docker::run(docker::RunOptions {
+        host,
+        credentials_path: std::path::PathBuf::from("/dev/null"),
+        codex_auth_path: codex_auth.path.clone(),
+        bedrock_setup: None,
+        broker_addr: broker.addr,
+        agent_command: vec!["codex".to_string()],
+        extra_args: passthrough,
+    })
+    .await?;
+
+    broker.handle.abort();
+    drop(codex_auth);
     std::process::exit(exit);
 }

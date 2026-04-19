@@ -59,8 +59,12 @@ async fn ensure_one(tag: &str, context_dir: &Path, dockerfile_name: &str) -> Res
 pub struct RunOptions {
     pub host: HostPaths,
     pub credentials_path: PathBuf,
+    pub codex_auth_path: PathBuf,
     pub bedrock_setup: Option<BedrockSetup>,
     pub broker_addr: SocketAddr,
+    /// The command to invoke inside the container, e.g.
+    /// `["claude", "--dangerously-skip-permissions"]` or `["codex"]`.
+    pub agent_command: Vec<String>,
     pub extra_args: Vec<String>,
 }
 
@@ -113,6 +117,10 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         (
             "CLAUDE_MD_MOUNT_SRC",
             claude_md_src.display().to_string(),
+        ),
+        (
+            "CODEX_AUTH_PATH",
+            opts.codex_auth_path.display().to_string(),
         ),
         ("ALLOWLIST_PATH", allowlist_path.display().to_string()),
         ("HOST_UID", uid.to_string()),
@@ -197,7 +205,7 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         cmd.arg("-T");
     }
     cmd.arg("agent");
-    cmd.args(["claude", "--dangerously-skip-permissions"]);
+    cmd.args(&opts.agent_command);
     if !opts.extra_args.is_empty() {
         cmd.args(&opts.extra_args);
     }
