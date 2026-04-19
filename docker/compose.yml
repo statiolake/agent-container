@@ -25,9 +25,8 @@ services:
       - IS_SANDBOX=1
       - TINI_SUBREAPER=1
       # Bedrock pathway; these are empty unless the host opted in via
-      # ~/.claude/settings.json env.USE_BEDROCK + AWS_PROFILE.
+      # ~/.claude/settings.json env.CLAUDE_CODE_USE_BEDROCK + AWS_PROFILE.
       - CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-}
-      - USE_BEDROCK=${USE_BEDROCK:-}
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
       - AWS_REGION=${AWS_REGION:-}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-}

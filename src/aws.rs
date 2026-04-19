@@ -17,9 +17,6 @@ pub struct BedrockSetup {
     pub profile: String,
     pub model: Option<String>,
     pub region: Option<String>,
-    /// Raw env var name used on the host (USE_BEDROCK or CLAUDE_CODE_USE_BEDROCK);
-    /// we pass whichever the user set plus CLAUDE_CODE_USE_BEDROCK for safety.
-    pub enable_var: String,
 }
 
 /// Credentials materialised via `aws configure export-credentials`.
@@ -44,14 +41,7 @@ pub fn detect_setup(settings_path: &Path) -> Result<Option<BedrockSetup>> {
         return Ok(None);
     };
 
-    let (enable_var, enabled) = if truthy(env.get("USE_BEDROCK")) {
-        ("USE_BEDROCK".to_string(), true)
-    } else if truthy(env.get("CLAUDE_CODE_USE_BEDROCK")) {
-        ("CLAUDE_CODE_USE_BEDROCK".to_string(), true)
-    } else {
-        (String::new(), false)
-    };
-    if !enabled {
+    if !truthy(env.get("CLAUDE_CODE_USE_BEDROCK")) {
         return Ok(None);
     }
 
@@ -77,7 +67,6 @@ pub fn detect_setup(settings_path: &Path) -> Result<Option<BedrockSetup>> {
         profile,
         model,
         region,
-        enable_var,
     }))
 }
 
@@ -168,9 +157,9 @@ mod tests {
     }
 
     #[test]
-    fn detects_bedrock_with_use_bedrock_flag() {
+    fn detects_bedrock_with_claude_code_use_bedrock_flag() {
         let f = write_settings(
-            r#"{"env": {"USE_BEDROCK": "1", "AWS_PROFILE": "dev",
+            r#"{"env": {"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_PROFILE": "dev",
                 "ANTHROPIC_MODEL": "anthropic.claude-3-5-sonnet-20241022-v1:0",
                 "AWS_REGION": "us-west-2"}}"#,
         );
@@ -178,28 +167,28 @@ mod tests {
         assert_eq!(s.profile, "dev");
         assert_eq!(s.model.as_deref(), Some("anthropic.claude-3-5-sonnet-20241022-v1:0"));
         assert_eq!(s.region.as_deref(), Some("us-west-2"));
-        assert_eq!(s.enable_var, "USE_BEDROCK");
     }
 
     #[test]
-    fn detects_claude_code_use_bedrock_alias() {
+    fn accepts_boolean_true_for_flag() {
         let f = write_settings(
             r#"{"env": {"CLAUDE_CODE_USE_BEDROCK": "true", "AWS_PROFILE": "prod"}}"#,
         );
         let s = detect_setup(f.path()).unwrap().unwrap();
         assert_eq!(s.profile, "prod");
-        assert_eq!(s.enable_var, "CLAUDE_CODE_USE_BEDROCK");
     }
 
     #[test]
     fn no_bedrock_when_profile_missing() {
-        let f = write_settings(r#"{"env": {"USE_BEDROCK": "1"}}"#);
+        let f = write_settings(r#"{"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}"#);
         assert!(detect_setup(f.path()).unwrap().is_none());
     }
 
     #[test]
     fn no_bedrock_when_flag_falsy() {
-        let f = write_settings(r#"{"env": {"USE_BEDROCK": "0", "AWS_PROFILE": "dev"}}"#);
+        let f = write_settings(
+            r#"{"env": {"CLAUDE_CODE_USE_BEDROCK": "0", "AWS_PROFILE": "dev"}}"#,
+        );
         assert!(detect_setup(f.path()).unwrap().is_none());
     }
 

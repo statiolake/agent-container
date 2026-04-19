@@ -128,11 +128,6 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     };
     if let Some((setup, creds)) = &opts.bedrock {
         put("CLAUDE_CODE_USE_BEDROCK", "1".to_string());
-        // Echo back the user's original toggle too so downstream code that
-        // reads `USE_BEDROCK` directly also sees it.
-        if setup.enable_var != "CLAUDE_CODE_USE_BEDROCK" {
-            put(&setup.enable_var, "1".to_string());
-        }
         if let Some(model) = &setup.model {
             put("ANTHROPIC_MODEL", model.clone());
         }
@@ -151,7 +146,6 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     // parent shell unexpectedly.
     for key in [
         "CLAUDE_CODE_USE_BEDROCK",
-        "USE_BEDROCK",
         "ANTHROPIC_MODEL",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
