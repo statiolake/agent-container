@@ -8,10 +8,17 @@
 //!   `projects.<path>` entries are dropped so the container only sees its
 //!   own workspace, with its path rewritten to `/workspace`.
 //! - `~/.claude/settings.json` — user-level settings, copied as-is.
-//! - `~/.claude/skills/` — copied recursively so the container's Claude Code
-//!   can load the same skills the host has.
+//! - `~/.claude/skills/`, `~/.claude/commands/`, `~/.claude/agents/` — user-
+//!   authored extensions (custom skills, slash commands, subagents).
+//! - `~/.claude/plugins/` — plugin-provided skills, slash commands, and
+//!   subagents. Copied verbatim (including `hooks/`, `scripts/`, `.git/`
+//!   inside each plugin) because Claude Code re-syncs marketplaces via
+//!   `git` on start anyway if they look stale, so pruning subtrees only
+//!   thrashes. Hooks declared inside plugins are dormant until a plugin
+//!   is explicitly installed, and nothing gets installed automatically.
 //!
-//! Not copied: hooks, plugins, raw MCP configuration, other projects.
+//! Not copied: user-level hooks, the raw MCP configuration, other projects,
+//! or anything under `~/.claude/` not listed above.
 
 use std::fs;
 use std::path::Path;
@@ -64,7 +71,8 @@ pub fn sync_host_state(host: &HostPaths, opts: SyncOptions<'_>) -> Result<()> {
 
     sync_claude_json(host, &opts).context("failed to sync .claude.json")?;
     sync_settings_json(host).context("failed to sync .claude/settings.json")?;
-    sync_skills(host).context("failed to sync .claude/skills")?;
+    sync_user_extensions(host).context("failed to sync user skills/commands/agents")?;
+    sync_plugin_marketplaces(host).context("failed to sync plugin marketplaces")?;
     if opts.bedrock {
         ensure_dummy_aws_profile(host).context("failed to prepare dummy AWS bedrock profile")?;
     }
@@ -193,21 +201,39 @@ fn strip_keys(obj: &mut serde_json::Map<String, Value>) {
     }
 }
 
-fn sync_skills(host: &HostPaths) -> Result<()> {
-    let src = host.claude_root.join("skills");
-    let dest = host.container_home.join(".claude").join("skills");
-    if !src.is_dir() {
-        // Remove stale container-side skills if host no longer has any.
-        if dest.is_dir() {
-            fs::remove_dir_all(&dest).ok();
-        }
-        return Ok(());
+fn sync_user_extensions(host: &HostPaths) -> Result<()> {
+    // Custom user skills / slash commands / subagents live under these
+    // directories. They're markdown data; mirror them verbatim.
+    for name in ["skills", "commands", "agents"] {
+        let src = host.claude_root.join(name);
+        let dest = host.container_home.join(".claude").join(name);
+        mirror_or_clear(&src, &dest)?;
     }
+    Ok(())
+}
+
+fn sync_plugin_marketplaces(host: &HostPaths) -> Result<()> {
+    // Mirror the entire host plugins tree — marketplaces, cache, installed
+    // manifest, everything. Trying to prune hooks/scripts inside plugin
+    // dirs is pointless because Claude Code re-syncs marketplaces via git
+    // whenever the copy looks incomplete; those files come back every
+    // run. Plugin-internal hooks stay dormant until a plugin is installed
+    // via `installed_plugins.json`, which we do not do automatically.
+    let src = host.claude_root.join("plugins");
+    let dest = host.container_home.join(".claude").join("plugins");
+    mirror_or_clear(&src, &dest)
+}
+
+/// Mirror `src` → `dest`, wiping any pre-existing container copy first.
+fn mirror_or_clear(src: &Path, dest: &Path) -> Result<()> {
     if dest.is_dir() {
-        fs::remove_dir_all(&dest)
+        fs::remove_dir_all(dest)
             .with_context(|| format!("failed to clear {}", dest.display()))?;
     }
-    copy_dir_recursive(&src, &dest)
+    if !src.is_dir() {
+        return Ok(());
+    }
+    copy_dir_recursive(src, dest)
         .with_context(|| format!("failed to copy {} to {}", src.display(), dest.display()))?;
     Ok(())
 }
