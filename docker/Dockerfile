@@ -37,6 +37,11 @@ ENV NODE_OPTIONS=--max-old-space-size=4096
 # so pressing the shortcut actually lands in a working editor.
 ENV EDITOR=vim
 ENV VISUAL=vim
+# Default to C.UTF-8 so vim and other tools handle multi-byte input
+# (Japanese, emoji, …) correctly. Without a UTF-8 locale libc falls back
+# to POSIX/ASCII and every non-ASCII character gets garbled on display.
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 
 WORKDIR /workspace
 
