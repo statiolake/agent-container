@@ -26,11 +26,7 @@ use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct McpOAuthEntry {
-    /// The `<serverName>|<hash>` key used in Keychain, kept intact so
-    /// callers can round-trip updates back into the same record later.
-    pub keychain_key: String,
     pub server_name: String,
-    pub server_url: String,
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at_ms: Option<i64>,
@@ -40,13 +36,6 @@ pub struct McpOAuthEntry {
 }
 
 impl McpOAuthEntry {
-    pub fn is_expired(&self) -> bool {
-        let Some(exp) = self.expires_at_ms else {
-            return false;
-        };
-        now_ms() >= exp
-    }
-
     /// Consider a token about-to-expire as expired. Gives the refresh
     /// path some slack so we don't race with an in-flight request.
     pub fn is_expiring_soon(&self) -> bool {
@@ -68,8 +57,6 @@ pub fn now_ms() -> i64 {
 struct RawEntry {
     #[serde(default, rename = "serverName")]
     server_name: Option<String>,
-    #[serde(default, rename = "serverUrl")]
-    server_url: Option<String>,
     #[serde(default, rename = "accessToken")]
     access_token: Option<String>,
     #[serde(default, rename = "refreshToken")]
@@ -150,12 +137,9 @@ fn parse_entry(keychain_key: &str, value: &Value) -> Result<McpOAuthEntry> {
     let Some(access_token) = raw.access_token else {
         bail!("mcpOAuth entry '{keychain_key}' has no accessToken");
     };
-    let server_url = raw.server_url.unwrap_or_default();
 
     Ok(McpOAuthEntry {
-        keychain_key: keychain_key.to_string(),
         server_name,
-        server_url,
         access_token,
         refresh_token: raw.refresh_token,
         expires_at_ms: raw.expires_at,
@@ -184,10 +168,6 @@ impl OAuthStore {
             .map(|(k, v)| (k, Arc::new(Mutex::new(v))))
             .collect();
         Self { entries, http }
-    }
-
-    pub fn server_names(&self) -> impl Iterator<Item = &str> {
-        self.entries.keys().map(String::as_str)
     }
 
     /// Return a currently-valid access token for an MCP server, refreshing
@@ -331,7 +311,6 @@ mod tests {
         }"#;
         let out = parse_raw_credentials(raw).unwrap();
         let notion = out.get("notion").unwrap();
-        assert_eq!(notion.keychain_key, "notion|abcd1234");
         assert_eq!(notion.access_token, "ntn-XYZ");
         assert_eq!(notion.refresh_token.as_deref(), Some("ntn-REFRESH"));
         assert_eq!(notion.expires_at_ms, Some(1776600000000));
@@ -373,11 +352,9 @@ mod tests {
     }
 
     #[test]
-    fn expiry_helpers_behave_near_deadline() {
+    fn is_expiring_soon_behaves_near_deadline() {
         let mut e = McpOAuthEntry {
-            keychain_key: "k".into(),
             server_name: "n".into(),
-            server_url: String::new(),
             access_token: "a".into(),
             refresh_token: None,
             expires_at_ms: Some(now_ms() + 1_000_000),
@@ -385,19 +362,15 @@ mod tests {
             authorization_server_url: None,
             scope: None,
         };
-        assert!(!e.is_expired());
         assert!(!e.is_expiring_soon());
 
         e.expires_at_ms = Some(now_ms() - 1);
-        assert!(e.is_expired());
         assert!(e.is_expiring_soon());
 
         e.expires_at_ms = Some(now_ms() + 5_000);
-        assert!(!e.is_expired());
         assert!(e.is_expiring_soon());
 
         e.expires_at_ms = None;
-        assert!(!e.is_expired());
         assert!(!e.is_expiring_soon());
     }
 }
