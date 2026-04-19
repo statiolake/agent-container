@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -13,16 +13,14 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Launch Claude Code inside the sandbox container.
+    /// Launch a coding agent inside the sandbox container.
     Run {
-        /// Extra arguments forwarded to `claude` inside the container.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        passthrough: Vec<String>,
-    },
-
-    /// Launch Codex (OpenAI) inside the sandbox container.
-    Codex {
-        /// Extra arguments forwarded to `codex` inside the container.
+        /// Which agent to run as the session's primary binary. Both agents'
+        /// auth is still bind-mounted either way, so you can call the other
+        /// one from inside.
+        #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
+        agent: AgentKind,
+        /// Extra arguments forwarded to the chosen agent inside the container.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         passthrough: Vec<String>,
     },
@@ -32,6 +30,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AgentKind {
+    Claude,
+    Codex,
 }
 
 #[derive(Debug, Subcommand)]

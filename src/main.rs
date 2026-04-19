@@ -12,10 +12,13 @@ mod policy;
 mod server;
 mod sync;
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::cli::{Cli, Commands, ConfigCommands};
+use crate::cli::{AgentKind, Cli, Commands, ConfigCommands};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,27 +32,30 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run { passthrough } => run_cmd(passthrough).await,
-        Commands::Codex { passthrough } => codex_cmd(passthrough).await,
+        Commands::Run { agent, passthrough } => run_cmd(agent, passthrough).await,
         Commands::Config { command } => match command {
             ConfigCommands::Mcp => config_cmd::run().await,
         },
     }
 }
 
-async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
+async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
     let host = paths::HostPaths::detect()?;
 
+    // Host-side discovery — always performed so broker/sync can populate
+    // correctly regardless of which agent is the session primary.
     let bedrock = aws::detect_setup(&host.claude_root.join("settings.json"))
         .context("failed to read Bedrock settings from ~/.claude/settings.json")?;
     let refresh = aws::detect_refresh_command(&host.home.join(".claude.json"))
         .context("failed to read awsAuthRefresh from ~/.claude.json")?;
     let mcp_servers = mcp::load_http_servers(&host.home.join(".claude.json"))
         .context("failed to load MCP servers from ~/.claude.json")?;
-    let policy = policy::McpPolicy::load()
-        .context("failed to load MCP allowlist policy; fix or remove ~/.config/agent-container/mcp.toml")?;
-    let oauth = std::sync::Arc::new(oauth::OAuthStore::new(
-        oauth::load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
+    let policy = policy::McpPolicy::load().context(
+        "failed to load MCP allowlist policy; fix or remove ~/.config/agent-container/mcp.toml",
+    )?;
+    let oauth_store = Arc::new(oauth::OAuthStore::new(
+        oauth::load_from_keychain()
+            .context("failed to load MCP OAuth entries from Keychain")?,
     ));
 
     if let Some(setup) = &bedrock {
@@ -67,29 +73,14 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
         );
     }
 
-    // When Bedrock is active the container does not need Anthropic OAuth, so
-    // credential-prep failures degrade to a warning.
-    let credentials = match creds::prepare(&host.claude_root) {
-        Ok(c) => Some(c),
-        Err(e) if bedrock.is_some() => {
-            eprintln!(
-                "[agent-container] note: skipping Anthropic credentials (using Bedrock): {e:#}"
-            );
-            None
-        }
-        Err(e) => {
-            return Err(e).context(
-                "failed to prepare Claude OAuth credentials; run `claude /login` on the host first",
-            );
-        }
-    };
-    if let Some(c) = &credentials
-        && c.is_expired()
-    {
-        eprintln!(
-            "[agent-container] warning: host Claude credentials appear expired; refresh them with `claude /login` before running if the container cannot refresh on its own."
-        );
-    }
+    // Always attempt to materialise both agents' auth so that whichever
+    // agent runs as primary, the other can still be invoked from inside
+    // (e.g. Claude's bash tool calling `codex exec ...` or vice versa).
+    let claude_is_primary = matches!(agent, AgentKind::Claude);
+    let codex_is_primary = matches!(agent, AgentKind::Codex);
+    let claude_creds =
+        prepare_claude_credentials(&host, claude_is_primary, bedrock.is_some())?;
+    let codex_auth = prepare_codex_auth(&host, codex_is_primary)?;
 
     docker::ensure_images(&docker::default_dockerfile_dir())
         .await
@@ -99,7 +90,7 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
         bedrock.clone().map(|b| (b, refresh.clone())),
         mcp_servers.clone(),
         policy,
-        oauth.clone(),
+        oauth_store.clone(),
     )
     .await?;
     tracing::info!(addr = %broker.addr, "host broker listening");
@@ -116,58 +107,86 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
     )
     .context("failed to sync host Claude Code state into container")?;
 
-    let credentials_path = credentials
+    let credentials_path = claude_creds
         .as_ref()
         .map(|c| c.path.clone())
-        .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+        .unwrap_or_else(|| PathBuf::from("/dev/null"));
+    let codex_auth_path = codex_auth
+        .as_ref()
+        .map(|c| c.path.clone())
+        .unwrap_or_else(|| PathBuf::from("/dev/null"));
+
+    let agent_command = match agent {
+        AgentKind::Claude => vec![
+            "claude".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ],
+        AgentKind::Codex => vec!["codex".to_string()],
+    };
 
     let exit = docker::run(docker::RunOptions {
         host,
         credentials_path,
-        codex_auth_path: std::path::PathBuf::from("/dev/null"),
+        codex_auth_path,
         bedrock_setup: bedrock,
         broker_addr: broker.addr,
-        agent_command: vec![
-            "claude".to_string(),
-            "--dangerously-skip-permissions".to_string(),
-        ],
+        agent_command,
         extra_args: passthrough,
     })
     .await?;
 
     broker.handle.abort();
-    drop(credentials);
+    drop(claude_creds);
+    drop(codex_auth);
     std::process::exit(exit);
 }
 
-async fn codex_cmd(passthrough: Vec<String>) -> Result<()> {
-    let host = paths::HostPaths::detect()?;
+fn prepare_claude_credentials(
+    host: &paths::HostPaths,
+    primary: bool,
+    has_bedrock: bool,
+) -> Result<Option<creds::CredentialFile>> {
+    match creds::prepare(&host.claude_root) {
+        Ok(c) => {
+            if c.is_expired() {
+                eprintln!(
+                    "[agent-container] warning: host Claude credentials appear expired; refresh them with `claude /login` before running if the container cannot refresh on its own."
+                );
+            }
+            Ok(Some(c))
+        }
+        Err(e) if !primary => {
+            eprintln!(
+                "[agent-container] note: Claude credentials unavailable; the in-container 'claude' binary will fail until `claude /login` is run on the host: {e:#}"
+            );
+            Ok(None)
+        }
+        Err(e) if has_bedrock => {
+            eprintln!(
+                "[agent-container] note: skipping Anthropic credentials (using Bedrock): {e:#}"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e).context(
+            "failed to prepare Claude OAuth credentials; run `claude /login` on the host first",
+        ),
+    }
+}
 
-    let codex_auth = codex::prepare_auth(&host.home)
-        .context("failed to prepare Codex auth; run `codex login` on the host first")?;
-
-    docker::ensure_images(&docker::default_dockerfile_dir())
-        .await
-        .context("failed to build or locate container images")?;
-
-    // Spawn an empty broker so the compose project still has a reachable
-    // AGENT_CONTAINER_HOST_ENDPOINT; Codex itself does not use /aws or
-    // /mcp routes.
-    let broker = server::spawn(None, Vec::new(), policy::McpPolicy::default(), std::sync::Arc::new(oauth::OAuthStore::new(Default::default())))
-        .await?;
-
-    let exit = docker::run(docker::RunOptions {
-        host,
-        credentials_path: std::path::PathBuf::from("/dev/null"),
-        codex_auth_path: codex_auth.path.clone(),
-        bedrock_setup: None,
-        broker_addr: broker.addr,
-        agent_command: vec!["codex".to_string()],
-        extra_args: passthrough,
-    })
-    .await?;
-
-    broker.handle.abort();
-    drop(codex_auth);
-    std::process::exit(exit);
+fn prepare_codex_auth(
+    host: &paths::HostPaths,
+    primary: bool,
+) -> Result<Option<codex::CodexAuthFile>> {
+    match codex::prepare_auth(&host.home) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if !primary => {
+            eprintln!(
+                "[agent-container] note: Codex auth unavailable; the in-container 'codex' binary will fail until `codex login` is run on the host: {e:#}"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e).context(
+            "failed to prepare Codex auth; run `codex login` on the host first",
+        ),
+    }
 }
