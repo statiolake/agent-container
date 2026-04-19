@@ -37,6 +37,8 @@ pub struct Tool {
 pub struct ToolAnnotations {
     #[serde(default, rename = "readOnlyHint")]
     pub read_only_hint: Option<bool>,
+    // Retained for schema fidelity and future UI polish; not consumed yet.
+    #[allow(dead_code)]
     #[serde(default, rename = "destructiveHint")]
     pub destructive_hint: Option<bool>,
 }
