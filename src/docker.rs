@@ -137,6 +137,14 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         format!("http://host.docker.internal:{}", opts.broker_addr.port()),
     );
 
+    // Forward the host terminal description so in-container TUIs choose
+    // the correct colour palette.
+    for key in ["TERM", "COLORTERM"] {
+        if let Ok(v) = std::env::var(key) {
+            env.insert(key.to_string(), v);
+        }
+    }
+
     // Bedrock env vars: declared as `${VAR:-}` in compose.yml, so an unset
     // shell var translates to an empty string in the container.
     let mut put = |k: &str, v: String| {

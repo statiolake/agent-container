@@ -28,6 +28,11 @@ services:
       - no_proxy=localhost,127.0.0.1,proxy
       - IS_SANDBOX=1
       - TINI_SUBREAPER=1
+      # Inherit the host terminal so the in-container TUIs (Claude Code,
+      # Codex) pick the right colour palette. Sensible defaults for
+      # non-interactive or unknown hosts.
+      - TERM=${TERM:-xterm-256color}
+      - COLORTERM=${COLORTERM:-truecolor}
       # Bedrock pathway. Actual AWS credentials are fetched on demand by
       # the container's awsAuthRefresh script via AGENT_CONTAINER_HOST_ENDPOINT;
       # these toggles stay empty unless the host opted in.
