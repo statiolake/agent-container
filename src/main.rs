@@ -1,3 +1,4 @@
+mod aws;
 mod cli;
 mod creds;
 mod docker;
@@ -27,10 +28,41 @@ async fn main() -> Result<()> {
 
 async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
     let host = paths::HostPaths::detect()?;
-    let credentials = creds::prepare(&host.claude_root).context(
-        "failed to prepare Claude OAuth credentials; run `claude /login` on the host first",
-    )?;
-    if credentials.is_expired() {
+
+    let bedrock = aws::detect_setup(&host.claude_root.join("settings.json"))
+        .context("failed to read Bedrock settings from ~/.claude/settings.json")?;
+    let bedrock_creds = if let Some(setup) = &bedrock {
+        eprintln!(
+            "[agent-container] Bedrock mode detected (profile={}); resolving AWS credentials...",
+            setup.profile
+        );
+        Some(
+            aws::resolve_credentials(setup)
+                .context("failed to resolve AWS credentials for Bedrock")?,
+        )
+    } else {
+        None
+    };
+
+    // When Bedrock is active the container does not need Anthropic OAuth, so
+    // credential-prep failures degrade to a warning.
+    let credentials = match creds::prepare(&host.claude_root) {
+        Ok(c) => Some(c),
+        Err(e) if bedrock.is_some() => {
+            eprintln!(
+                "[agent-container] note: skipping Anthropic credentials (using Bedrock): {e:#}"
+            );
+            None
+        }
+        Err(e) => {
+            return Err(e).context(
+                "failed to prepare Claude OAuth credentials; run `claude /login` on the host first",
+            );
+        }
+    };
+    if let Some(c) = &credentials
+        && c.is_expired()
+    {
         eprintln!(
             "[agent-container] warning: host Claude credentials appear expired; refresh them with `claude /login` before running if the container cannot refresh on its own."
         );
@@ -42,9 +74,15 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
 
     sync::sync_host_state(&host).context("failed to sync host Claude Code state into container")?;
 
+    let credentials_path = credentials
+        .as_ref()
+        .map(|c| c.path.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+
     let exit = docker::run(docker::RunOptions {
         host,
-        credentials_path: credentials.path.clone(),
+        credentials_path,
+        bedrock: bedrock.zip(bedrock_creds),
         extra_args: passthrough,
     })
     .await?;

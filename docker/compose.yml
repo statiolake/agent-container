@@ -24,6 +24,16 @@ services:
       - no_proxy=localhost,127.0.0.1,proxy
       - IS_SANDBOX=1
       - TINI_SUBREAPER=1
+      # Bedrock pathway; these are empty unless the host opted in via
+      # ~/.claude/settings.json env.USE_BEDROCK + AWS_PROFILE.
+      - CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-}
+      - USE_BEDROCK=${USE_BEDROCK:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
+      - AWS_REGION=${AWS_REGION:-}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
     volumes:
       # Persistent $HOME so onboarding, login, settings, and Claude Code's
       # ~/.claude.json survive across runs. Specific sub-mounts below

@@ -9,6 +9,10 @@
 ^claude\.ai$
 ^console\.anthropic\.com$
 
+# --- AWS Bedrock (only used when USE_BEDROCK is set in settings.json env) ---
+^bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com$
+^bedrock\.[a-z0-9-]+\.amazonaws\.com$
+
 # --- Rust toolchain ---
 ^crates\.io$
 ^static\.crates\.io$
