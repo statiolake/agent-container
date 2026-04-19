@@ -25,6 +25,10 @@ services:
       - IS_SANDBOX=1
       - TINI_SUBREAPER=1
     volumes:
+      # Persistent $HOME so onboarding, login, settings, and Claude Code's
+      # ~/.claude.json survive across runs. Specific sub-mounts below
+      # override individual paths that must stay ephemeral or workspace-scoped.
+      - "${CONTAINER_HOME_PATH}:/home/agent"
       - "${WORKSPACE_PATH}:/workspace"
       - "${HOST_PROJECT_DIR}:/home/agent/.claude/projects/-workspace"
       - "${CREDENTIALS_PATH}:/home/agent/.claude/.credentials.json"

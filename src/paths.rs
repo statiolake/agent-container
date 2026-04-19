@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use directories::UserDirs;
+use directories::{ProjectDirs, UserDirs};
 
 pub struct HostPaths {
     pub claude_root: PathBuf,
     pub workspace: PathBuf,
+    pub container_home: PathBuf,
 }
 
 impl HostPaths {
@@ -13,10 +14,13 @@ impl HostPaths {
         let user_dirs = UserDirs::new().context("failed to detect user home directory")?;
         let home = user_dirs.home_dir().to_path_buf();
         let claude_root = home.join(".claude");
-        let workspace = std::env::current_dir().context("failed to read current working directory")?;
+        let workspace =
+            std::env::current_dir().context("failed to read current working directory")?;
+        let container_home = detect_container_home()?;
         Ok(Self {
             claude_root,
             workspace,
+            container_home,
         })
     }
 
@@ -29,6 +33,17 @@ impl HostPaths {
     pub fn host_claude_md(&self) -> PathBuf {
         self.claude_root.join("CLAUDE.md")
     }
+}
+
+/// Persistent `$HOME` directory used by the containerised Claude Code.
+/// Kept separate from the host's `~` so host settings, hooks, and plugins
+/// never leak in, while onboarding, login, and other transient state (which
+/// Claude Code writes to both `~/.claude/` and `~/.claude.json`) survives
+/// across runs.
+fn detect_container_home() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("", "", "agent-container")
+        .context("failed to resolve XDG project directories")?;
+    Ok(dirs.data_local_dir().join("home"))
 }
 
 /// Convert an absolute path to the directory name Claude Code uses under

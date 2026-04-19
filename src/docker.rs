@@ -65,6 +65,12 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     let host_project_dir = opts.host.host_project_dir();
     std::fs::create_dir_all(&host_project_dir)
         .with_context(|| format!("failed to prepare session dir {}", host_project_dir.display()))?;
+    std::fs::create_dir_all(&opts.host.container_home).with_context(|| {
+        format!(
+            "failed to prepare persistent claude-home at {}",
+            opts.host.container_home.display()
+        )
+    })?;
 
     // Use /dev/null as the CLAUDE.md mount source when the host lacks one, so
     // compose always has a concrete path to bind.
@@ -87,6 +93,10 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         (
             "WORKSPACE_PATH",
             opts.host.workspace.display().to_string(),
+        ),
+        (
+            "CONTAINER_HOME_PATH",
+            opts.host.container_home.display().to_string(),
         ),
         (
             "HOST_PROJECT_DIR",
