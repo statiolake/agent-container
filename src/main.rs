@@ -10,6 +10,7 @@ mod oauth;
 mod paths;
 mod policy;
 mod server;
+mod stdio_mcp;
 mod sync;
 
 use std::path::PathBuf;
@@ -49,7 +50,7 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
         .context("failed to read Bedrock settings from ~/.claude/settings.json")?;
     let refresh = aws::detect_refresh_command(&host.home.join(".claude.json"))
         .context("failed to read awsAuthRefresh from ~/.claude.json")?;
-    let mcp_servers = mcp::load_http_servers(&host.home.join(".claude.json"))
+    let mcp_servers = mcp::load_servers(&host.home.join(".claude.json"))
         .context("failed to load MCP servers from ~/.claude.json")?;
     let policy = policy::McpPolicy::load().context(
         "failed to load MCP allowlist policy; fix or remove ~/.config/agent-container/mcp.toml",
@@ -66,11 +67,14 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
         );
     }
     if !mcp_servers.is_empty() {
-        let names: Vec<_> = mcp_servers.iter().map(|s| s.name.as_str()).collect();
+        let labels: Vec<_> = mcp_servers
+            .iter()
+            .map(|s| format!("{}({})", s.name(), s.transport_label()))
+            .collect();
         eprintln!(
             "[agent-container] proxying {} MCP server(s) through broker: {}",
             mcp_servers.len(),
-            names.join(", ")
+            labels.join(", ")
         );
     }
 
@@ -156,7 +160,7 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
     let refresh = aws::detect_refresh_command(&host.home.join(".claude.json"))
         .ok()
         .flatten();
-    let mcp_servers = mcp::load_http_servers(&host.home.join(".claude.json")).unwrap_or_default();
+    let mcp_servers = mcp::load_servers(&host.home.join(".claude.json")).unwrap_or_default();
     let policy = policy::McpPolicy::load().unwrap_or_default();
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().unwrap_or_default(),

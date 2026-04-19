@@ -1,5 +1,4 @@
-//! Read the host's MCP server declarations, classify them by transport,
-//! and expose the HTTP/SSE ones via the broker.
+//! Read the host's MCP server declarations and classify them by transport.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -19,9 +18,40 @@ pub struct HttpMcpServer {
     pub headers: BTreeMap<String, String>,
 }
 
-/// Read HTTP/SSE MCP server definitions from the top-level `mcpServers`
-/// in `~/.claude.json`. stdio servers are ignored for now.
-pub fn load_http_servers(claude_json: &Path) -> Result<Vec<HttpMcpServer>> {
+#[derive(Debug, Clone)]
+pub struct StdioMcpServer {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum McpServer {
+    Http(HttpMcpServer),
+    Stdio(StdioMcpServer),
+}
+
+impl McpServer {
+    pub fn name(&self) -> &str {
+        match self {
+            McpServer::Http(s) => &s.name,
+            McpServer::Stdio(s) => &s.name,
+        }
+    }
+
+    pub fn transport_label(&self) -> &str {
+        match self {
+            McpServer::Http(s) => s.transport.as_str(),
+            McpServer::Stdio(_) => "stdio",
+        }
+    }
+}
+
+/// Read every MCP server definition out of the top-level `mcpServers` key
+/// of `~/.claude.json`. Entries the parser cannot classify are logged and
+/// skipped rather than returned as errors.
+pub fn load_servers(claude_json: &Path) -> Result<Vec<McpServer>> {
     if !claude_json.is_file() {
         return Ok(Vec::new());
     }
@@ -39,15 +69,28 @@ pub fn load_http_servers(claude_json: &Path) -> Result<Vec<HttpMcpServer>> {
         match parse_entry(name, value) {
             Ok(Some(server)) => out.push(server),
             Ok(None) => {
-                tracing::debug!(name, "skipping non-HTTP MCP server");
+                tracing::debug!(name, "skipping unrecognised MCP server entry");
             }
             Err(e) => {
                 tracing::warn!(name, error = %e, "failed to parse MCP server entry; skipping");
             }
         }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort_by(|a, b| a.name().cmp(b.name()));
     Ok(out)
+}
+
+/// Backwards-compatible filter for callers (e.g. the `config mcp` TUI) that
+/// only handle HTTP/SSE transports.
+pub fn load_http_servers(claude_json: &Path) -> Result<Vec<HttpMcpServer>> {
+    let servers = load_servers(claude_json)?;
+    Ok(servers
+        .into_iter()
+        .filter_map(|s| match s {
+            McpServer::Http(h) => Some(h),
+            McpServer::Stdio(_) => None,
+        })
+        .collect())
 }
 
 #[derive(Deserialize)]
@@ -60,9 +103,13 @@ struct RawEntry {
     headers: BTreeMap<String, String>,
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
-fn parse_entry(name: &str, value: &Value) -> Result<Option<HttpMcpServer>> {
+fn parse_entry(name: &str, value: &Value) -> Result<Option<McpServer>> {
     let entry: RawEntry =
         serde_json::from_value(value.clone()).context("entry is not a valid MCP server object")?;
 
@@ -72,28 +119,41 @@ fn parse_entry(name: &str, value: &Value) -> Result<Option<HttpMcpServer>> {
         Some(t) => t.to_ascii_lowercase(),
         None => {
             if entry.command.is_some() {
-                return Ok(None);
+                "stdio".to_string()
+            } else {
+                "http".to_string()
             }
-            "http".to_string()
         }
     };
 
-    if transport != "http" && transport != "sse" {
-        return Ok(None);
+    match transport.as_str() {
+        "stdio" => {
+            let Some(command) = entry.command else {
+                return Ok(None);
+            };
+            Ok(Some(McpServer::Stdio(StdioMcpServer {
+                name: name.to_string(),
+                command,
+                args: entry.args,
+                env: entry.env,
+            })))
+        }
+        "http" | "sse" => {
+            let Some(url) = entry.url else {
+                return Ok(None);
+            };
+            if url.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(McpServer::Http(HttpMcpServer {
+                name: name.to_string(),
+                transport,
+                url,
+                headers: entry.headers,
+            })))
+        }
+        _ => Ok(None),
     }
-    let Some(url) = entry.url else {
-        return Ok(None);
-    };
-    if url.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(HttpMcpServer {
-        name: name.to_string(),
-        transport,
-        url,
-        headers: entry.headers,
-    }))
 }
 
 #[cfg(test)]
@@ -107,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_http_servers_skipping_stdio() {
+    fn loads_both_http_and_stdio_servers() {
         let f = write(
             r#"{
               "mcpServers": {
@@ -115,29 +175,51 @@ mod tests {
                          "headers": {"Authorization": "Bearer xxx"}},
                 "fs": {"type": "stdio", "command": "node", "args": ["srv.js"]},
                 "legacy-sse": {"type": "sse", "url": "https://old.example/mcp"},
-                "implicit-stdio": {"command": "ls"},
+                "implicit-stdio": {"command": "ls", "args": ["/tmp"]},
                 "broken": {}
               }
             }"#,
         );
-        let servers = load_http_servers(f.path()).unwrap();
-        let names: Vec<_> = servers.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["legacy-sse", "web"]);
-        let web = servers.iter().find(|s| s.name == "web").unwrap();
-        assert_eq!(web.transport, "http");
-        assert_eq!(web.url, "https://example.com/mcp");
-        assert_eq!(web.headers.get("Authorization").map(String::as_str), Some("Bearer xxx"));
+        let servers = load_servers(f.path()).unwrap();
+        let pairs: Vec<_> = servers
+            .iter()
+            .map(|s| (s.name(), s.transport_label()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("fs", "stdio"),
+                ("implicit-stdio", "stdio"),
+                ("legacy-sse", "sse"),
+                ("web", "http"),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_http_servers_filters_out_stdio() {
+        let f = write(
+            r#"{
+              "mcpServers": {
+                "web": {"type": "http", "url": "https://example.com/mcp"},
+                "fs": {"type": "stdio", "command": "node"}
+              }
+            }"#,
+        );
+        let http = load_http_servers(f.path()).unwrap();
+        let names: Vec<_> = http.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["web"]);
     }
 
     #[test]
     fn empty_when_no_mcp_servers() {
         let f = write(r#"{"hasCompletedOnboarding": true}"#);
-        assert!(load_http_servers(f.path()).unwrap().is_empty());
+        assert!(load_servers(f.path()).unwrap().is_empty());
     }
 
     #[test]
     fn missing_file_is_fine() {
         let p = std::env::temp_dir().join("definitely-missing-claude.json");
-        assert!(load_http_servers(&p).unwrap().is_empty());
+        assert!(load_servers(&p).unwrap().is_empty());
     }
 }

@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Request, State};
@@ -30,14 +30,20 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::aws::{BedrockCredentials, BedrockSetup, resolve_credentials};
-use crate::mcp::HttpMcpServer;
+use crate::mcp::{HttpMcpServer, McpServer};
 use crate::oauth::OAuthStore;
 use crate::policy::McpPolicy;
+use crate::stdio_mcp::{self, StdioHandle};
+
+enum McpBackend {
+    Http(HttpMcpServer),
+    Stdio(StdioHandle),
+}
 
 struct BrokerState {
     bedrock: Option<(BedrockSetup, Option<String>)>,
     last_error: Mutex<Option<String>>,
-    mcp: HashMap<String, HttpMcpServer>,
+    mcp: HashMap<String, McpBackend>,
     policy: RwLock<McpPolicy>,
     annotations: Mutex<HashMap<String, HashMap<String, Option<bool>>>>,
     oauth: Arc<OAuthStore>,
@@ -51,7 +57,7 @@ pub struct RunningServer {
 
 pub async fn spawn(
     bedrock: Option<(BedrockSetup, Option<String>)>,
-    mcp_servers: Vec<HttpMcpServer>,
+    mcp_servers: Vec<McpServer>,
     policy: McpPolicy,
     oauth: Arc<OAuthStore>,
 ) -> Result<RunningServer> {
@@ -65,10 +71,26 @@ pub async fn spawn(
         .build()
         .context("failed to build reqwest client")?;
 
-    let mcp: HashMap<String, HttpMcpServer> = mcp_servers
-        .into_iter()
-        .map(|s| (s.name.clone(), s))
-        .collect();
+    let mut mcp: HashMap<String, McpBackend> = HashMap::new();
+    for server in mcp_servers {
+        let name = server.name().to_string();
+        match server {
+            McpServer::Http(h) => {
+                mcp.insert(name, McpBackend::Http(h));
+            }
+            McpServer::Stdio(s) => match stdio_mcp::spawn_worker(s.clone()) {
+                Ok(handle) => {
+                    mcp.insert(name, McpBackend::Stdio(handle));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[agent-container] failed to start stdio MCP server '{}': {e:#}",
+                        s.name
+                    );
+                }
+            },
+        }
+    }
 
     let state = Arc::new(BrokerState {
         bedrock,
@@ -141,7 +163,11 @@ async fn forward_mcp(
     state: Arc<BrokerState>,
     req: Request,
 ) -> Response {
-    let Some(server) = state.mcp.get(name).cloned() else {
+    let backend_kind = state.mcp.get(name).map(|b| match b {
+        McpBackend::Http(_) => BackendKind::Http,
+        McpBackend::Stdio(_) => BackendKind::Stdio,
+    });
+    let Some(kind) = backend_kind else {
         return (
             StatusCode::NOT_FOUND,
             format!("no MCP server named '{name}' on host"),
@@ -149,7 +175,11 @@ async fn forward_mcp(
             .into_response();
     };
 
-    match forward_inner(state, name, server, rest, req).await {
+    let result = match kind {
+        BackendKind::Http => forward_http(state, name, rest, req).await,
+        BackendKind::Stdio => forward_stdio(state, name, req).await,
+    };
+    match result {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!(name = %name, error = %e, "MCP forward failed");
@@ -158,13 +188,21 @@ async fn forward_mcp(
     }
 }
 
-async fn forward_inner(
+enum BackendKind {
+    Http,
+    Stdio,
+}
+
+async fn forward_http(
     state: Arc<BrokerState>,
     server_name: &str,
-    server: HttpMcpServer,
     rest_path: &str,
     req: Request,
 ) -> Result<Response> {
+    let server = match state.mcp.get(server_name) {
+        Some(McpBackend::Http(s)) => s.clone(),
+        _ => bail!("internal: expected HTTP backend for '{server_name}'"),
+    };
     let (parts, body) = req.into_parts();
     let upstream_url = build_upstream_url(&server.url, rest_path, parts.uri.query())?;
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
@@ -190,30 +228,8 @@ async fn forward_inner(
         .await
         .context("failed to buffer request body")?;
 
-    // Policy gate: reject disallowed tools/call before they reach the upstream.
-    if let Some(call) = parse_tool_call(&body_bytes) {
-        let read_only = {
-            let cache = state.annotations.lock().await;
-            cache
-                .get(server_name)
-                .and_then(|m| m.get(&call.name))
-                .copied()
-                .unwrap_or(None)
-        };
-        let allowed = {
-            let policy = state.policy.read().await;
-            policy.tool_allowed(server_name, &call.name, read_only)
-        };
-        if !allowed {
-            return Ok(jsonrpc_error_response(
-                call.id,
-                -32601,
-                format!(
-                    "tool '{}' is blocked by agent-container allowlist",
-                    call.name
-                ),
-            ));
-        }
+    if let Some(blocked) = enforce_tool_call_policy(&state, server_name, &body_bytes).await {
+        return Ok(blocked);
     }
 
     let is_tools_list = parse_method(&body_bytes).as_deref() == Some("tools/list");
@@ -287,6 +303,98 @@ async fn forward_inner(
         .expect("response builder headers") = out_headers;
     let stream = upstream.bytes_stream();
     Ok(builder.body(Body::from_stream(stream))?)
+}
+
+async fn forward_stdio(
+    state: Arc<BrokerState>,
+    server_name: &str,
+    req: Request,
+) -> Result<Response> {
+    let handle = match state.mcp.get(server_name) {
+        Some(McpBackend::Stdio(h)) => h.clone(),
+        _ => bail!("internal: expected stdio backend for '{server_name}'"),
+    };
+
+    let (_parts, body) = req.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .context("failed to buffer request body")?;
+
+    if let Some(blocked) = enforce_tool_call_policy(&state, server_name, &body_bytes).await {
+        return Ok(blocked);
+    }
+
+    let is_tools_list = parse_method(&body_bytes).as_deref() == Some("tools/list");
+    let response_bytes = handle
+        .call(body_bytes.to_vec())
+        .await
+        .context("stdio MCP call failed")?;
+
+    // Notifications come back empty — respond with 204 so the Claude Code
+    // MCP client does not try to parse an empty body as JSON.
+    if response_bytes.is_empty() {
+        return Ok(Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Body::empty())?);
+    }
+
+    let body_bytes = if is_tools_list {
+        match filter_tools_list_body(
+            &response_bytes,
+            server_name,
+            &state.policy,
+            &state.annotations,
+        )
+        .await
+        {
+            Ok(filtered) => filtered,
+            Err(e) => {
+                tracing::warn!(server = %server_name, error = %e, "tools/list filter failed; passing stdio response through");
+                response_bytes
+            }
+        }
+    } else {
+        response_bytes
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body_bytes))?)
+}
+
+/// Run the tool-call allowlist gate. Returns a pre-built JSON-RPC error
+/// response when the request should be blocked, or None when it should
+/// be forwarded as-is.
+async fn enforce_tool_call_policy(
+    state: &BrokerState,
+    server_name: &str,
+    body_bytes: &[u8],
+) -> Option<Response> {
+    let call = parse_tool_call(body_bytes)?;
+    let read_only = {
+        let cache = state.annotations.lock().await;
+        cache
+            .get(server_name)
+            .and_then(|m| m.get(&call.name))
+            .copied()
+            .unwrap_or(None)
+    };
+    let allowed = {
+        let policy = state.policy.read().await;
+        policy.tool_allowed(server_name, &call.name, read_only)
+    };
+    if allowed {
+        return None;
+    }
+    Some(jsonrpc_error_response(
+        call.id,
+        -32601,
+        format!(
+            "tool '{}' is blocked by agent-container allowlist",
+            call.name
+        ),
+    ))
 }
 
 /// Parse just enough of the request body to extract the JSON-RPC method,

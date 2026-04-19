@@ -26,7 +26,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::mcp::HttpMcpServer;
+use crate::mcp::McpServer;
 use crate::paths::HostPaths;
 
 const CONTAINER_WORKSPACE: &str = "/workspace";
@@ -58,7 +58,7 @@ pub struct SyncOptions<'a> {
     pub bedrock: bool,
     /// `http://host.docker.internal:<broker port>` as seen from the container.
     pub broker_url_from_container: &'a str,
-    pub mcp_servers: &'a [HttpMcpServer],
+    pub mcp_servers: &'a [McpServer],
 }
 
 pub fn sync_host_state(host: &HostPaths, opts: SyncOptions<'_>) -> Result<()> {
@@ -133,21 +133,29 @@ fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
 
 fn build_proxy_mcp_map(
     broker_url: &str,
-    servers: &[HttpMcpServer],
+    servers: &[McpServer],
 ) -> serde_json::Map<String, Value> {
     let mut map = serde_json::Map::new();
     for s in servers {
         let mut entry = serde_json::Map::new();
-        entry.insert("type".into(), Value::String(s.transport.clone()));
+        // The broker always exposes everything as plain HTTP, even when the
+        // original server is SSE or stdio. Pick the closest `type` the
+        // Claude Code client understands: keep `sse` for native SSE (so the
+        // streaming semantics match), otherwise call it `http`.
+        let transport = match s {
+            McpServer::Http(h) if h.transport == "sse" => "sse",
+            _ => "http",
+        };
+        entry.insert("type".into(), Value::String(transport.into()));
         entry.insert(
             "url".into(),
             Value::String(format!(
                 "{}/mcp/{}",
                 broker_url.trim_end_matches('/'),
-                s.name
+                s.name()
             )),
         );
-        map.insert(s.name.clone(), Value::Object(entry));
+        map.insert(s.name().to_string(), Value::Object(entry));
     }
     map
 }
@@ -385,19 +393,26 @@ mod tests {
             workspace,
             container_home: container_home.path().to_path_buf(),
         };
+        use crate::mcp::HttpMcpServer;
         let servers = vec![
-            HttpMcpServer {
+            McpServer::Http(HttpMcpServer {
                 name: "github".to_string(),
                 transport: "http".to_string(),
                 url: "https://upstream/mcp".to_string(),
                 headers: Default::default(),
-            },
-            HttpMcpServer {
+            }),
+            McpServer::Http(HttpMcpServer {
                 name: "legacy".to_string(),
                 transport: "sse".to_string(),
                 url: "https://old/mcp".to_string(),
                 headers: Default::default(),
-            },
+            }),
+            McpServer::Stdio(crate::mcp::StdioMcpServer {
+                name: "local-fs".to_string(),
+                command: "node".to_string(),
+                args: vec!["srv.js".to_string()],
+                env: Default::default(),
+            }),
         ];
         sync_claude_json(
             &host,
@@ -420,6 +435,12 @@ mod tests {
         );
         assert_eq!(mcp["github"]["type"].as_str(), Some("http"));
         assert_eq!(mcp["legacy"]["type"].as_str(), Some("sse"));
+        // stdio MCP servers get proxied as HTTP in the container view.
+        assert_eq!(mcp["local-fs"]["type"].as_str(), Some("http"));
+        assert_eq!(
+            mcp["local-fs"]["url"].as_str(),
+            Some("http://host.docker.internal:9999/mcp/local-fs")
+        );
         // auth headers must never end up in the container copy
         assert!(mcp["github"].get("headers").is_none());
     }
