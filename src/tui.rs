@@ -1,10 +1,10 @@
 //! Full-screen ratatui UI for `agent-container config mcp`.
 //!
-//! Every tool advertised by every configured MCP server (HTTP/SSE/stdio)
-//! appears in a single scrollable checklist. Arrow keys move the cursor,
-//! space toggles the current tool, `s` or Enter saves, `q` or Esc cancels.
-//! The alternate screen is used so the prior terminal contents reappear
-//! untouched after exit.
+//! One tab per MCP server. `h`/`l` (or ←/→) switch tabs, `j`/`k` (or ↑/↓)
+//! move within the active tab's tool list, space toggles the highlighted
+//! tool, `a`/`A` enable/disable every tool on the current tab in one go,
+//! `s` or Enter saves, `q` or Esc cancels. The alternate screen is used
+//! so the prior terminal contents reappear untouched after exit.
 
 use std::io;
 use std::time::Duration;
@@ -20,7 +20,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs};
 
 #[derive(Debug, Clone)]
 pub struct ToolEntry {
@@ -38,68 +38,126 @@ pub enum Outcome {
 
 struct App {
     entries: Vec<ToolEntry>,
-    selected: usize,
+    server_names: Vec<String>,
+    tab: usize,
+    /// Cursor position per tab, kept across tab switches.
+    per_tab_cursor: Vec<usize>,
     state: ListState,
-    message: Option<String>,
 }
 
 impl App {
-    fn new(entries: Vec<ToolEntry>) -> Self {
+    fn new(mut entries: Vec<ToolEntry>) -> Self {
+        entries.sort_by(|a, b| {
+            a.server_name
+                .cmp(&b.server_name)
+                .then_with(|| a.tool_name.cmp(&b.tool_name))
+        });
+        let mut server_names: Vec<String> =
+            entries.iter().map(|e| e.server_name.clone()).collect();
+        server_names.dedup();
+        let per_tab_cursor = vec![0usize; server_names.len()];
         let mut state = ListState::default();
         if !entries.is_empty() {
             state.select(Some(0));
         }
         Self {
             entries,
-            selected: 0,
+            server_names,
+            tab: 0,
+            per_tab_cursor,
             state,
-            message: None,
         }
+    }
+
+    fn tab_indices(&self) -> Vec<usize> {
+        let Some(server) = self.server_names.get(self.tab) else {
+            return Vec::new();
+        };
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| &e.server_name == server)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn current_entry_index(&self) -> Option<usize> {
+        self.tab_indices()
+            .get(self.per_tab_cursor.get(self.tab).copied().unwrap_or(0))
+            .copied()
+    }
+
+    fn sync_state(&mut self) {
+        self.state
+            .select(self.per_tab_cursor.get(self.tab).copied());
+    }
+
+    fn next_tab(&mut self) {
+        if self.server_names.is_empty() {
+            return;
+        }
+        self.tab = (self.tab + 1) % self.server_names.len();
+        self.sync_state();
+    }
+
+    fn prev_tab(&mut self) {
+        if self.server_names.is_empty() {
+            return;
+        }
+        self.tab = if self.tab == 0 {
+            self.server_names.len() - 1
+        } else {
+            self.tab - 1
+        };
+        self.sync_state();
     }
 
     fn move_up(&mut self) {
-        if self.entries.is_empty() {
-            return;
+        let cur = self.per_tab_cursor.get_mut(self.tab);
+        if let Some(cur) = cur {
+            *cur = cur.saturating_sub(1);
         }
-        self.selected = self.selected.saturating_sub(1);
-        self.state.select(Some(self.selected));
+        self.sync_state();
     }
 
     fn move_down(&mut self) {
-        if self.entries.is_empty() {
-            return;
+        let tab_len = self.tab_indices().len();
+        if let Some(cur) = self.per_tab_cursor.get_mut(self.tab) {
+            if *cur + 1 < tab_len {
+                *cur += 1;
+            }
         }
-        if self.selected + 1 < self.entries.len() {
-            self.selected += 1;
-            self.state.select(Some(self.selected));
-        }
+        self.sync_state();
     }
 
     fn jump_home(&mut self) {
-        if !self.entries.is_empty() {
-            self.selected = 0;
-            self.state.select(Some(0));
+        if let Some(cur) = self.per_tab_cursor.get_mut(self.tab) {
+            *cur = 0;
         }
+        self.sync_state();
     }
 
     fn jump_end(&mut self) {
-        if !self.entries.is_empty() {
-            self.selected = self.entries.len() - 1;
-            self.state.select(Some(self.selected));
+        let tab_len = self.tab_indices().len();
+        if tab_len == 0 {
+            return;
         }
+        if let Some(cur) = self.per_tab_cursor.get_mut(self.tab) {
+            *cur = tab_len - 1;
+        }
+        self.sync_state();
     }
 
     fn toggle(&mut self) {
-        if let Some(entry) = self.entries.get_mut(self.selected) {
-            entry.enabled = !entry.enabled;
+        if let Some(idx) = self.current_entry_index() {
+            self.entries[idx].enabled = !self.entries[idx].enabled;
         }
     }
 
-    fn toggle_server_all(&mut self, enable: bool) {
-        let Some(current) = self.entries.get(self.selected) else {
+    fn toggle_all_in_tab(&mut self, enable: bool) {
+        let Some(server) = self.server_names.get(self.tab).cloned() else {
             return;
         };
-        let server = current.server_name.clone();
         for e in &mut self.entries {
             if e.server_name == server {
                 e.enabled = enable;
@@ -109,7 +167,6 @@ impl App {
 }
 
 pub fn run_selection(initial: Vec<ToolEntry>) -> Result<Outcome> {
-    // Enter alt-screen + raw mode; wire a panic hook to restore on crash.
     enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, cursor::Hide).context("entering alt screen")?;
@@ -132,11 +189,15 @@ pub fn run_selection(initial: Vec<ToolEntry>) -> Result<Outcome> {
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Up | KeyCode::Char('k') => app.move_up(),
                     KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                    KeyCode::Left | KeyCode::Char('h') => app.prev_tab(),
+                    KeyCode::Right | KeyCode::Char('l') => app.next_tab(),
+                    KeyCode::Tab => app.next_tab(),
+                    KeyCode::BackTab => app.prev_tab(),
                     KeyCode::Home | KeyCode::Char('g') => app.jump_home(),
                     KeyCode::End | KeyCode::Char('G') => app.jump_end(),
                     KeyCode::Char(' ') => app.toggle(),
-                    KeyCode::Char('a') => app.toggle_server_all(true),
-                    KeyCode::Char('A') => app.toggle_server_all(false),
+                    KeyCode::Char('a') => app.toggle_all_in_tab(true),
+                    KeyCode::Char('A') => app.toggle_all_in_tab(false),
                     KeyCode::Char('s') | KeyCode::Enter => break Outcome::Save(app.entries),
                     KeyCode::Char('q') | KeyCode::Esc => break Outcome::Cancel,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -149,7 +210,6 @@ pub fn run_selection(initial: Vec<ToolEntry>) -> Result<Outcome> {
         }
     };
 
-    // Restore terminal.
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show).ok();
     Ok(outcome)
@@ -161,14 +221,16 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(2),
         ])
         .split(area);
 
     render_title(f, chunks[0]);
-    render_list(f, chunks[1], app);
-    render_footer(f, chunks[2], app);
+    render_tabs(f, chunks[1], app);
+    render_list(f, chunks[2], app);
+    render_footer(f, chunks[3], app);
 }
 
 fn render_title(f: &mut ratatui::Frame<'_>, area: Rect) {
@@ -185,54 +247,35 @@ fn render_title(f: &mut ratatui::Frame<'_>, area: Rect) {
     f.render_widget(title, area);
 }
 
-fn render_list(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
-    let mut items: Vec<ListItem> = Vec::with_capacity(app.entries.len());
-    let mut last_server: Option<&str> = None;
-    for entry in &app.entries {
-        let server_changed = last_server != Some(entry.server_name.as_str());
-        last_server = Some(&entry.server_name);
-
-        let cb = if entry.enabled { "[x]" } else { "[ ]" };
-        let ann = match entry.read_only_hint {
-            Some(true) => Span::styled(" RO    ", Style::default().fg(Color::Green)),
-            Some(false) => Span::styled(" WRITE ", Style::default().fg(Color::Yellow)),
-            None => Span::styled("  ?    ", Style::default().fg(Color::DarkGray)),
-        };
-        let server = if server_changed {
-            Span::styled(
-                format!("{:<12}", entry.server_name),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::raw(format!("{:<12}", ""))
-        };
-        let tool = Span::raw(format!("{:<32}", entry.tool_name));
-        let first_line = entry
-            .description
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim();
-        let desc = Span::styled(
-            if first_line.len() > 60 {
-                format!("{}…", &first_line[..60])
-            } else {
-                first_line.to_string()
-            },
-            Style::default().fg(Color::DarkGray),
+fn render_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let titles: Vec<Line> = app
+        .server_names
+        .iter()
+        .map(|s| Line::from(Span::raw(s.as_str())))
+        .collect();
+    let tabs = Tabs::new(titles)
+        .block(Block::default().borders(Borders::BOTTOM))
+        .select(app.tab)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         );
+    f.render_widget(tabs, area);
+}
 
-        items.push(ListItem::new(Line::from(vec![
-            Span::raw(format!(" {cb} ")),
-            ann,
-            Span::raw("  "),
-            server,
-            tool,
-            desc,
-        ])));
-    }
+fn render_list(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+    let Some(server) = app.server_names.get(app.tab) else {
+        return;
+    };
+    let items: Vec<ListItem> = app
+        .entries
+        .iter()
+        .filter(|e| &e.server_name == server)
+        .map(render_row)
+        .collect();
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::NONE))
@@ -241,17 +284,49 @@ fn render_list(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶");
+        .highlight_symbol("▶ ");
 
     f.render_stateful_widget(list, area, &mut app.state);
 }
 
+fn render_row(entry: &ToolEntry) -> ListItem<'static> {
+    let cb = if entry.enabled { "[x]" } else { "[ ]" };
+    let first_line = entry.description.lines().next().unwrap_or("").trim();
+    let desc = if first_line.len() > 64 {
+        format!("{}…", &first_line[..64])
+    } else {
+        first_line.to_string()
+    };
+
+    // Small, out-of-the-way annotation tag after the description.
+    let annotation: Option<Span<'static>> = match entry.read_only_hint {
+        Some(true) => Some(Span::styled(" [RO]", Style::default().fg(Color::Green))),
+        Some(false) => Some(Span::styled(" [W]", Style::default().fg(Color::Yellow))),
+        None => None,
+    };
+
+    let mut spans = vec![
+        Span::raw(format!("{cb} ")),
+        Span::raw(format!("{:<32}", entry.tool_name)),
+        Span::styled(desc, Style::default().fg(Color::DarkGray)),
+    ];
+    if let Some(tag) = annotation {
+        spans.push(tag);
+    }
+    ListItem::new(Line::from(spans))
+}
+
 fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let enabled_count = app.entries.iter().filter(|e| e.enabled).count();
-    let total = app.entries.len();
     let help = Line::from(vec![
         Span::styled(
-            "↑/↓",
+            "h/l",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" switch MCP · "),
+        Span::styled(
+            "j/k",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -270,7 +345,7 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" server enable/disable all · "),
+        Span::raw(" tab on/off · "),
         Span::styled(
             "s",
             Style::default()
@@ -286,18 +361,43 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         ),
         Span::raw(" quit"),
     ]);
-    let count = Line::from(Span::styled(
-        format!(
-            "{}/{} enabled{}",
-            enabled_count,
-            total,
-            app.message
-                .as_ref()
-                .map(|m| format!(" — {m}"))
-                .unwrap_or_default()
+    let (tab_enabled, tab_total) = app
+        .server_names
+        .get(app.tab)
+        .map(|server| {
+            let total = app
+                .entries
+                .iter()
+                .filter(|e| &e.server_name == server)
+                .count();
+            let enabled = app
+                .entries
+                .iter()
+                .filter(|e| &e.server_name == server && e.enabled)
+                .count();
+            (enabled, total)
+        })
+        .unwrap_or((0, 0));
+    let total_enabled = app.entries.iter().filter(|e| e.enabled).count();
+    let count = Line::from(vec![
+        Span::styled(
+            format!(
+                "{}: {}/{} enabled",
+                app.server_names
+                    .get(app.tab)
+                    .map(String::as_str)
+                    .unwrap_or("-"),
+                tab_enabled,
+                tab_total
+            ),
+            Style::default().fg(Color::DarkGray),
         ),
-        Style::default().fg(Color::DarkGray),
-    ));
+        Span::raw("   "),
+        Span::styled(
+            format!("(overall {}/{})", total_enabled, app.entries.len()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
     let para = Paragraph::new(vec![help, count]);
     f.render_widget(para, area);
 }
