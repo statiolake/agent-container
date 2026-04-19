@@ -1,0 +1,43 @@
+services:
+  proxy:
+    image: agent-container-proxy:dev
+    networks:
+      - jail
+      - egress
+    volumes:
+      - "${ALLOWLIST_PATH}:/etc/tinyproxy/allowlist.txt:ro"
+    restart: "no"
+
+  agent:
+    image: agent-container:dev
+    depends_on:
+      proxy:
+        condition: service_started
+    networks:
+      - jail
+    environment:
+      - HTTP_PROXY=http://proxy:8888
+      - HTTPS_PROXY=http://proxy:8888
+      - http_proxy=http://proxy:8888
+      - https_proxy=http://proxy:8888
+      - NO_PROXY=localhost,127.0.0.1,proxy
+      - no_proxy=localhost,127.0.0.1,proxy
+      - IS_SANDBOX=1
+      - TINI_SUBREAPER=1
+    volumes:
+      - "${WORKSPACE_PATH}:/workspace"
+      - "${HOST_PROJECT_DIR}:/home/agent/.claude/projects/-workspace"
+      - "${CREDENTIALS_PATH}:/home/agent/.claude/.credentials.json"
+      - "${CLAUDE_MD_MOUNT_SRC}:/home/agent/.claude/CLAUDE.md:ro"
+    user: "${HOST_UID}:${HOST_GID}"
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    init: true
+
+networks:
+  jail:
+    driver: bridge
+    internal: true
+  egress:
+    driver: bridge

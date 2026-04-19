@@ -1,0 +1,45 @@
+# Extended regex patterns, one per line. `#` starts a comment.
+# Matches destination hostnames for CONNECT requests and URLs for plain HTTP.
+# With FilterDefaultDeny=Yes, only hosts matching a pattern are reachable.
+
+# --- Claude / Anthropic ---
+^api\.anthropic\.com$
+^statsig\.anthropic\.com$
+
+# --- Rust toolchain ---
+^crates\.io$
+^static\.crates\.io$
+^index\.crates\.io$
+^static\.rust-lang\.org$
+^sh\.rustup\.rs$
+
+# --- Node / npm ---
+^registry\.npmjs\.org$
+^registry\.yarnpkg\.com$
+
+# --- Python ---
+^pypi\.org$
+^files\.pythonhosted\.org$
+
+# --- Go modules ---
+^proxy\.golang\.org$
+^sum\.golang\.org$
+
+# --- GitHub (clone, release artifacts, API) ---
+^github\.com$
+^api\.github\.com$
+^codeload\.github\.com$
+^raw\.githubusercontent\.com$
+^objects\.githubusercontent\.com$
+^release-assets\.githubusercontent\.com$
+^uploads\.github\.com$
+
+# --- Debian / Ubuntu apt repos (container base image updates) ---
+^deb\.debian\.org$
+^security\.debian\.org$
+^archive\.ubuntu\.com$
+^security\.ubuntu\.com$
+^ports\.ubuntu\.com$
+
+# --- Alpine package repos ---
+^dl-cdn\.alpinelinux\.org$
