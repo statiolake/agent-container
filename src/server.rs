@@ -1,6 +1,17 @@
 //! Host-side broker HTTP server. The container hits it through the
 //! forward-proxy sidecar to obtain fresh Bedrock credentials and to reach
 //! the host's HTTP/SSE MCP servers without learning their auth headers.
+//!
+//! The MCP path is not a dumb reverse proxy — it understands enough of
+//! JSON-RPC to enforce the operator's per-tool allowlist:
+//!
+//! - `tools/call` requests are rejected up-front when the named tool is
+//!   disallowed, so the upstream never sees the attempt.
+//! - `tools/list` responses (when the upstream returns `application/json`)
+//!   are parsed, filtered, and re-serialised so Claude Code only learns
+//!   about allowed tools. The `annotations.readOnlyHint` on each tool is
+//!   cached so `tools/call` can fall back to the same default.
+//! - Streaming (SSE) responses are passed through unfiltered for now.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -14,16 +25,20 @@ use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::aws::{BedrockCredentials, BedrockSetup, resolve_credentials};
 use crate::mcp::HttpMcpServer;
+use crate::policy::McpPolicy;
 
 struct BrokerState {
     bedrock: Option<(BedrockSetup, Option<String>)>,
     last_error: Mutex<Option<String>>,
     mcp: HashMap<String, HttpMcpServer>,
+    policy: RwLock<McpPolicy>,
+    annotations: Mutex<HashMap<String, HashMap<String, Option<bool>>>>,
     http_client: reqwest::Client,
 }
 
@@ -35,6 +50,7 @@ pub struct RunningServer {
 pub async fn spawn(
     bedrock: Option<(BedrockSetup, Option<String>)>,
     mcp_servers: Vec<HttpMcpServer>,
+    policy: McpPolicy,
 ) -> Result<RunningServer> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -55,6 +71,8 @@ pub async fn spawn(
         bedrock,
         last_error: Mutex::new(None),
         mcp,
+        policy: RwLock::new(policy),
+        annotations: Mutex::new(HashMap::new()),
         http_client,
     });
 
@@ -127,7 +145,7 @@ async fn forward_mcp(
             .into_response();
     };
 
-    match forward_inner(&state.http_client, server, rest, req).await {
+    match forward_inner(state, name, server, rest, req).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!(name = %name, error = %e, "MCP forward failed");
@@ -137,15 +155,14 @@ async fn forward_mcp(
 }
 
 async fn forward_inner(
-    client: &reqwest::Client,
+    state: Arc<BrokerState>,
+    server_name: &str,
     server: HttpMcpServer,
     rest_path: &str,
     req: Request,
 ) -> Result<Response> {
     let (parts, body) = req.into_parts();
-
     let upstream_url = build_upstream_url(&server.url, rest_path, parts.uri.query())?;
-
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .context("invalid HTTP method")?;
 
@@ -157,7 +174,36 @@ async fn forward_inner(
         .await
         .context("failed to buffer request body")?;
 
-    let upstream = client
+    // Policy gate: reject disallowed tools/call before they reach the upstream.
+    if let Some(call) = parse_tool_call(&body_bytes) {
+        let read_only = {
+            let cache = state.annotations.lock().await;
+            cache
+                .get(server_name)
+                .and_then(|m| m.get(&call.name))
+                .copied()
+                .unwrap_or(None)
+        };
+        let allowed = {
+            let policy = state.policy.read().await;
+            policy.tool_allowed(server_name, &call.name, read_only)
+        };
+        if !allowed {
+            return Ok(jsonrpc_error_response(
+                call.id,
+                -32601,
+                format!(
+                    "tool '{}' is blocked by agent-container allowlist",
+                    call.name
+                ),
+            ));
+        }
+    }
+
+    let is_tools_list = parse_method(&body_bytes).as_deref() == Some("tools/list");
+
+    let upstream = state
+        .http_client
         .request(method, &upstream_url)
         .headers(headers)
         .body(body_bytes.to_vec())
@@ -166,22 +212,145 @@ async fn forward_inner(
         .context("upstream MCP request failed")?;
 
     let status = StatusCode::from_u16(upstream.status().as_u16())?;
-    let mut builder = Response::builder().status(status);
-    if let Some(out_headers) = builder.headers_mut() {
-        for (n, v) in upstream.headers() {
-            if is_hop_by_hop(n.as_str()) {
-                continue;
-            }
-            if let (Ok(name), Ok(val)) = (
-                HeaderName::from_bytes(n.as_ref()),
-                HeaderValue::from_bytes(v.as_bytes()),
-            ) {
-                out_headers.append(name, val);
-            }
+    let upstream_content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_ascii_lowercase());
+    let is_json =
+        matches!(upstream_content_type.as_deref(), Some(t) if t.starts_with("application/json"));
+
+    let mut out_headers = HeaderMap::new();
+    for (n, v) in upstream.headers() {
+        if is_hop_by_hop(n.as_str()) {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(n.as_ref()),
+            HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            out_headers.append(name, val);
         }
     }
+
+    if is_tools_list && is_json && status.is_success() {
+        let raw = upstream
+            .bytes()
+            .await
+            .context("failed to buffer tools/list response body")?;
+        let filtered = filter_tools_list_body(
+            &raw,
+            server_name,
+            &state.policy,
+            &state.annotations,
+        )
+        .await;
+        let body_bytes = match filtered {
+            Ok(bytes) => {
+                // Content-Length now reflects the filtered body.
+                out_headers.remove(reqwest::header::CONTENT_LENGTH.as_str());
+                bytes
+            }
+            Err(e) => {
+                tracing::warn!(server = %server_name, error = %e, "tools/list filter failed; passing through");
+                raw.to_vec()
+            }
+        };
+        let mut builder = Response::builder().status(status);
+        *builder
+            .headers_mut()
+            .expect("response builder headers") = out_headers;
+        return Ok(builder.body(Body::from(body_bytes))?);
+    }
+
+    let mut builder = Response::builder().status(status);
+    *builder
+        .headers_mut()
+        .expect("response builder headers") = out_headers;
     let stream = upstream.bytes_stream();
     Ok(builder.body(Body::from_stream(stream))?)
+}
+
+/// Parse just enough of the request body to extract the JSON-RPC method,
+/// if any. Returns None for batches or unparseable bodies.
+fn parse_method(body: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    v.get("method")?.as_str().map(|s| s.to_string())
+}
+
+struct ParsedToolCall {
+    id: Value,
+    name: String,
+}
+
+fn parse_tool_call(body: &[u8]) -> Option<ParsedToolCall> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    if v.get("method")?.as_str()? != "tools/call" {
+        return None;
+    }
+    let name = v.get("params")?.get("name")?.as_str()?.to_string();
+    let id = v.get("id").cloned().unwrap_or(Value::Null);
+    Some(ParsedToolCall { id, name })
+}
+
+fn jsonrpc_error_response(id: Value, code: i32, message: String) -> Response {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": code, "message": message}
+    });
+    let bytes = serde_json::to_vec(&body).expect("json encode");
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json");
+    builder = builder.header(axum::http::header::CONTENT_LENGTH, bytes.len());
+    builder.body(Body::from(bytes)).expect("build error body")
+}
+
+pub(crate) async fn filter_tools_list_body(
+    raw: &[u8],
+    server_name: &str,
+    policy: &RwLock<McpPolicy>,
+    annotations: &Mutex<HashMap<String, HashMap<String, Option<bool>>>>,
+) -> Result<Vec<u8>> {
+    let mut parsed: Value = serde_json::from_slice(raw).context("response is not JSON")?;
+    let Some(obj) = parsed.as_object_mut() else {
+        return Ok(raw.to_vec());
+    };
+    let Some(result) = obj.get_mut("result").and_then(Value::as_object_mut) else {
+        return Ok(raw.to_vec());
+    };
+    let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) else {
+        return Ok(raw.to_vec());
+    };
+
+    let policy_snapshot = policy.read().await.clone();
+    let mut cache = annotations.lock().await;
+    let server_cache = cache.entry(server_name.to_string()).or_default();
+
+    let mut kept = Vec::with_capacity(tools.len());
+    for tool in tools.drain(..) {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let read_only = tool
+            .get("annotations")
+            .and_then(|a| a.get("readOnlyHint"))
+            .and_then(Value::as_bool);
+        if let Some(n) = &name {
+            server_cache.insert(n.clone(), read_only);
+        }
+        let Some(n) = name else {
+            continue;
+        };
+        if policy_snapshot.tool_allowed(server_name, &n, read_only) {
+            kept.push(tool);
+        }
+    }
+    *tools = kept;
+
+    serde_json::to_vec(&parsed).context("re-serialising filtered tools/list")
 }
 
 fn build_upstream_url(base: &str, rest: &str, query: Option<&str>) -> Result<String> {
@@ -312,5 +481,96 @@ mod tests {
             build_upstream_url("https://example.com/", "/foo/bar", Some("x=1")).unwrap(),
             "https://example.com/foo/bar?x=1"
         );
+    }
+
+    #[test]
+    fn parse_method_extracts_jsonrpc_method_name() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        assert_eq!(parse_method(body).as_deref(), Some("tools/list"));
+        assert!(parse_method(b"not json").is_none());
+        assert!(parse_method(br#"[{"method":"x"}]"#).is_none());
+    }
+
+    #[test]
+    fn parse_tool_call_extracts_name_and_id() {
+        let body = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"evil"}}"#;
+        let call = parse_tool_call(body).unwrap();
+        assert_eq!(call.name, "evil");
+        assert_eq!(call.id, Value::from(7));
+        // A `tools/list` is not a tool call.
+        assert!(parse_tool_call(br#"{"method":"tools/list"}"#).is_none());
+    }
+
+    #[tokio::test]
+    async fn tools_list_filter_drops_non_readonly_by_default() {
+        let raw = br#"{
+          "jsonrpc":"2.0","id":1,
+          "result":{"tools":[
+            {"name":"read_file","annotations":{"readOnlyHint":true}},
+            {"name":"delete_file","annotations":{"readOnlyHint":false}},
+            {"name":"unknown"}
+          ]}
+        }"#;
+        let policy = RwLock::new(McpPolicy::default());
+        let ann: Mutex<HashMap<String, HashMap<String, Option<bool>>>> =
+            Mutex::new(HashMap::new());
+
+        let out = filter_tools_list_body(raw, "srv", &policy, &ann).await.unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<_> = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["read_file"]);
+        // annotations cache populated.
+        let cache = ann.lock().await;
+        assert_eq!(
+            cache["srv"].get("delete_file").copied().flatten(),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_filter_respects_explicit_enables() {
+        let raw = br#"{
+          "jsonrpc":"2.0",
+          "result":{"tools":[
+            {"name":"read_file","annotations":{"readOnlyHint":true}},
+            {"name":"delete_file","annotations":{"readOnlyHint":false}}
+          ]}
+        }"#;
+        let mut policy = McpPolicy::default();
+        policy.set_tool("srv", "delete_file", true);
+        let policy = RwLock::new(policy);
+        let ann = Mutex::new(HashMap::new());
+
+        let out = filter_tools_list_body(raw, "srv", &policy, &ann).await.unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<_> = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["read_file", "delete_file"]);
+    }
+
+    #[tokio::test]
+    async fn tools_list_filter_hides_everything_for_disabled_server() {
+        let raw = br#"{
+          "result":{"tools":[
+            {"name":"read_file","annotations":{"readOnlyHint":true}}
+          ]}
+        }"#;
+        let mut policy = McpPolicy::default();
+        policy.set_server_enabled("srv", false);
+        let policy = RwLock::new(policy);
+        let ann = Mutex::new(HashMap::new());
+        let out = filter_tools_list_body(raw, "srv", &policy, &ann).await.unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let arr = v["result"]["tools"].as_array().unwrap();
+        assert!(arr.is_empty());
     }
 }

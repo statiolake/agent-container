@@ -38,6 +38,8 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
         .context("failed to read awsAuthRefresh from ~/.claude.json")?;
     let mcp_servers = mcp::load_http_servers(&host.home.join(".claude.json"))
         .context("failed to load MCP servers from ~/.claude.json")?;
+    let policy = policy::McpPolicy::load()
+        .context("failed to load MCP allowlist policy; fix or remove ~/.config/agent-container/mcp.toml")?;
 
     if let Some(setup) = &bedrock {
         eprintln!(
@@ -85,6 +87,7 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
     let broker = server::spawn(
         bedrock.clone().map(|b| (b, refresh.clone())),
         mcp_servers.clone(),
+        policy,
     )
     .await?;
     tracing::info!(addr = %broker.addr, "host broker listening");
