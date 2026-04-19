@@ -315,6 +315,24 @@ async fn forward_stdio(
         _ => bail!("internal: expected stdio backend for '{server_name}'"),
     };
 
+    // stdio MCP servers only understand JSON-RPC requests; they have no
+    // notion of the optional streamable-HTTP GET channel. Returning 405
+    // matches the spec's guidance for servers that do not support
+    // server-initiated streaming, and prevents Claude Code's MCP client
+    // from hanging on a connection that would never receive events.
+    let method = req.method().clone();
+    if method != axum::http::Method::POST {
+        tracing::debug!(
+            server = %server_name,
+            method = %method,
+            "non-POST request to stdio MCP endpoint; responding 405",
+        );
+        return Ok(Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(axum::http::header::ALLOW, "POST")
+            .body(Body::from("stdio MCP backend only accepts POST"))?);
+    }
+
     let (_parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX)
         .await
@@ -325,10 +343,21 @@ async fn forward_stdio(
     }
 
     let is_tools_list = parse_method(&body_bytes).as_deref() == Some("tools/list");
+    tracing::debug!(
+        server = %server_name,
+        method = parse_method(&body_bytes).as_deref().unwrap_or("<unparsed>"),
+        body_len = body_bytes.len(),
+        "forwarding to stdio MCP",
+    );
     let response_bytes = handle
         .call(body_bytes.to_vec())
         .await
         .context("stdio MCP call failed")?;
+    tracing::debug!(
+        server = %server_name,
+        bytes = response_bytes.len(),
+        "stdio MCP response ready",
+    );
 
     // Notifications come back empty — respond with 204 so the Claude Code
     // MCP client does not try to parse an empty body as JSON.
