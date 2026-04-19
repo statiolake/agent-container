@@ -235,6 +235,10 @@ async fn forward_inner(
         .map(|s| s.to_ascii_lowercase());
     let is_json =
         matches!(upstream_content_type.as_deref(), Some(t) if t.starts_with("application/json"));
+    let is_sse = matches!(
+        upstream_content_type.as_deref(),
+        Some(t) if t.starts_with("text/event-stream")
+    );
 
     let mut out_headers = HeaderMap::new();
     for (n, v) in upstream.headers() {
@@ -249,19 +253,17 @@ async fn forward_inner(
         }
     }
 
-    if is_tools_list && is_json && status.is_success() {
+    if is_tools_list && (is_json || is_sse) && status.is_success() {
         let raw = upstream
             .bytes()
             .await
             .context("failed to buffer tools/list response body")?;
-        let filtered = filter_tools_list_body(
-            &raw,
-            server_name,
-            &state.policy,
-            &state.annotations,
-        )
-        .await;
-        let body_bytes = match filtered {
+        let filter_result = if is_json {
+            filter_tools_list_body(&raw, server_name, &state.policy, &state.annotations).await
+        } else {
+            filter_tools_list_sse(&raw, server_name, &state.policy, &state.annotations).await
+        };
+        let body_bytes = match filter_result {
             Ok(bytes) => {
                 // Content-Length now reflects the filtered body.
                 out_headers.remove(reqwest::header::CONTENT_LENGTH.as_str());
@@ -330,14 +332,95 @@ pub(crate) async fn filter_tools_list_body(
     annotations: &Mutex<HashMap<String, HashMap<String, Option<bool>>>>,
 ) -> Result<Vec<u8>> {
     let mut parsed: Value = serde_json::from_slice(raw).context("response is not JSON")?;
-    let Some(obj) = parsed.as_object_mut() else {
+    let changed = filter_tools_list_value(&mut parsed, server_name, policy, annotations).await;
+    if !changed {
         return Ok(raw.to_vec());
+    }
+    serde_json::to_vec(&parsed).context("re-serialising filtered tools/list")
+}
+
+/// Filter `tools/list` responses delivered via Server-Sent Events. MCP
+/// streamable-HTTP servers often reply that way: each `data:` line in an
+/// event carries a JSON-RPC message. Parse each event, filter any
+/// `result.tools` arrays in place, then re-emit the stream with the
+/// filtered payload. Non-tools/list events pass through untouched.
+pub(crate) async fn filter_tools_list_sse(
+    raw: &[u8],
+    server_name: &str,
+    policy: &RwLock<McpPolicy>,
+    annotations: &Mutex<HashMap<String, HashMap<String, Option<bool>>>>,
+) -> Result<Vec<u8>> {
+    let text_raw = std::str::from_utf8(raw).context("SSE response was not valid UTF-8")?;
+    // Normalise line endings so the \n\n split below works regardless.
+    let text = text_raw.replace("\r\n", "\n");
+    let mut out = String::with_capacity(text.len());
+
+    // Event boundary is a blank line; re-emit each event independently.
+    for event in text.split("\n\n") {
+        if event.is_empty() {
+            continue;
+        }
+        let mut data = String::new();
+        let mut other_lines: Vec<String> = Vec::new();
+        for line in event.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            } else if line.is_empty() {
+                // intra-event empty line shouldn't occur (event boundary
+                // was already the split above), ignore defensively.
+            } else {
+                other_lines.push(line.to_string());
+            }
+        }
+
+        let replacement_data = if data.is_empty() {
+            None
+        } else if let Ok(mut parsed) = serde_json::from_str::<Value>(&data) {
+            let changed =
+                filter_tools_list_value(&mut parsed, server_name, policy, annotations).await;
+            if changed {
+                Some(serde_json::to_string(&parsed).unwrap_or(data.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let emit_data = replacement_data.unwrap_or(data);
+
+        for ol in &other_lines {
+            out.push_str(ol);
+            out.push('\n');
+        }
+        if !emit_data.is_empty() {
+            for line in emit_data.split('\n') {
+                out.push_str("data: ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
+    Ok(out.into_bytes())
+}
+
+async fn filter_tools_list_value(
+    parsed: &mut Value,
+    server_name: &str,
+    policy: &RwLock<McpPolicy>,
+    annotations: &Mutex<HashMap<String, HashMap<String, Option<bool>>>>,
+) -> bool {
+    let Some(obj) = parsed.as_object_mut() else {
+        return false;
     };
     let Some(result) = obj.get_mut("result").and_then(Value::as_object_mut) else {
-        return Ok(raw.to_vec());
+        return false;
     };
     let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) else {
-        return Ok(raw.to_vec());
+        return false;
     };
 
     let policy_snapshot = policy.read().await.clone();
@@ -365,8 +448,7 @@ pub(crate) async fn filter_tools_list_body(
         }
     }
     *tools = kept;
-
-    serde_json::to_vec(&parsed).context("re-serialising filtered tools/list")
+    true
 }
 
 fn build_upstream_url(base: &str, rest: &str, query: Option<&str>) -> Result<String> {
@@ -571,6 +653,45 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, vec!["read_file", "delete_file"]);
+    }
+
+    #[tokio::test]
+    async fn sse_filter_drops_non_readonly_tools() {
+        let raw = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"read_file\",\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"delete_file\",\"annotations\":{\"readOnlyHint\":false}}]}}\n\n";
+        let policy = RwLock::new(McpPolicy::default());
+        let ann = Mutex::new(HashMap::new());
+        let filtered = filter_tools_list_sse(raw, "srv", &policy, &ann).await.unwrap();
+        let text = String::from_utf8(filtered).unwrap();
+        // Pull the data: line back out of the re-emitted SSE and parse it.
+        let data = text
+            .lines()
+            .find_map(|l| l.strip_prefix("data: "))
+            .expect("data line in filtered SSE");
+        let v: Value = serde_json::from_str(data).unwrap();
+        let names: Vec<_> = v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["read_file"]);
+        // Cache populated by the SSE path, so tools/call can decide.
+        let cache = ann.lock().await;
+        assert_eq!(
+            cache["srv"].get("delete_file").copied().flatten(),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_filter_preserves_non_tools_list_events() {
+        let raw = b"event: ping\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
+        let policy = RwLock::new(McpPolicy::default());
+        let ann = Mutex::new(HashMap::new());
+        let filtered = filter_tools_list_sse(raw, "srv", &policy, &ann).await.unwrap();
+        let text = String::from_utf8(filtered).unwrap();
+        assert!(text.contains("event: ping"));
+        assert!(text.contains("notifications/progress"));
     }
 
     #[tokio::test]
