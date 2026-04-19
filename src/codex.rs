@@ -1,7 +1,10 @@
 //! Helpers for the Codex pathway: ship the host's ChatGPT-subscription
 //! auth token into the container through a short-lived 0600 temp file so
 //! the container can run `@openai/codex` without inheriting anything else
-//! from `~/.codex` (trust_level lists, session history, …).
+//! from `~/.codex` (trust_level lists, session history, …), and pin a
+//! minimal `config.toml` inside the container so Codex does not try to
+//! nest its own bubblewrap sandbox (which fails inside docker because
+//! user namespaces cannot be recreated).
 
 use std::fs;
 use std::io::Write;
@@ -56,4 +59,23 @@ pub fn prepare_auth(host_home: &Path) -> Result<CodexAuthFile> {
     file.flush().ok();
 
     Ok(CodexAuthFile { path, cleanup: true })
+}
+
+/// Write a minimal `~/.codex/config.toml` into the container's persistent
+/// home that disables Codex's own sandbox and approval loop. The docker
+/// container plus the proxy allowlist already provide the sandbox
+/// boundary, and Codex's bubblewrap cannot recreate user namespaces from
+/// inside docker so enabling it would just fail nested shell exec.
+pub fn write_container_config(container_home: &Path) -> Result<()> {
+    let dir = container_home.join(".codex");
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create {}", dir.display()))?;
+    let contents = "# Written by agent-container. The container itself is the sandbox,\n\
+                    # so Codex's internal sandbox is disabled here to avoid nested\n\
+                    # bubblewrap failures and surprise approval prompts.\n\
+                    approval_policy = \"never\"\n\
+                    sandbox_mode = \"danger-full-access\"\n";
+    let path = dir.join("config.toml");
+    fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }

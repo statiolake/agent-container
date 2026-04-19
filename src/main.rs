@@ -107,6 +107,9 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
     )
     .context("failed to sync host Claude Code state into container")?;
 
+    codex::write_container_config(&host.container_home)
+        .context("failed to write codex config.toml into container home")?;
+
     let credentials_path = claude_creds
         .as_ref()
         .map(|c| c.path.clone())
