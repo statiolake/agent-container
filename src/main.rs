@@ -2,6 +2,7 @@ mod aws;
 mod cli;
 mod creds;
 mod docker;
+mod mcp;
 mod paths;
 mod server;
 mod sync;
@@ -34,11 +35,21 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
         .context("failed to read Bedrock settings from ~/.claude/settings.json")?;
     let refresh = aws::detect_refresh_command(&host.home.join(".claude.json"))
         .context("failed to read awsAuthRefresh from ~/.claude.json")?;
+    let mcp_servers = mcp::load_http_servers(&host.home.join(".claude.json"))
+        .context("failed to load MCP servers from ~/.claude.json")?;
 
     if let Some(setup) = &bedrock {
         eprintln!(
             "[agent-container] Bedrock mode detected (profile={}); the container will fetch fresh AWS credentials on demand through the host broker.",
             setup.profile
+        );
+    }
+    if !mcp_servers.is_empty() {
+        let names: Vec<_> = mcp_servers.iter().map(|s| s.name.as_str()).collect();
+        eprintln!(
+            "[agent-container] proxying {} MCP server(s) through broker: {}",
+            mcp_servers.len(),
+            names.join(", ")
         );
     }
 
@@ -70,11 +81,24 @@ async fn run_cmd(passthrough: Vec<String>) -> Result<()> {
         .await
         .context("failed to build or locate container images")?;
 
-    sync::sync_host_state(&host, bedrock.is_some())
-        .context("failed to sync host Claude Code state into container")?;
-
-    let broker = server::spawn(bedrock.clone().map(|b| (b, refresh.clone()))).await?;
+    let broker = server::spawn(
+        bedrock.clone().map(|b| (b, refresh.clone())),
+        mcp_servers.clone(),
+    )
+    .await?;
     tracing::info!(addr = %broker.addr, "host broker listening");
+    let broker_url_from_container =
+        format!("http://host.docker.internal:{}", broker.addr.port());
+
+    sync::sync_host_state(
+        &host,
+        sync::SyncOptions {
+            bedrock: bedrock.is_some(),
+            broker_url_from_container: &broker_url_from_container,
+            mcp_servers: &mcp_servers,
+        },
+    )
+    .context("failed to sync host Claude Code state into container")?;
 
     let credentials_path = credentials
         .as_ref()

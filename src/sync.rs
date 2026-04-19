@@ -19,6 +19,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use crate::mcp::HttpMcpServer;
 use crate::paths::HostPaths;
 
 const CONTAINER_WORKSPACE: &str = "/workspace";
@@ -46,7 +47,14 @@ const COMMON_STRIP: &[&str] = &[
     "sandbox",
 ];
 
-pub fn sync_host_state(host: &HostPaths, bedrock: bool) -> Result<()> {
+pub struct SyncOptions<'a> {
+    pub bedrock: bool,
+    /// `http://host.docker.internal:<broker port>` as seen from the container.
+    pub broker_url_from_container: &'a str,
+    pub mcp_servers: &'a [HttpMcpServer],
+}
+
+pub fn sync_host_state(host: &HostPaths, opts: SyncOptions<'_>) -> Result<()> {
     fs::create_dir_all(&host.container_home).with_context(|| {
         format!(
             "failed to ensure container home {}",
@@ -54,16 +62,16 @@ pub fn sync_host_state(host: &HostPaths, bedrock: bool) -> Result<()> {
         )
     })?;
 
-    sync_claude_json(host, bedrock).context("failed to sync .claude.json")?;
+    sync_claude_json(host, &opts).context("failed to sync .claude.json")?;
     sync_settings_json(host).context("failed to sync .claude/settings.json")?;
     sync_skills(host).context("failed to sync .claude/skills")?;
-    if bedrock {
+    if opts.bedrock {
         ensure_dummy_aws_profile(host).context("failed to prepare dummy AWS bedrock profile")?;
     }
     Ok(())
 }
 
-fn sync_claude_json(host: &HostPaths, bedrock: bool) -> Result<()> {
+fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
     let src = host.home.join(".claude.json");
     let mut cfg: Value = if src.is_file() {
         let raw = fs::read_to_string(&src)
@@ -89,7 +97,7 @@ fn sync_claude_json(host: &HostPaths, bedrock: bool) -> Result<()> {
             *projects = filtered;
         }
 
-        if bedrock {
+        if opts.bedrock {
             obj.insert(
                 "awsAuthRefresh".to_string(),
                 Value::String("/usr/local/bin/agent-container-aws-refresh".to_string()),
@@ -97,12 +105,43 @@ fn sync_claude_json(host: &HostPaths, bedrock: bool) -> Result<()> {
         } else {
             obj.remove("awsAuthRefresh");
         }
+
+        if !opts.mcp_servers.is_empty() {
+            obj.insert(
+                "mcpServers".to_string(),
+                Value::Object(build_proxy_mcp_map(
+                    opts.broker_url_from_container,
+                    opts.mcp_servers,
+                )),
+            );
+        }
     }
 
     let dest = host.container_home.join(".claude.json");
     let pretty = serde_json::to_string_pretty(&cfg)?;
     fs::write(&dest, pretty).with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
+}
+
+fn build_proxy_mcp_map(
+    broker_url: &str,
+    servers: &[HttpMcpServer],
+) -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    for s in servers {
+        let mut entry = serde_json::Map::new();
+        entry.insert("type".into(), Value::String(s.transport.clone()));
+        entry.insert(
+            "url".into(),
+            Value::String(format!(
+                "{}/mcp/{}",
+                broker_url.trim_end_matches('/'),
+                s.name
+            )),
+        );
+        map.insert(s.name.clone(), Value::Object(entry));
+    }
+    map
 }
 
 /// Initialise a dummy `~/.aws/credentials` with a `[bedrock]` section if
@@ -237,7 +276,15 @@ mod tests {
             container_home: container_home.path().to_path_buf(),
         };
 
-        sync_claude_json(&host, false).unwrap();
+        sync_claude_json(
+            &host,
+            &SyncOptions {
+                bedrock: false,
+                broker_url_from_container: "http://host.docker.internal:0",
+                mcp_servers: &[],
+            },
+        )
+        .unwrap();
 
         let out: Value = serde_json::from_str(
             &fs::read_to_string(container_home.path().join(".claude.json")).unwrap(),
@@ -278,7 +325,15 @@ mod tests {
             workspace,
             container_home: container_home.path().to_path_buf(),
         };
-        sync_claude_json(&host, true).unwrap();
+        sync_claude_json(
+            &host,
+            &SyncOptions {
+                bedrock: true,
+                broker_url_from_container: "http://host.docker.internal:0",
+                mcp_servers: &[],
+            },
+        )
+        .unwrap();
 
         let out: Value = serde_json::from_str(
             &fs::read_to_string(container_home.path().join(".claude.json")).unwrap(),
@@ -288,6 +343,59 @@ mod tests {
             out["awsAuthRefresh"].as_str(),
             Some("/usr/local/bin/agent-container-aws-refresh")
         );
+    }
+
+    #[test]
+    fn mcp_servers_are_rewritten_to_proxy_urls() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = tmp_home.path().join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(tmp_home.path().join(".claude.json"), "{}").unwrap();
+
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root: tmp_home.path().join(".claude"),
+            workspace,
+            container_home: container_home.path().to_path_buf(),
+        };
+        let servers = vec![
+            HttpMcpServer {
+                name: "github".to_string(),
+                transport: "http".to_string(),
+                url: "https://upstream/mcp".to_string(),
+                headers: Default::default(),
+            },
+            HttpMcpServer {
+                name: "legacy".to_string(),
+                transport: "sse".to_string(),
+                url: "https://old/mcp".to_string(),
+                headers: Default::default(),
+            },
+        ];
+        sync_claude_json(
+            &host,
+            &SyncOptions {
+                bedrock: false,
+                broker_url_from_container: "http://host.docker.internal:9999",
+                mcp_servers: &servers,
+            },
+        )
+        .unwrap();
+
+        let out: Value = serde_json::from_str(
+            &fs::read_to_string(container_home.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        let mcp = out["mcpServers"].as_object().unwrap();
+        assert_eq!(
+            mcp["github"]["url"].as_str(),
+            Some("http://host.docker.internal:9999/mcp/github")
+        );
+        assert_eq!(mcp["github"]["type"].as_str(), Some("http"));
+        assert_eq!(mcp["legacy"]["type"].as_str(), Some("sse"));
+        // auth headers must never end up in the container copy
+        assert!(mcp["github"].get("headers").is_none());
     }
 
     #[test]
