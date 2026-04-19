@@ -12,6 +12,11 @@
 ^claude\.ai$
 ^console\.anthropic\.com$
 
+# --- OpenAI / ChatGPT (Codex with ChatGPT subscription auth) ---
+^chatgpt\.com$
+^api\.openai\.com$
+^auth\.openai\.com$
+
 # --- AWS Bedrock (only used when CLAUDE_CODE_USE_BEDROCK is set in settings.json env) ---
 ^bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com$
 ^bedrock\.[a-z0-9-]+\.amazonaws\.com$

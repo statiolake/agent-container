@@ -14,7 +14,7 @@ RUN apt-get update \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code@latest \
+RUN npm install -g @anthropic-ai/claude-code@latest @openai/codex \
     && npm cache clean --force
 
 COPY agent-container-aws-refresh.sh /usr/local/bin/agent-container-aws-refresh
@@ -25,7 +25,7 @@ RUN chmod 0755 /usr/local/bin/agent-container-aws-refresh
 # .credentials.json, projects/-workspace, CLAUDE.md) don't leave the parent
 # owned by root and blocking Claude Code from creating sibling dirs like
 # session-env at runtime.
-RUN mkdir -p /home/agent/.claude \
+RUN mkdir -p /home/agent/.claude /home/agent/.codex \
     && chmod -R 1777 /home/agent \
     && mkdir -p /workspace \
     && chmod 1777 /workspace
