@@ -5,6 +5,7 @@ mod creds;
 mod docker;
 mod mcp;
 mod mcp_client;
+mod oauth;
 mod paths;
 mod policy;
 mod server;
