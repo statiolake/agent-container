@@ -22,15 +22,48 @@ use clap::Parser;
 
 use crate::cli::{AgentKind, Cli, Commands, ConfigCommands};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Initialise the tracing subscriber. If `AGENT_CONTAINER_LOG_FILE` is
+/// set, logs go there (append, no ANSI) via a non-blocking writer so the
+/// container's TUI on stderr/stdout stays unharmed. Otherwise logs go to
+/// stderr as before.
+fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agent_container=info,warn"));
+
+    if let Ok(path) = std::env::var("AGENT_CONTAINER_LOG_FILE") {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                let (writer, guard) = tracing_appender::non_blocking(file);
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .init();
+                return Some(guard);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[agent-container] failed to open log file {path}: {e}; falling back to stderr"
+                );
+            }
+        }
+    }
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agent_container=info,warn")),
-        )
+        .with_env_filter(filter)
         .with_target(false)
         .init();
+    None
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let _log_guard = init_tracing();
 
     let cli = Cli::parse();
     match cli.command {
