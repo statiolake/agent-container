@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result};
 use inquire::MultiSelect;
-use inquire::ui::{Color, RenderConfig, Styled};
 
 use crate::mcp::HttpMcpServer;
 use crate::mcp_client::{Tool, fetch_tools};
@@ -68,15 +67,12 @@ async fn configure_server(server: &HttpMcpServer, policy: &mut McpPolicy) -> Res
         .filter_map(|(i, row)| row.currently_enabled.then_some(i))
         .collect();
 
-    let render = RenderConfig::default()
-        .with_help_message(Styled::new(" ↑/↓ move, space to toggle, enter to accept ").with_fg(Color::DarkGrey));
-
     let selection = MultiSelect::new(
         &format!("tools to expose from '{}'", server.name),
         options.clone(),
     )
     .with_default(&defaults)
-    .with_render_config(render)
+    .with_help_message("↑/↓ move, space to toggle, enter to accept, esc to skip")
     .prompt();
 
     let chosen = match selection {
