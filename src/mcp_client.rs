@@ -13,7 +13,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::mcp::HttpMcpServer;
+use crate::mcp::{HttpMcpServer, StdioMcpServer};
+use crate::stdio_mcp;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 const CLIENT_NAME: &str = "agent-container";
@@ -103,6 +104,58 @@ pub async fn fetch_tools(
     ensure_no_error(&list_resp.body, "tools/list")?;
     let tools = list_resp
         .body
+        .get("result")
+        .and_then(|r| r.get("tools"))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("tools/list response missing result.tools"))?;
+    let tools: Vec<Tool> =
+        serde_json::from_value(tools).context("tools/list response has unexpected shape")?;
+    Ok(tools)
+}
+
+/// Spawn the host-side subprocess for a stdio MCP server, run the
+/// initialize / initialized / tools/list handshake against it, then drop
+/// the worker so the child exits. Used by the TUI to preview what tools
+/// a stdio server advertises without having to boot the full broker.
+pub async fn fetch_tools_stdio(server: &StdioMcpServer) -> Result<Vec<Tool>> {
+    let handle = stdio_mcp::spawn_worker(server.clone())
+        .with_context(|| format!("failed to start stdio MCP '{}'", server.name))?;
+
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": next_id(),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")},
+        }
+    });
+    let init_bytes = serde_json::to_vec(&init)?;
+    let init_resp = handle.call(init_bytes).await?;
+    if !init_resp.is_empty() {
+        let parsed: Value = serde_json::from_slice(&init_resp)
+            .context("initialize response was not valid JSON")?;
+        ensure_no_error(&parsed, "initialize")?;
+    }
+
+    let initialized = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+    // Fire-and-forget; worker returns empty for notifications.
+    let _ = handle.call(serde_json::to_vec(&initialized)?).await;
+
+    let list_req = json!({
+        "jsonrpc": "2.0",
+        "id": next_id(),
+        "method": "tools/list"
+    });
+    let list_bytes = handle.call(serde_json::to_vec(&list_req)?).await?;
+    let parsed: Value =
+        serde_json::from_slice(&list_bytes).context("tools/list response was not valid JSON")?;
+    ensure_no_error(&parsed, "tools/list")?;
+    let tools = parsed
         .get("result")
         .and_then(|r| r.get("tools"))
         .cloned()

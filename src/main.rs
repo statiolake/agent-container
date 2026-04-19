@@ -12,6 +12,7 @@ mod policy;
 mod server;
 mod stdio_mcp;
 mod sync;
+mod tui;
 
 use std::path::PathBuf;
 use std::sync::Arc;

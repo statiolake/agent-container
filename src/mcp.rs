@@ -80,19 +80,6 @@ pub fn load_servers(claude_json: &Path) -> Result<Vec<McpServer>> {
     Ok(out)
 }
 
-/// Backwards-compatible filter for callers (e.g. the `config mcp` TUI) that
-/// only handle HTTP/SSE transports.
-pub fn load_http_servers(claude_json: &Path) -> Result<Vec<HttpMcpServer>> {
-    let servers = load_servers(claude_json)?;
-    Ok(servers
-        .into_iter()
-        .filter_map(|s| match s {
-            McpServer::Http(h) => Some(h),
-            McpServer::Stdio(_) => None,
-        })
-        .collect())
-}
-
 #[derive(Deserialize)]
 struct RawEntry {
     #[serde(default, rename = "type")]
@@ -196,22 +183,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn load_http_servers_filters_out_stdio() {
-        let f = write(
-            r#"{
-              "mcpServers": {
-                "web": {"type": "http", "url": "https://example.com/mcp"},
-                "fs": {"type": "stdio", "command": "node"}
-              }
-            }"#,
-        );
-        let http = load_http_servers(f.path()).unwrap();
-        let names: Vec<_> = http.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["web"]);
-    }
-
-    #[test]
+#[test]
     fn empty_when_no_mcp_servers() {
         let f = write(r#"{"hasCompletedOnboarding": true}"#);
         assert!(load_servers(f.path()).unwrap().is_empty());

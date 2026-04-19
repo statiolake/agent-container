@@ -1,185 +1,134 @@
-//! `agent-container config mcp` — interactively review the host's MCP
-//! servers and toggle which of their tools the container may see.
-
-use anyhow::{Context, Result};
-use inquire::MultiSelect;
+//! `agent-container config mcp` — fetch every declared MCP server's
+//! tools/list (HTTP/SSE/stdio alike) and hand the full catalogue to the
+//! ratatui-based allowlist UI.
 
 use std::sync::Arc;
 
-use crate::mcp::HttpMcpServer;
-use crate::mcp_client::{Tool, fetch_tools};
+use anyhow::{Context, Result};
+
+use crate::mcp::{self, McpServer};
+use crate::mcp_client::{Tool, fetch_tools, fetch_tools_stdio};
 use crate::oauth::{OAuthStore, load_from_keychain};
 use crate::paths::HostPaths;
-use crate::policy::{McpPolicy, config_path};
+use crate::policy::McpPolicy;
+use crate::tui::{self, Outcome, ToolEntry};
 
 pub async fn run() -> Result<()> {
     let host = HostPaths::detect()?;
-    let servers = crate::mcp::load_http_servers(&host.home.join(".claude.json"))
+    let servers = mcp::load_servers(&host.home.join(".claude.json"))
         .context("failed to load MCP servers from ~/.claude.json")?;
 
     if servers.is_empty() {
-        println!(
-            "No HTTP/SSE MCP servers are declared in ~/.claude.json; nothing to configure."
-        );
+        println!("No MCP servers declared in ~/.claude.json; nothing to configure.");
         return Ok(());
     }
 
     let oauth = Arc::new(OAuthStore::new(
         load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
     ));
+    let policy = McpPolicy::load().context("failed to load existing MCP allowlist")?;
 
-    let mut policy = McpPolicy::load().context("failed to load existing MCP allowlist")?;
-
+    println!("Fetching tools from {} MCP server(s)...", servers.len());
+    let mut entries: Vec<ToolEntry> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     for server in &servers {
-        configure_server(server, &mut policy, &oauth).await?;
+        let name = server.name().to_string();
+        use std::io::Write;
+        print!("  {} ({})...", name, server.transport_label());
+        std::io::stdout().flush().ok();
+        match fetch_any(server, &oauth).await {
+            Ok(tools) => {
+                println!(" {} tool(s)", tools.len());
+                for tool in tools {
+                    let read_only_hint = tool.read_only_hint();
+                    let enabled = policy.tool_allowed(&name, &tool.name, read_only_hint);
+                    entries.push(ToolEntry {
+                        server_name: name.clone(),
+                        tool_name: tool.name,
+                        description: tool.description.unwrap_or_default(),
+                        read_only_hint,
+                        enabled,
+                    });
+                }
+            }
+            Err(e) => {
+                println!(" FAILED ({e:#})");
+                skipped.push((name, format!("{e:#}")));
+            }
+        }
     }
 
-    let path = policy.save().context("failed to save MCP allowlist")?;
-    println!();
-    println!("Saved to {}", path.display());
-    println!(
-        "Broker checks this on startup; re-run `agent-container run` to pick up changes."
-    );
-    Ok(())
-}
-
-async fn configure_server(
-    server: &HttpMcpServer,
-    policy: &mut McpPolicy,
-    oauth: &OAuthStore,
-) -> Result<()> {
-    println!();
-    println!("── {} ──", server.name);
-    println!("   upstream: {}", server.url);
-
-    let bearer = match oauth.access_token(&server.name).await {
-        Ok(tok) => tok,
-        Err(e) => {
-            eprintln!(
-                "   ✗ OAuth refresh for '{}' failed: {e:#}\n     skipping; existing policy kept intact.",
-                server.name
-            );
-            return Ok(());
-        }
-    };
-
-    println!("   fetching tools/list from upstream...");
-    let tools = match fetch_tools(server, bearer.as_deref()).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "   ✗ could not fetch tools from '{}': {e:#}\n     skipping; existing policy kept intact.",
-                server.name
-            );
-            return Ok(());
-        }
-    };
-    if tools.is_empty() {
-        println!("   (no tools advertised)");
+    if entries.is_empty() {
+        eprintln!("No tools to configure.");
         return Ok(());
     }
 
-    let options: Vec<ToolRow> = tools
-        .iter()
-        .map(|t| ToolRow::new(&server.name, t, policy))
-        .collect();
-    let defaults: Vec<usize> = options
-        .iter()
-        .enumerate()
-        .filter_map(|(i, row)| row.currently_enabled.then_some(i))
-        .collect();
+    entries.sort_by(|a, b| {
+        a.server_name
+            .cmp(&b.server_name)
+            .then_with(|| a.tool_name.cmp(&b.tool_name))
+    });
 
-    let selection = MultiSelect::new(
-        &format!("tools to expose from '{}'", server.name),
-        options.clone(),
-    )
-    .with_default(&defaults)
-    .with_help_message("↑/↓ move, space to toggle, enter to accept, esc to skip")
-    .prompt();
-
-    let chosen = match selection {
-        Ok(rows) => rows,
-        Err(inquire::InquireError::OperationCanceled)
-        | Err(inquire::InquireError::OperationInterrupted) => {
-            println!("   (skipped)");
-            return Ok(());
-        }
-        Err(e) => return Err(anyhow::anyhow!(e).context("MCP tool selection failed")),
-    };
-
-    let chosen_names: std::collections::BTreeSet<&str> =
-        chosen.iter().map(|r| r.tool.as_str()).collect();
-
-    for row in &options {
-        let enabled = chosen_names.contains(row.tool.as_str());
-        if enabled == row.annotation_default {
-            // Matches the annotation's default — drop any explicit entry so
-            // the config file only records real deviations.
-            if let Some(server_policy) = policy.servers.get_mut(&server.name) {
-                server_policy.tools.remove(&row.tool);
+    match tui::run_selection(entries)? {
+        Outcome::Save(entries) => {
+            let mut policy = policy;
+            apply_entries(&mut policy, &entries);
+            let path = policy.save().context("failed to save MCP allowlist")?;
+            println!("Saved to {}", path.display());
+            if !skipped.is_empty() {
+                println!(
+                    "Skipped {} server(s); their existing policy entries were not touched:",
+                    skipped.len()
+                );
+                for (name, err) in &skipped {
+                    println!("  {name}: {err}");
+                }
             }
-        } else {
-            policy.set_tool(&server.name, &row.tool, enabled);
+            println!("Re-run `agent-container run` to pick up changes.");
+        }
+        Outcome::Cancel => {
+            println!("Cancelled; policy file unchanged.");
         }
     }
-    policy.set_server_enabled(&server.name, true);
 
     Ok(())
 }
 
-#[derive(Clone)]
-struct ToolRow {
-    tool: String,
-    description: String,
-    annotation: String,
-    currently_enabled: bool,
-    annotation_default: bool,
-}
-
-impl ToolRow {
-    fn new(server: &str, tool: &Tool, policy: &McpPolicy) -> Self {
-        let ro = tool.read_only_hint();
-        let annotation = match ro {
-            Some(true) => "read-only",
-            Some(false) => "write/destructive",
-            None => "no annotation",
-        };
-        let annotation_default = ro.unwrap_or(false);
-        let currently_enabled = policy.tool_allowed(server, &tool.name, ro);
-        Self {
-            tool: tool.name.clone(),
-            description: tool
-                .description
-                .clone()
-                .unwrap_or_default()
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-            annotation: annotation.to_string(),
-            currently_enabled,
-            annotation_default,
+async fn fetch_any(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> {
+    match server {
+        McpServer::Http(h) => {
+            let bearer = oauth.access_token(&h.name).await.unwrap_or(None);
+            fetch_tools(h, bearer.as_deref()).await
         }
+        McpServer::Stdio(s) => fetch_tools_stdio(s).await,
     }
 }
 
-impl std::fmt::Display for ToolRow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.description.is_empty() {
-            write!(f, "{:<40}  [{}]", self.tool, self.annotation)
+fn apply_entries(policy: &mut McpPolicy, entries: &[ToolEntry]) {
+    use std::collections::BTreeSet;
+    let servers: BTreeSet<&str> = entries.iter().map(|e| e.server_name.as_str()).collect();
+    for server in &servers {
+        policy.set_server_enabled(server, true);
+    }
+
+    for entry in entries {
+        let annotation_default = entry.read_only_hint.unwrap_or(false);
+        if entry.enabled == annotation_default {
+            // Matches the annotation default; leave no explicit entry so
+            // the toml stays minimal.
+            if let Some(sp) = policy.servers.get_mut(&entry.server_name) {
+                sp.tools.remove(&entry.tool_name);
+            }
         } else {
-            let desc = if self.description.len() > 60 {
-                format!("{}…", &self.description[..60])
-            } else {
-                self.description.clone()
-            };
-            write!(f, "{:<40}  [{}]  {}", self.tool, self.annotation, desc)
+            policy.set_tool(&entry.server_name, &entry.tool_name, entry.enabled);
         }
     }
 }
 
+// Touch the unused symbol so the config module continues to pull in
+// policy::config_path (documented contract for callers who want to know
+// where the allowlist lives).
 #[allow(dead_code)]
-fn _config_path_fn() -> anyhow::Result<std::path::PathBuf> {
-    config_path()
+fn _hint_config_path() -> anyhow::Result<std::path::PathBuf> {
+    crate::policy::config_path()
 }
