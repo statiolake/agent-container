@@ -33,6 +33,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Run { agent, passthrough } => run_cmd(agent, passthrough).await,
+        Commands::Shell { passthrough } => shell_cmd(passthrough).await,
         Commands::Config { command } => match command {
             ConfigCommands::Mcp => config_cmd::run().await,
         },
@@ -135,6 +136,100 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
         broker_addr: broker.addr,
         agent_command,
         extra_args: passthrough,
+    })
+    .await?;
+
+    broker.handle.abort();
+    drop(claude_creds);
+    drop(codex_auth);
+    std::process::exit(exit);
+}
+
+async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
+    let host = paths::HostPaths::detect()?;
+
+    // Discovery is the same as `run`, except we downgrade every auth
+    // failure to a warning — if the user is dropping into a shell it's
+    // usually to debug something and blocking on missing credentials
+    // would be counterproductive.
+    let bedrock = aws::detect_setup(&host.claude_root.join("settings.json")).ok().flatten();
+    let refresh = aws::detect_refresh_command(&host.home.join(".claude.json"))
+        .ok()
+        .flatten();
+    let mcp_servers = mcp::load_http_servers(&host.home.join(".claude.json")).unwrap_or_default();
+    let policy = policy::McpPolicy::load().unwrap_or_default();
+    let oauth_store = Arc::new(oauth::OAuthStore::new(
+        oauth::load_from_keychain().unwrap_or_default(),
+    ));
+
+    let claude_creds = match creds::prepare(&host.claude_root) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("[agent-container] note: Claude credentials unavailable: {e:#}");
+            None
+        }
+    };
+    let codex_auth = match codex::prepare_auth(&host.home) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("[agent-container] note: Codex auth unavailable: {e:#}");
+            None
+        }
+    };
+
+    docker::ensure_images(&docker::default_dockerfile_dir())
+        .await
+        .context("failed to build or locate container images")?;
+
+    let broker = server::spawn(
+        bedrock.clone().map(|b| (b, refresh.clone())),
+        mcp_servers.clone(),
+        policy,
+        oauth_store,
+    )
+    .await?;
+    let broker_url_from_container =
+        format!("http://host.docker.internal:{}", broker.addr.port());
+
+    sync::sync_host_state(
+        &host,
+        sync::SyncOptions {
+            bedrock: bedrock.is_some(),
+            broker_url_from_container: &broker_url_from_container,
+            mcp_servers: &mcp_servers,
+        },
+    )
+    .context("failed to sync host Claude Code state into container")?;
+
+    codex::write_container_config(&host.home, &host.container_home)
+        .context("failed to write codex config.toml into container home")?;
+
+    let credentials_path = claude_creds
+        .as_ref()
+        .map(|c| c.path.clone())
+        .unwrap_or_else(|| PathBuf::from("/dev/null"));
+    let codex_auth_path = codex_auth
+        .as_ref()
+        .map(|c| c.path.clone())
+        .unwrap_or_else(|| PathBuf::from("/dev/null"));
+
+    let agent_command = if passthrough.is_empty() {
+        vec!["bash".to_string(), "-l".to_string()]
+    } else {
+        // Join the passthrough into a single `bash -lc "cmd"` so quoting
+        // works the way users expect from a normal interactive shell.
+        let joined = passthrough.join(" ");
+        vec!["bash".to_string(), "-lc".to_string(), joined]
+    };
+
+    let exit = docker::run(docker::RunOptions {
+        host,
+        credentials_path,
+        codex_auth_path,
+        bedrock_setup: bedrock,
+        broker_addr: broker.addr,
+        agent_command,
+        extra_args: Vec::new(),
     })
     .await?;
 

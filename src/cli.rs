@@ -25,6 +25,16 @@ pub enum Commands {
         passthrough: Vec<String>,
     },
 
+    /// Drop into the container's bash shell for troubleshooting. Uses the
+    /// same networking / mounts / auths as `run` but skips the agent
+    /// binary so you can poke at the filesystem, curl endpoints, etc.
+    Shell {
+        /// Optional command to exec inside bash instead of dropping to a
+        /// prompt (e.g. `agent-container shell -- cat /etc/resolv.conf`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        passthrough: Vec<String>,
+    },
+
     /// Edit agent-container configuration.
     Config {
         #[command(subcommand)]
