@@ -81,17 +81,33 @@ fn truthy(v: Option<&Value>) -> bool {
     }
 }
 
-/// Look up an optional `awsAuthRefresh` shell command from `~/.claude.json`.
+/// Look up an optional `awsAuthRefresh` shell command from either
+/// `~/.claude/settings.json` or `~/.claude.json`. Either is valid —
+/// Claude Code itself reads the former (user settings) and we also fall
+/// back to the latter for compatibility.
+///
 /// When present, it is invoked on the host before retrying AWS credential
 /// resolution — typically `aws sso login --profile XXX` or a thin wrapper.
-pub fn detect_refresh_command(claude_json: &Path) -> Result<Option<String>> {
-    if !claude_json.is_file() {
+pub fn detect_refresh_command(
+    settings_json: &Path,
+    claude_json: &Path,
+) -> Result<Option<String>> {
+    for path in [settings_json, claude_json] {
+        if let Some(cmd) = read_refresh_from(path)? {
+            return Ok(Some(cmd));
+        }
+    }
+    Ok(None)
+}
+
+fn read_refresh_from(path: &Path) -> Result<Option<String>> {
+    if !path.is_file() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(claude_json)
-        .with_context(|| format!("failed to read {}", claude_json.display()))?;
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
     let cfg: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {} as JSON", claude_json.display()))?;
+        .with_context(|| format!("failed to parse {} as JSON", path.display()))?;
     Ok(cfg
         .get("awsAuthRefresh")
         .and_then(Value::as_str)
@@ -258,23 +274,49 @@ mod tests {
     }
 
     #[test]
-    fn reads_aws_auth_refresh_command() {
-        let f = write_settings(r#"{"awsAuthRefresh": "aws sso login --profile dev"}"#);
+    fn reads_refresh_from_settings_json_first() {
+        let settings = write_settings(r#"{"awsAuthRefresh": "from-settings"}"#);
+        let claude_json = write_settings(r#"{"awsAuthRefresh": "from-claude-json"}"#);
         assert_eq!(
-            detect_refresh_command(f.path()).unwrap().as_deref(),
+            detect_refresh_command(settings.path(), claude_json.path())
+                .unwrap()
+                .as_deref(),
+            Some("from-settings")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_claude_json() {
+        let missing =
+            std::env::temp_dir().join("agent-container-definitely-no-settings.json");
+        let claude_json = write_settings(r#"{"awsAuthRefresh": "aws sso login --profile dev"}"#);
+        assert_eq!(
+            detect_refresh_command(&missing, claude_json.path())
+                .unwrap()
+                .as_deref(),
             Some("aws sso login --profile dev")
         );
     }
 
     #[test]
-    fn no_refresh_when_field_missing() {
-        let f = write_settings(r#"{"hasCompletedOnboarding": true}"#);
-        assert!(detect_refresh_command(f.path()).unwrap().is_none());
+    fn no_refresh_when_neither_has_it() {
+        let settings = write_settings(r#"{"hasCompletedOnboarding": true}"#);
+        let claude_json = write_settings(r#"{"theme": "dark"}"#);
+        assert!(
+            detect_refresh_command(settings.path(), claude_json.path())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn ignores_blank_refresh_command() {
-        let f = write_settings(r#"{"awsAuthRefresh": "   "}"#);
-        assert!(detect_refresh_command(f.path()).unwrap().is_none());
+        let settings = write_settings(r#"{"awsAuthRefresh": "   "}"#);
+        let claude_json = write_settings(r#"{"awsAuthRefresh": ""}"#);
+        assert!(
+            detect_refresh_command(settings.path(), claude_json.path())
+                .unwrap()
+                .is_none()
+        );
     }
 }

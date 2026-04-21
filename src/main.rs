@@ -82,8 +82,11 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
     // correctly regardless of which agent is the session primary.
     let bedrock = aws::detect_setup(&host.claude_root.join("settings.json"))
         .context("failed to read Bedrock settings from ~/.claude/settings.json")?;
-    let refresh = aws::detect_refresh_command(&host.home.join(".claude.json"))
-        .context("failed to read awsAuthRefresh from ~/.claude.json")?;
+    let refresh = aws::detect_refresh_command(
+        &host.claude_root.join("settings.json"),
+        &host.home.join(".claude.json"),
+    )
+    .context("failed to read awsAuthRefresh from ~/.claude/settings.json or ~/.claude.json")?;
     let mcp_servers = mcp::load_servers(&host.home.join(".claude.json"))
         .context("failed to load MCP servers from ~/.claude.json")?;
     let policy = policy::McpPolicy::load().context(
@@ -196,9 +199,12 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
     // usually to debug something and blocking on missing credentials
     // would be counterproductive.
     let bedrock = aws::detect_setup(&host.claude_root.join("settings.json")).ok().flatten();
-    let refresh = aws::detect_refresh_command(&host.home.join(".claude.json"))
-        .ok()
-        .flatten();
+    let refresh = aws::detect_refresh_command(
+        &host.claude_root.join("settings.json"),
+        &host.home.join(".claude.json"),
+    )
+    .ok()
+    .flatten();
     let mcp_servers = mcp::load_servers(&host.home.join(".claude.json")).unwrap_or_default();
     let policy = policy::McpPolicy::load().unwrap_or_default();
     let oauth_store = Arc::new(oauth::OAuthStore::new(

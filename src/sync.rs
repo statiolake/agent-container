@@ -70,7 +70,7 @@ pub fn sync_host_state(host: &HostPaths, opts: SyncOptions<'_>) -> Result<()> {
     })?;
 
     sync_claude_json(host, &opts).context("failed to sync .claude.json")?;
-    sync_settings_json(host).context("failed to sync .claude/settings.json")?;
+    sync_settings_json(host, &opts).context("failed to sync .claude/settings.json")?;
     sync_user_extensions(host).context("failed to sync user skills/commands/agents")?;
     sync_plugin_marketplaces(host).context("failed to sync plugin marketplaces")?;
     if opts.bedrock {
@@ -182,17 +182,30 @@ fn ensure_dummy_aws_profile(host: &HostPaths) -> Result<()> {
     Ok(())
 }
 
-fn sync_settings_json(host: &HostPaths) -> Result<()> {
+fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
     let src = host.claude_root.join("settings.json");
-    if !src.is_file() {
-        return Ok(());
-    }
-    let raw = fs::read_to_string(&src)
-        .with_context(|| format!("failed to read {}", src.display()))?;
-    let mut settings: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {} as JSON", src.display()))?;
+    let mut settings: Value = if src.is_file() {
+        let raw = fs::read_to_string(&src)
+            .with_context(|| format!("failed to read {}", src.display()))?;
+        serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {} as JSON", src.display()))?
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
     if let Some(obj) = settings.as_object_mut() {
         strip_keys(obj);
+        // Mirror the awsAuthRefresh injection we already do for
+        // .claude.json — Claude Code looks in settings.json first for
+        // user-level configuration and this is where the operator most
+        // naturally puts it.
+        if opts.bedrock {
+            obj.insert(
+                "awsAuthRefresh".to_string(),
+                Value::String("/usr/local/bin/agent-container-aws-refresh".to_string()),
+            );
+        } else {
+            obj.remove("awsAuthRefresh");
+        }
     }
     let dest_dir = host.container_home.join(".claude");
     fs::create_dir_all(&dest_dir)?;
@@ -511,7 +524,15 @@ mod tests {
             workspace,
             container_home: container_home.path().to_path_buf(),
         };
-        sync_settings_json(&host).unwrap();
+        sync_settings_json(
+            &host,
+            &SyncOptions {
+                bedrock: false,
+                broker_url_from_container: "http://unused",
+                mcp_servers: &[],
+            },
+        )
+        .unwrap();
 
         let out: Value = serde_json::from_str(
             &fs::read_to_string(container_home.path().join(".claude/settings.json")).unwrap(),
@@ -521,5 +542,42 @@ mod tests {
         for key in ["env", "hooks", "permissions", "sandbox", "mcpServers"] {
             assert!(out.get(key).is_none(), "{key} should be stripped");
         }
+        assert!(out.get("awsAuthRefresh").is_none());
+    }
+
+    #[test]
+    fn bedrock_mode_injects_aws_auth_refresh_into_settings_too() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = tmp_home.path().join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let claude_root = tmp_home.path().join(".claude");
+        fs::create_dir_all(&claude_root).unwrap();
+        fs::write(claude_root.join("settings.json"), r#"{"theme": "dark"}"#).unwrap();
+
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root,
+            workspace,
+            container_home: container_home.path().to_path_buf(),
+        };
+        sync_settings_json(
+            &host,
+            &SyncOptions {
+                bedrock: true,
+                broker_url_from_container: "http://unused",
+                mcp_servers: &[],
+            },
+        )
+        .unwrap();
+
+        let out: Value = serde_json::from_str(
+            &fs::read_to_string(container_home.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            out["awsAuthRefresh"].as_str(),
+            Some("/usr/local/bin/agent-container-aws-refresh")
+        );
     }
 }
