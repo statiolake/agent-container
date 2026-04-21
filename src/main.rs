@@ -147,7 +147,7 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
     sync::sync_host_state(
         &host,
         sync::SyncOptions {
-            bedrock: bedrock.is_some(),
+            bedrock: bedrock.as_ref(),
             broker_url_from_container: &broker_url_from_container,
             mcp_servers: &mcp_servers,
         },
@@ -248,7 +248,7 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
     sync::sync_host_state(
         &host,
         sync::SyncOptions {
-            bedrock: bedrock.is_some(),
+            bedrock: bedrock.as_ref(),
             broker_url_from_container: &broker_url_from_container,
             mcp_servers: &mcp_servers,
         },

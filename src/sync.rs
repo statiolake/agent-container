@@ -55,10 +55,16 @@ const COMMON_STRIP: &[&str] = &[
 ];
 
 pub struct SyncOptions<'a> {
-    pub bedrock: bool,
+    pub bedrock: Option<&'a crate::aws::BedrockSetup>,
     /// `http://host.docker.internal:<broker port>` as seen from the container.
     pub broker_url_from_container: &'a str,
     pub mcp_servers: &'a [McpServer],
+}
+
+impl SyncOptions<'_> {
+    fn is_bedrock(&self) -> bool {
+        self.bedrock.is_some()
+    }
 }
 
 pub fn sync_host_state(host: &HostPaths, opts: SyncOptions<'_>) -> Result<()> {
@@ -102,7 +108,7 @@ fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
             *projects = filtered;
         }
 
-        if opts.bedrock {
+        if opts.is_bedrock() {
             // Claude Code runs awsCredentialExport silently, expects a
             // JSON response on stdout with a `Credentials` object. We
             // point it straight at the host broker through the forward
@@ -186,7 +192,7 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
         // it. The command returns JSON on stdout; the broker bridges
         // through the forward proxy so the container never touches its
         // own ~/.aws/credentials.
-        if opts.bedrock {
+        if let Some(bedrock) = opts.bedrock {
             obj.insert(
                 "awsCredentialExport".to_string(),
                 Value::String(
@@ -194,6 +200,20 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
                         .to_string(),
                 ),
             );
+            // Strip of `env` happened above via COMMON_STRIP; rebuild a
+            // minimal one so Claude Code sees CLAUDE_CODE_USE_BEDROCK
+            // (and the model/region it picked) wherever it looks —
+            // process env and settings.json env both match.
+            let mut env = serde_json::Map::new();
+            env.insert("CLAUDE_CODE_USE_BEDROCK".into(), Value::String("1".into()));
+            if let Some(model) = &bedrock.model {
+                env.insert("ANTHROPIC_MODEL".into(), Value::String(model.clone()));
+            }
+            if let Some(region) = &bedrock.region {
+                env.insert("AWS_REGION".into(), Value::String(region.clone()));
+                env.insert("AWS_DEFAULT_REGION".into(), Value::String(region.clone()));
+            }
+            obj.insert("env".into(), Value::Object(env));
         } else {
             obj.remove("awsCredentialExport");
         }
@@ -275,6 +295,14 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn sample_bedrock() -> crate::aws::BedrockSetup {
+        crate::aws::BedrockSetup {
+            profile: "bedrock".into(),
+            model: Some("anthropic.claude-sonnet-4-20250514-v1:0".into()),
+            region: Some("us-west-2".into()),
+        }
+    }
+
     #[test]
     fn filtering_drops_mcp_and_rewrites_workspace() {
         let tmp_home = tempfile::tempdir().unwrap();
@@ -318,7 +346,7 @@ mod tests {
         sync_claude_json(
             &host,
             &SyncOptions {
-                bedrock: false,
+                bedrock: None,
                 broker_url_from_container: "http://host.docker.internal:0",
                 mcp_servers: &[],
             },
@@ -373,7 +401,7 @@ mod tests {
         sync_claude_json(
             &host,
             &SyncOptions {
-                bedrock: true,
+                bedrock: Some(&sample_bedrock()),
                 broker_url_from_container: "http://host.docker.internal:0",
                 mcp_servers: &[],
             },
@@ -430,7 +458,7 @@ mod tests {
         sync_claude_json(
             &host,
             &SyncOptions {
-                bedrock: false,
+                bedrock: None,
                 broker_url_from_container: "http://host.docker.internal:9999",
                 mcp_servers: &servers,
             },
@@ -488,7 +516,7 @@ mod tests {
         sync_settings_json(
             &host,
             &SyncOptions {
-                bedrock: false,
+                bedrock: None,
                 broker_url_from_container: "http://unused",
                 mcp_servers: &[],
             },
@@ -525,7 +553,7 @@ mod tests {
         sync_settings_json(
             &host,
             &SyncOptions {
-                bedrock: true,
+                bedrock: Some(&sample_bedrock()),
                 broker_url_from_container: "http://unused",
                 mcp_servers: &[],
             },
@@ -536,9 +564,17 @@ mod tests {
             &fs::read_to_string(container_home.path().join(".claude/settings.json")).unwrap(),
         )
         .unwrap();
+        assert!(out.get("awsAuthRefresh").is_none());
+        let export = out["awsCredentialExport"].as_str().unwrap();
+        assert!(export.contains("$AGENT_CONTAINER_HOST_ENDPOINT/aws/credentials"));
+        // env is rebuilt for Claude Code that reads it from settings.json
+        let env = out["env"].as_object().expect("env object injected");
+        assert_eq!(env["CLAUDE_CODE_USE_BEDROCK"].as_str(), Some("1"));
         assert_eq!(
-            out["awsAuthRefresh"].as_str(),
-            Some("/usr/local/bin/agent-container-aws-refresh")
+            env["ANTHROPIC_MODEL"].as_str(),
+            Some("anthropic.claude-sonnet-4-20250514-v1:0")
         );
+        assert_eq!(env["AWS_REGION"].as_str(), Some("us-west-2"));
+        assert_eq!(env["AWS_DEFAULT_REGION"].as_str(), Some("us-west-2"));
     }
 }
