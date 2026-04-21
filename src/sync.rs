@@ -73,9 +73,6 @@ pub fn sync_host_state(host: &HostPaths, opts: SyncOptions<'_>) -> Result<()> {
     sync_settings_json(host, &opts).context("failed to sync .claude/settings.json")?;
     sync_user_extensions(host).context("failed to sync user skills/commands/agents")?;
     sync_plugin_marketplaces(host).context("failed to sync plugin marketplaces")?;
-    if opts.bedrock {
-        ensure_dummy_aws_profile(host).context("failed to prepare dummy AWS bedrock profile")?;
-    }
     Ok(())
 }
 
@@ -106,13 +103,24 @@ fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
         }
 
         if opts.bedrock {
+            // Claude Code runs awsCredentialExport silently, expects a
+            // JSON response on stdout with a `Credentials` object. We
+            // point it straight at the host broker through the forward
+            // proxy so the container never needs to touch its own
+            // ~/.aws/credentials.
             obj.insert(
-                "awsAuthRefresh".to_string(),
-                Value::String("/usr/local/bin/agent-container-aws-refresh".to_string()),
+                "awsCredentialExport".to_string(),
+                Value::String(
+                    "sh -c 'curl -fsS --max-time 15 \"$AGENT_CONTAINER_HOST_ENDPOINT/aws/credentials\"'"
+                        .to_string(),
+                ),
             );
         } else {
-            obj.remove("awsAuthRefresh");
+            obj.remove("awsCredentialExport");
         }
+        // Always strip the older awsAuthRefresh key we used to inject in
+        // case a stale persistent home still has it.
+        obj.remove("awsAuthRefresh");
 
         if !opts.mcp_servers.is_empty() {
             obj.insert(
@@ -160,28 +168,6 @@ fn build_proxy_mcp_map(
     map
 }
 
-/// Initialise a dummy `~/.aws/credentials` with a `[bedrock]` section if
-/// one does not already exist, so Claude Code has something to point
-/// `AWS_PROFILE=bedrock` at on first use. The placeholder values will be
-/// rejected by Bedrock, which triggers `awsAuthRefresh` to fetch real ones.
-fn ensure_dummy_aws_profile(host: &HostPaths) -> Result<()> {
-    let aws_dir = host.container_home.join(".aws");
-    fs::create_dir_all(&aws_dir)
-        .with_context(|| format!("failed to create {}", aws_dir.display()))?;
-    let creds_path = aws_dir.join("credentials");
-    if creds_path.exists() {
-        return Ok(());
-    }
-    fs::write(
-        &creds_path,
-        "[bedrock]\n\
-         aws_access_key_id = PLACEHOLDER\n\
-         aws_secret_access_key = PLACEHOLDER\n",
-    )
-    .with_context(|| format!("failed to write {}", creds_path.display()))?;
-    Ok(())
-}
-
 fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
     let src = host.claude_root.join("settings.json");
     let mut settings: Value = if src.is_file() {
@@ -194,18 +180,24 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
     };
     if let Some(obj) = settings.as_object_mut() {
         strip_keys(obj);
-        // Mirror the awsAuthRefresh injection we already do for
-        // .claude.json — Claude Code looks in settings.json first for
-        // user-level configuration and this is where the operator most
-        // naturally puts it.
+        // Mirror the awsCredentialExport injection we do for .claude.json
+        // — Claude Code looks in settings.json first for user-level
+        // configuration, which is where the operator most naturally puts
+        // it. The command returns JSON on stdout; the broker bridges
+        // through the forward proxy so the container never touches its
+        // own ~/.aws/credentials.
         if opts.bedrock {
             obj.insert(
-                "awsAuthRefresh".to_string(),
-                Value::String("/usr/local/bin/agent-container-aws-refresh".to_string()),
+                "awsCredentialExport".to_string(),
+                Value::String(
+                    "sh -c 'curl -fsS --max-time 15 \"$AGENT_CONTAINER_HOST_ENDPOINT/aws/credentials\"'"
+                        .to_string(),
+                ),
             );
         } else {
-            obj.remove("awsAuthRefresh");
+            obj.remove("awsCredentialExport");
         }
+        obj.remove("awsAuthRefresh");
     }
     let dest_dir = host.container_home.join(".claude");
     fs::create_dir_all(&dest_dir)?;
@@ -359,12 +351,18 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_mode_injects_aws_auth_refresh() {
+    fn bedrock_mode_injects_aws_credential_export_and_clears_auth_refresh() {
         let tmp_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
         let workspace = tmp_home.path().join("work");
         fs::create_dir_all(&workspace).unwrap();
-        fs::write(tmp_home.path().join(".claude.json"), "{}").unwrap();
+        // A stale persistent home may carry the legacy key from an older
+        // agent-container version — sync should remove it unconditionally.
+        fs::write(
+            tmp_home.path().join(".claude.json"),
+            r#"{"awsAuthRefresh": "stale"}"#,
+        )
+        .unwrap();
 
         let host = HostPaths {
             home: tmp_home.path().to_path_buf(),
@@ -386,9 +384,11 @@ mod tests {
             &fs::read_to_string(container_home.path().join(".claude.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            out["awsAuthRefresh"].as_str(),
-            Some("/usr/local/bin/agent-container-aws-refresh")
+        assert!(out.get("awsAuthRefresh").is_none(), "awsAuthRefresh must be cleared");
+        let export = out["awsCredentialExport"].as_str().unwrap();
+        assert!(
+            export.contains("$AGENT_CONTAINER_HOST_ENDPOINT/aws/credentials"),
+            "awsCredentialExport should curl the broker"
         );
     }
 
@@ -458,46 +458,7 @@ mod tests {
         assert!(mcp["github"].get("headers").is_none());
     }
 
-    #[test]
-    fn ensures_dummy_aws_profile_when_missing() {
-        let tmp_home = tempfile::tempdir().unwrap();
-        let container_home = tempfile::tempdir().unwrap();
-        let host = HostPaths {
-            home: tmp_home.path().to_path_buf(),
-            claude_root: tmp_home.path().join(".claude"),
-            workspace: tmp_home.path().join("work"),
-            container_home: container_home.path().to_path_buf(),
-        };
-        ensure_dummy_aws_profile(&host).unwrap();
-        let creds = fs::read_to_string(container_home.path().join(".aws/credentials")).unwrap();
-        assert!(creds.contains("[bedrock]"));
-        assert!(creds.contains("PLACEHOLDER"));
-    }
-
-    #[test]
-    fn preserves_existing_aws_credentials() {
-        let tmp_home = tempfile::tempdir().unwrap();
-        let container_home = tempfile::tempdir().unwrap();
-        let aws_dir = container_home.path().join(".aws");
-        fs::create_dir_all(&aws_dir).unwrap();
-        fs::write(
-            aws_dir.join("credentials"),
-            "[bedrock]\naws_access_key_id = REAL\naws_secret_access_key = REAL_SECRET\n",
-        )
-        .unwrap();
-        let host = HostPaths {
-            home: tmp_home.path().to_path_buf(),
-            claude_root: tmp_home.path().join(".claude"),
-            workspace: tmp_home.path().join("work"),
-            container_home: container_home.path().to_path_buf(),
-        };
-        ensure_dummy_aws_profile(&host).unwrap();
-        let creds = fs::read_to_string(aws_dir.join("credentials")).unwrap();
-        assert!(creds.contains("REAL"));
-        assert!(!creds.contains("PLACEHOLDER"));
-    }
-
-    #[test]
+#[test]
     fn settings_json_is_filtered() {
         let tmp_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();

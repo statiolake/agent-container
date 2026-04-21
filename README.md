@@ -165,21 +165,31 @@ Put this in `~/.claude/settings.json` on the host:
 }
 ```
 
-The CLI detects that, resolves credentials via `aws configure
-export-credentials --profile <profile> --format process` (which handles
-static keys, SSO, and assume-role uniformly), and serves them on the
+The CLI detects that and serves currently-valid credentials on the
 broker's `/aws/credentials` endpoint. The container's Claude Code reads
-them on demand via a short shell script set as `awsAuthRefresh`, so
-long-running sessions keep working after SSO session refreshes.
+them on demand through Claude Code's built-in `awsCredentialExport`
+hook, pointed at a tiny `curl` against the broker. The container never
+writes `~/.aws/credentials`; the credentials live only in Claude Code's
+memory for the lifetime of the request.
 
-If you want an SSO refresh command to run automatically when credential
-resolution fails on the host, set it in `~/.claude.json`:
+On the host, the broker resolves credentials via `aws configure
+export-credentials --profile <profile> --format process` — which
+handles static keys, SSO and assume-role uniformly. If resolution fails
+(typically SSO expired), an optional `awsAuthRefresh` command is run
+before a retry. Put it in `~/.claude/settings.json` (preferred) or
+`~/.claude.json`:
 
 ```json
 {
   "awsAuthRefresh": "aws sso login --profile my-bedrock-profile"
 }
 ```
+
+Host-side AWS env vars (`AWS_PROFILE`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) are deliberately **not**
+forwarded into the container. Otherwise a shell that happens to be
+pointing at a different AWS account would silently override the profile
+you chose in `settings.json`.
 
 ### Logging
 

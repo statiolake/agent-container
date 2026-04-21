@@ -18,9 +18,6 @@ RUN apt-get update \
 RUN npm install -g @anthropic-ai/claude-code@latest @openai/codex \
     && npm cache clean --force
 
-COPY agent-container-aws-refresh.sh /usr/local/bin/agent-container-aws-refresh
-RUN chmod 0755 /usr/local/bin/agent-container-aws-refresh
-
 # Writable home for an arbitrary UID passed via `docker run --user`.
 # Pre-create /home/agent/.claude so that bind-mounts of its children (e.g.
 # .credentials.json, projects/-workspace, CLAUDE.md) don't leave the parent

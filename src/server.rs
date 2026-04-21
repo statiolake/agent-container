@@ -129,8 +129,8 @@ async fn handle_aws(State(state): State<Arc<BrokerState>>) -> Response {
             *state.last_error.lock().await = None;
             (
                 StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                render_credentials_file(&creds),
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                render_awscredentialexport_json(&creds),
             )
                 .into_response()
         }
@@ -705,21 +705,40 @@ fn is_hop_by_hop(name: &str) -> bool {
     HOP.iter().any(|h| h.eq_ignore_ascii_case(name))
 }
 
-fn render_credentials_file(creds: &BedrockCredentials) -> String {
-    let mut out = String::new();
-    out.push_str("[bedrock]\n");
-    out.push_str(&format!("aws_access_key_id = {}\n", creds.access_key_id));
-    out.push_str(&format!(
-        "aws_secret_access_key = {}\n",
-        creds.secret_access_key
-    ));
+/// Emit the JSON shape Claude Code's `awsCredentialExport` command
+/// interface expects:
+///
+/// ```json
+/// {
+///   "Credentials": {
+///     "AccessKeyId": "...",
+///     "SecretAccessKey": "...",
+///     "SessionToken": "..."
+///   }
+/// }
+/// ```
+///
+/// The container-side `awsCredentialExport` command is a `curl` against
+/// this endpoint, so the container never has to touch its own
+/// `~/.aws/credentials` — Claude Code keeps the creds in memory.
+fn render_awscredentialexport_json(creds: &BedrockCredentials) -> String {
+    let mut credentials = serde_json::Map::new();
+    credentials.insert(
+        "AccessKeyId".to_string(),
+        serde_json::Value::String(creds.access_key_id.clone()),
+    );
+    credentials.insert(
+        "SecretAccessKey".to_string(),
+        serde_json::Value::String(creds.secret_access_key.clone()),
+    );
     if let Some(token) = &creds.session_token {
-        out.push_str(&format!("aws_session_token = {}\n", token));
+        credentials.insert(
+            "SessionToken".to_string(),
+            serde_json::Value::String(token.clone()),
+        );
     }
-    if let Some(region) = &creds.region {
-        out.push_str(&format!("region = {}\n", region));
-    }
-    out
+    let body = serde_json::json!({ "Credentials": serde_json::Value::Object(credentials) });
+    serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string())
 }
 
 #[cfg(test)]
@@ -727,32 +746,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn creds_file_renders_minimal_profile() {
+    fn aws_json_emits_credentials_shape_without_session_token() {
         let c = BedrockCredentials {
             access_key_id: "AKIA".into(),
             secret_access_key: "SECRET".into(),
             session_token: None,
             region: None,
         };
-        let out = render_credentials_file(&c);
-        assert!(out.contains("[bedrock]"));
-        assert!(out.contains("aws_access_key_id = AKIA"));
-        assert!(out.contains("aws_secret_access_key = SECRET"));
-        assert!(!out.contains("aws_session_token"));
-        assert!(!out.contains("region"));
+        let out = render_awscredentialexport_json(&c);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["Credentials"]["AccessKeyId"], "AKIA");
+        assert_eq!(v["Credentials"]["SecretAccessKey"], "SECRET");
+        assert!(v["Credentials"].get("SessionToken").is_none());
     }
 
     #[test]
-    fn creds_file_includes_optional_fields() {
+    fn aws_json_includes_session_token_when_present() {
         let c = BedrockCredentials {
             access_key_id: "AKIA".into(),
             secret_access_key: "SECRET".into(),
             session_token: Some("TOKEN".into()),
             region: Some("us-west-2".into()),
         };
-        let out = render_credentials_file(&c);
-        assert!(out.contains("aws_session_token = TOKEN"));
-        assert!(out.contains("region = us-west-2"));
+        let out = render_awscredentialexport_json(&c);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["Credentials"]["SessionToken"], "TOKEN");
     }
 
     #[test]

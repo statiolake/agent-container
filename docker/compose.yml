@@ -33,11 +33,13 @@ services:
       # non-interactive or unknown hosts.
       - TERM=${TERM:-xterm-256color}
       - COLORTERM=${COLORTERM:-truecolor}
-      # Bedrock pathway. Actual AWS credentials are fetched on demand by
-      # the container's awsAuthRefresh script via AGENT_CONTAINER_HOST_ENDPOINT;
-      # these toggles stay empty unless the host opted in.
+      # Bedrock pathway. Credentials themselves never travel through env
+      # vars — the container's awsCredentialExport command fetches them
+      # from the broker on demand. AWS_PROFILE / AWS_ACCESS_KEY_ID /
+      # AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN are intentionally NOT
+      # forwarded so the host's own AWS environment can't hijack which
+      # account the container transacts against.
       - CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-}
-      - AWS_PROFILE=${AWS_PROFILE:-}
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
       - AWS_REGION=${AWS_REGION:-}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-}
