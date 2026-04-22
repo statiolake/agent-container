@@ -109,17 +109,11 @@ fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
         }
 
         if opts.is_bedrock() {
-            // Claude Code runs awsCredentialExport silently, expects a
-            // JSON response on stdout with a `Credentials` object. We
-            // point it straight at the host broker through the forward
-            // proxy so the container never needs to touch its own
-            // ~/.aws/credentials.
             obj.insert(
                 "awsCredentialExport".to_string(),
-                Value::String(
-                    "sh -c 'curl -fsS --max-time 15 \"$AGENT_CONTAINER_HOST_ENDPOINT/aws/credentials\"'"
-                        .to_string(),
-                ),
+                Value::String(aws_credential_export_command(
+                    opts.broker_url_from_container,
+                )),
             );
         } else {
             obj.remove("awsCredentialExport");
@@ -195,10 +189,9 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
         if let Some(bedrock) = opts.bedrock {
             obj.insert(
                 "awsCredentialExport".to_string(),
-                Value::String(
-                    "sh -c 'curl -fsS --max-time 15 \"$AGENT_CONTAINER_HOST_ENDPOINT/aws/credentials\"'"
-                        .to_string(),
-                ),
+                Value::String(aws_credential_export_command(
+                    opts.broker_url_from_container,
+                )),
             );
             // Strip of `env` happened above via COMMON_STRIP; rebuild a
             // minimal one so Claude Code sees CLAUDE_CODE_USE_BEDROCK
@@ -226,6 +219,24 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
     fs::write(&dest, pretty)
         .with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
+}
+
+/// Build the `awsCredentialExport` shell command for the container.
+///
+/// Two things to notice:
+/// - The broker URL is interpolated at sync time rather than referencing
+///   `$AGENT_CONTAINER_HOST_ENDPOINT`, because Claude Code may spawn the
+///   hook without a shell that expands env vars.
+/// - `-x http://proxy:8888` forces the curl through the compose
+///   `proxy` service. The agent container is on a `--internal` network
+///   and has no `extra_hosts`, so `host.docker.internal` only resolves
+///   (and routes) when we go via the proxy. We cannot rely on
+///   `HTTP_PROXY` being inherited by the hook subprocess.
+fn aws_credential_export_command(broker_url: &str) -> String {
+    format!(
+        "curl -fsS --max-time 15 -x http://proxy:8888 {}/aws/credentials",
+        broker_url.trim_end_matches('/')
+    )
 }
 
 fn strip_keys(obj: &mut serde_json::Map<String, Value>) {
@@ -415,8 +426,12 @@ mod tests {
         assert!(out.get("awsAuthRefresh").is_none(), "awsAuthRefresh must be cleared");
         let export = out["awsCredentialExport"].as_str().unwrap();
         assert!(
-            export.contains("$AGENT_CONTAINER_HOST_ENDPOINT/aws/credentials"),
-            "awsCredentialExport should curl the broker"
+            export.contains("http://host.docker.internal:0/aws/credentials"),
+            "awsCredentialExport should curl the broker directly (got {export})"
+        );
+        assert!(
+            export.contains("-x http://proxy:8888"),
+            "awsCredentialExport must route through the compose proxy (got {export})"
         );
     }
 
@@ -566,7 +581,8 @@ mod tests {
         .unwrap();
         assert!(out.get("awsAuthRefresh").is_none());
         let export = out["awsCredentialExport"].as_str().unwrap();
-        assert!(export.contains("$AGENT_CONTAINER_HOST_ENDPOINT/aws/credentials"));
+        assert!(export.contains("http://unused/aws/credentials"));
+        assert!(export.contains("-x http://proxy:8888"));
         // env is rebuilt for Claude Code that reads it from settings.json
         let env = out["env"].as_object().expect("env object injected");
         assert_eq!(env["CLAUDE_CODE_USE_BEDROCK"].as_str(), Some("1"));
