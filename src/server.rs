@@ -120,13 +120,18 @@ pub async fn spawn(
 }
 
 async fn handle_aws(State(state): State<Arc<BrokerState>>) -> Response {
+    tracing::info!("aws credentials requested by container");
     let Some((setup, refresh)) = &state.bedrock else {
+        tracing::warn!(
+            "aws credentials requested but host has no Bedrock configuration — returning 404"
+        );
         return (StatusCode::NOT_FOUND, "Bedrock not configured on the host")
             .into_response();
     };
     match resolve_credentials(setup, refresh.as_deref()) {
         Ok(creds) => {
             *state.last_error.lock().await = None;
+            tracing::info!(profile = %setup.profile, "aws credentials resolved and returned");
             (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -136,6 +141,7 @@ async fn handle_aws(State(state): State<Arc<BrokerState>>) -> Response {
         }
         Err(e) => {
             let msg = format!("{e:#}");
+            tracing::error!(error = %msg, "aws credentials resolution failed");
             *state.last_error.lock().await = Some(msg.clone());
             (StatusCode::BAD_GATEWAY, msg).into_response()
         }
