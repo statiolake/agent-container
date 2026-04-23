@@ -757,7 +757,6 @@ mod tests {
             access_key_id: "AKIA".into(),
             secret_access_key: "SECRET".into(),
             session_token: None,
-            region: None,
         };
         let out = render_awscredentialexport_json(&c);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -772,7 +771,6 @@ mod tests {
             access_key_id: "AKIA".into(),
             secret_access_key: "SECRET".into(),
             session_token: Some("TOKEN".into()),
-            region: Some("us-west-2".into()),
         };
         let out = render_awscredentialexport_json(&c);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();

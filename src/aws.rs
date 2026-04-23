@@ -20,11 +20,14 @@ pub struct BedrockSetup {
 }
 
 /// Credentials materialised via `aws configure export-credentials`.
+///
+/// Region is deliberately absent: the AWS credential-process JSON format
+/// has no region field, and Claude Code picks up the region from the env
+/// section of settings.json (which we also keep in sync).
 pub struct BedrockCredentials {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: Option<String>,
-    pub region: Option<String>,
 }
 
 /// Parse `~/.claude/settings.json` and return a BedrockSetup if the user
@@ -180,16 +183,10 @@ fn try_export(setup: &BedrockSetup) -> Result<BedrockCredentials> {
     let parsed: ExportedCreds = serde_json::from_slice(&output.stdout)
         .context("failed to parse aws configure export-credentials JSON")?;
 
-    let region = setup
-        .region
-        .clone()
-        .or_else(|| lookup_profile_region(&setup.profile));
-
     Ok(BedrockCredentials {
         access_key_id: parsed.access_key_id,
         secret_access_key: parsed.secret_access_key,
         session_token: parsed.session_token,
-        region,
     })
 }
 
@@ -202,23 +199,6 @@ fn run_refresh(cmd: &str) -> Result<()> {
         bail!("awsAuthRefresh exited with status {status}");
     }
     Ok(())
-}
-
-fn lookup_profile_region(profile: &str) -> Option<String> {
-    let output = Command::new("aws")
-        .args(["configure", "get", "region", "--profile", profile])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let region = String::from_utf8(output.stdout).ok()?;
-    let trimmed = region.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
 }
 
 #[cfg(test)]
