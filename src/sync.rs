@@ -79,7 +79,66 @@ pub fn sync_host_state(host: &HostPaths, opts: SyncOptions<'_>) -> Result<()> {
     sync_settings_json(host, &opts).context("failed to sync .claude/settings.json")?;
     sync_user_extensions(host).context("failed to sync user skills/commands/agents")?;
     sync_plugin_marketplaces(host).context("failed to sync plugin marketplaces")?;
+    sync_git_identity(host).context("failed to sync git identity")?;
     Ok(())
+}
+
+/// Query the host's git identity for the current workspace and write it
+/// into the container's `~/.gitconfig`. Using `git -C <workspace> config
+/// --get` resolves global, local, and any `includeIf` config the host
+/// would use in that directory, so the container commits with the same
+/// author the host would.
+///
+/// We write to the container HOME's gitconfig rather than touching
+/// `<workspace>/.git/config` directly — the workspace is bind-mounted,
+/// so writes there would leak back into the host's repo.
+fn sync_git_identity(host: &HostPaths) -> Result<()> {
+    let name = host_git_config(&host.workspace, "user.name");
+    let email = host_git_config(&host.workspace, "user.email");
+    write_container_gitconfig(&host.container_home, name.as_deref(), email.as_deref())
+}
+
+fn write_container_gitconfig(
+    container_home: &Path,
+    name: Option<&str>,
+    email: Option<&str>,
+) -> Result<()> {
+    let dest = container_home.join(".gitconfig");
+    match (name, email) {
+        (Some(n), Some(e)) => {
+            let body = format!("[user]\n\tname = {n}\n\temail = {e}\n");
+            fs::write(&dest, body)
+                .with_context(|| format!("failed to write {}", dest.display()))?;
+        }
+        _ => {
+            if dest.exists() {
+                let _ = fs::remove_file(&dest);
+            }
+            eprintln!(
+                "[agent-container] warning: host has no git user.name / user.email configured for this workspace; `git commit` inside the container will fail until you set them."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn host_git_config(workspace: &Path, key: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(workspace)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
@@ -592,5 +651,30 @@ mod tests {
         );
         assert_eq!(env["AWS_REGION"].as_str(), Some("us-west-2"));
         assert_eq!(env["AWS_DEFAULT_REGION"].as_str(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn gitconfig_written_when_both_values_present() {
+        let container_home = tempfile::tempdir().unwrap();
+        write_container_gitconfig(
+            container_home.path(),
+            Some("Example User"),
+            Some("user@example.com"),
+        )
+        .unwrap();
+        let body = fs::read_to_string(container_home.path().join(".gitconfig")).unwrap();
+        assert!(body.contains("name = Example User"));
+        assert!(body.contains("email = user@example.com"));
+    }
+
+    #[test]
+    fn gitconfig_removed_when_values_missing() {
+        let container_home = tempfile::tempdir().unwrap();
+        let dest = container_home.path().join(".gitconfig");
+        fs::write(&dest, "[user]\n\tname = stale\n").unwrap();
+
+        write_container_gitconfig(container_home.path(), None, Some("only@example.com"))
+            .unwrap();
+        assert!(!dest.exists(), "stale gitconfig should be removed");
     }
 }
