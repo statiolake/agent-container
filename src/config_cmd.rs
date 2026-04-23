@@ -21,7 +21,7 @@ use crate::oauth::{OAuthStore, load_from_keychain};
 use crate::paths::HostPaths;
 use crate::policy::McpPolicy;
 use crate::settings::{self, Scope, Settings};
-use crate::tui::{self, Outcome, ToolEntry};
+use crate::tui::{self, Outcome, ToolEntry, TuiInput};
 
 /// Resolve scope flags to a concrete [`Scope`], defaulting to workspace.
 /// The flags are already mutually exclusive at the clap layer.
@@ -52,72 +52,87 @@ pub async fn run_editor(scope: Scope) -> Result<()> {
     let servers = mcp::load_servers(&host.home.join(".claude.json"))
         .context("failed to load MCP servers from ~/.claude.json")?;
 
-    if servers.is_empty() {
-        println!("No MCP servers declared in ~/.claude.json; nothing to configure.");
-        return Ok(());
-    }
-
     let oauth = Arc::new(OAuthStore::new(
         load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
     ));
 
-    // Display starts from the merged view so users see what is effectively
-    // active; writes land in the chosen scope only.
-    let policy: McpPolicy = Settings::load_merged(&host.workspace)
-        .context("failed to load agent-container settings")?
-        .mcp;
+    // Three views of settings we need at the same time:
+    //
+    // - `scope_settings` is what's on disk for the target scope (editor
+    //   inputs for proxy.allow come from here — workspace shouldn't see
+    //   inherited-global rules in its own file view).
+    // - `merged` drives the MCP tool-row enabled bit so the UI reflects
+    //   what actually takes effect at runtime.
+    // - `base_mcp` is the policy without the target scope, used at save
+    //   time so we only persist entries that diverge from inheritance.
+    let scope_settings = Settings::load_scope(scope, &host.workspace)
+        .context("failed to load scope-local settings")?;
+    let merged = Settings::load_merged(&host.workspace)
+        .context("failed to load agent-container settings")?;
+    let base_mcp: McpPolicy = match scope {
+        Scope::Workspace => Settings::load_global().unwrap_or_default().mcp,
+        Scope::Global => McpPolicy::default(),
+    };
 
-    println!("Fetching tools from {} MCP server(s)...", servers.len());
     let mut entries: Vec<ToolEntry> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
-    for server in &servers {
-        let name = server.name().to_string();
-        use std::io::Write;
-        print!("  {} ({})...", name, server.transport_label());
-        std::io::stdout().flush().ok();
-        match fetch_any(server, &oauth).await {
-            Ok(tools) => {
-                println!(" {} tool(s)", tools.len());
-                for tool in tools {
-                    let read_only_hint = tool.read_only_hint();
-                    let enabled = policy.tool_allowed(&name, &tool.name, read_only_hint);
-                    entries.push(ToolEntry {
-                        server_name: name.clone(),
-                        tool_name: tool.name,
-                        description: tool.description.unwrap_or_default(),
-                        read_only_hint,
-                        enabled,
-                    });
+    if servers.is_empty() {
+        eprintln!("[agent-container] note: no MCP servers declared in ~/.claude.json; the MCP tab will be empty.");
+    } else {
+        println!("Fetching tools from {} MCP server(s)...", servers.len());
+        for server in &servers {
+            let name = server.name().to_string();
+            use std::io::Write;
+            print!("  {} ({})...", name, server.transport_label());
+            std::io::stdout().flush().ok();
+            match fetch_any(server, &oauth).await {
+                Ok(tools) => {
+                    println!(" {} tool(s)", tools.len());
+                    for tool in tools {
+                        let read_only_hint = tool.read_only_hint();
+                        let enabled =
+                            merged.mcp.tool_allowed(&name, &tool.name, read_only_hint);
+                        entries.push(ToolEntry {
+                            server_name: name.clone(),
+                            tool_name: tool.name,
+                            description: tool.description.unwrap_or_default(),
+                            read_only_hint,
+                            enabled,
+                        });
+                    }
+                }
+                Err(e) => {
+                    println!(" FAILED ({e:#})");
+                    skipped.push((name, format!("{e:#}")));
                 }
             }
-            Err(e) => {
-                println!(" FAILED ({e:#})");
-                skipped.push((name, format!("{e:#}")));
-            }
         }
+        entries.sort_by(|a, b| {
+            a.server_name
+                .cmp(&b.server_name)
+                .then_with(|| a.tool_name.cmp(&b.tool_name))
+        });
     }
 
-    if entries.is_empty() {
-        eprintln!("No tools to configure.");
-        return Ok(());
-    }
+    let input = TuiInput {
+        scope_label: match scope {
+            Scope::Global => "Global".to_string(),
+            Scope::Workspace => "Workspace".to_string(),
+        },
+        proxy_allow: scope_settings.proxy.allow.clone(),
+        tool_entries: entries,
+    };
 
-    entries.sort_by(|a, b| {
-        a.server_name
-            .cmp(&b.server_name)
-            .then_with(|| a.tool_name.cmp(&b.tool_name))
-    });
-
-    match tui::run_selection(entries)? {
-        Outcome::Save(entries) => {
-            // Load the *target scope* (not merged) so we don't accidentally
-            // promote a global entry into the workspace file just because
-            // it happened to be the effective value.
-            let mut scoped = Settings::load_scope(scope, &host.workspace)
-                .context("failed to load target-scope settings for save")?;
-            apply_entries(&mut scoped.mcp, &entries);
+    match tui::run_selection(input)? {
+        Outcome::Save(out) => {
+            // Load the target scope fresh (not merged) so untouched sections
+            // of its settings.toml survive this save verbatim.
+            let mut target = Settings::load_scope(scope, &host.workspace)
+                .context("failed to reload target-scope settings for save")?;
+            target.proxy.allow = out.proxy_allow;
+            apply_entries_scoped(&mut target.mcp, &base_mcp, &out.tool_entries);
             let path = settings::path(scope, &host.workspace)?;
-            scoped.save_to(&path).context("failed to save settings")?;
+            target.save_to(&path).context("failed to save settings")?;
             println!("Saved to {} ({:?} scope)", path.display(), scope);
             if !skipped.is_empty() {
                 println!(
@@ -234,23 +249,29 @@ async fn fetch_any(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> 
     }
 }
 
-fn apply_entries(policy: &mut McpPolicy, entries: &[ToolEntry]) {
-    use std::collections::BTreeSet;
-    let servers: BTreeSet<&str> = entries.iter().map(|e| e.server_name.as_str()).collect();
-    for server in &servers {
-        policy.set_server_enabled(server, true);
-    }
-
+/// Produce a minimal per-scope `McpPolicy` by only writing entries that
+/// diverge from `base` (the merged view without this scope).
+///
+/// Tools matching the inherited state get their per-tool entry cleared
+/// so the layered settings file stays as sparse as possible. Servers end
+/// up in the scope file only when they have at least one divergent tool.
+fn apply_entries_scoped(target: &mut McpPolicy, base: &McpPolicy, entries: &[ToolEntry]) {
     for entry in entries {
-        let annotation_default = entry.read_only_hint.unwrap_or(false);
-        if entry.enabled == annotation_default {
-            // Matches the annotation default; leave no explicit entry so
-            // the toml stays minimal.
-            if let Some(sp) = policy.servers.get_mut(&entry.server_name) {
+        let base_state = base.tool_allowed(&entry.server_name, &entry.tool_name, entry.read_only_hint);
+        if entry.enabled == base_state {
+            if let Some(sp) = target.servers.get_mut(&entry.server_name) {
                 sp.tools.remove(&entry.tool_name);
             }
         } else {
-            policy.set_tool(&entry.server_name, &entry.tool_name, entry.enabled);
+            target.set_tool(&entry.server_name, &entry.tool_name, entry.enabled);
         }
     }
+    // Drop server entries that no longer carry any override.
+    target.servers.retain(|name, sp| {
+        if !sp.tools.is_empty() {
+            return true;
+        }
+        let base_enabled = base.servers.get(name).map(|b| b.enabled).unwrap_or(true);
+        sp.enabled != base_enabled
+    });
 }
