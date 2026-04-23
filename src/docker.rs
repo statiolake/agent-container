@@ -66,6 +66,10 @@ pub struct RunOptions {
     /// `["claude", "--dangerously-skip-permissions"]` or `["codex"]`.
     pub agent_command: Vec<String>,
     pub extra_args: Vec<String>,
+    /// User-defined `proxy.allow` patterns, already merged across global
+    /// and workspace settings. Appended to the bundled base allowlist and
+    /// mounted into tinyproxy.
+    pub proxy_allow: Vec<String>,
 }
 
 /// Orchestrate the compose project: start relay, run agent, always tear down.
@@ -95,7 +99,10 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
 
-    let allowlist_path = default_dockerfile_dir().join("proxy").join("allowlist.txt");
+    let base_allowlist = default_dockerfile_dir().join("proxy").join("allowlist.txt");
+    let allowlist_path = crate::proxy_allowlist::cache_path_for(std::process::id())?;
+    crate::proxy_allowlist::generate(&base_allowlist, &opts.proxy_allow, &allowlist_path)
+        .context("failed to materialise merged proxy allowlist for tinyproxy")?;
 
     let mut env: HashMap<String, String> = [
         (

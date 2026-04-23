@@ -9,6 +9,7 @@ mod mcp_client;
 mod oauth;
 mod paths;
 mod policy;
+mod proxy_allowlist;
 mod server;
 mod settings;
 mod stdio_mcp;
@@ -94,9 +95,10 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
     .context("failed to read awsAuthRefresh from ~/.claude/settings.json or ~/.claude.json")?;
     let mcp_servers = mcp::load_servers(&host.home.join(".claude.json"))
         .context("failed to load MCP servers from ~/.claude.json")?;
-    let policy = settings::Settings::load_merged(&host.workspace)
-        .context("failed to load agent-container settings (global + workspace)")?
-        .mcp;
+    let merged_settings = settings::Settings::load_merged(&host.workspace)
+        .context("failed to load agent-container settings (global + workspace)")?;
+    let policy = merged_settings.mcp.clone();
+    let proxy_allow = merged_settings.proxy.allow.clone();
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain()
             .context("failed to load MCP OAuth entries from Keychain")?,
@@ -187,6 +189,7 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
         broker_addr: broker.addr,
         agent_command,
         extra_args: passthrough,
+        proxy_allow,
     })
     .await?;
 
@@ -211,9 +214,10 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
     .ok()
     .flatten();
     let mcp_servers = mcp::load_servers(&host.home.join(".claude.json")).unwrap_or_default();
-    let policy = settings::Settings::load_merged(&host.workspace)
-        .unwrap_or_default()
-        .mcp;
+    let merged_settings =
+        settings::Settings::load_merged(&host.workspace).unwrap_or_default();
+    let policy = merged_settings.mcp.clone();
+    let proxy_allow = merged_settings.proxy.allow.clone();
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().unwrap_or_default(),
     ));
@@ -291,6 +295,7 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
         broker_addr: broker.addr,
         agent_command,
         extra_args: Vec::new(),
+        proxy_allow,
     })
     .await?;
 
