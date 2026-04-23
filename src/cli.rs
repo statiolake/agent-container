@@ -35,10 +35,26 @@ pub enum Commands {
         passthrough: Vec<String>,
     },
 
-    /// Edit agent-container configuration.
+    /// Edit agent-container configuration (proxy allowlist, MCP tools).
+    ///
+    /// Settings are layered: a global file at
+    /// `$XDG_CONFIG/agent-container/settings.toml` and a workspace-local
+    /// file at `<workspace>/.agent-container/settings.toml`. Both are
+    /// merged at runtime; writes go to whichever scope the flags select.
     Config {
         #[command(subcommand)]
-        command: ConfigCommands,
+        command: Option<ConfigCommands>,
+        /// Target the user-global settings file. Mutually exclusive with
+        /// --workspace.
+        #[arg(long)]
+        global: bool,
+        /// Target the workspace-local settings file (default).
+        #[arg(long, conflicts_with = "global")]
+        workspace: bool,
+        /// Open the target settings.toml in `$EDITOR` instead of the TUI.
+        /// Only meaningful without a subcommand.
+        #[arg(long)]
+        editor: bool,
     },
 }
 
@@ -50,6 +66,15 @@ pub enum AgentKind {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommands {
-    /// Interactively toggle which MCP tools the container can see.
-    Mcp,
+    /// Print the current settings as TOML. Without flags, prints the
+    /// merged view (global ∪ workspace) — which is what the runtime
+    /// actually sees.
+    Show {
+        /// Show only the global settings file.
+        #[arg(long)]
+        global: bool,
+        /// Show only the workspace-local settings file.
+        #[arg(long, conflicts_with = "global")]
+        workspace: bool,
+    },
 }

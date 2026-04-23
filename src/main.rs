@@ -75,9 +75,34 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Run { agent, passthrough } => run_cmd(agent, passthrough).await,
         Commands::Shell { passthrough } => shell_cmd(passthrough).await,
-        Commands::Config { command } => match command {
-            ConfigCommands::Mcp => config_cmd::run().await,
-        },
+        Commands::Config {
+            command,
+            global,
+            workspace,
+            editor,
+        } => dispatch_config(command, global, workspace, editor).await,
+    }
+}
+
+async fn dispatch_config(
+    command: Option<ConfigCommands>,
+    global: bool,
+    workspace: bool,
+    editor: bool,
+) -> Result<()> {
+    match command {
+        Some(ConfigCommands::Show {
+            global: show_global,
+            workspace: show_workspace,
+        }) => config_cmd::run_show(config_cmd::resolve_scope_opt(show_global, show_workspace)),
+        None => {
+            let scope = config_cmd::resolve_scope(global, workspace);
+            if editor {
+                config_cmd::run_open_in_editor(scope)
+            } else {
+                config_cmd::run_editor(scope).await
+            }
+        }
     }
 }
 
