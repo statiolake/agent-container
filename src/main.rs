@@ -10,6 +10,7 @@ mod oauth;
 mod paths;
 mod policy;
 mod server;
+mod settings;
 mod stdio_mcp;
 mod sync;
 mod tui;
@@ -65,6 +66,10 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 async fn main() -> Result<()> {
     let _log_guard = init_tracing();
 
+    if let Err(e) = settings::migrate_legacy_global_if_needed() {
+        eprintln!("[agent-container] legacy mcp.toml migration failed: {e:#}");
+    }
+
     let cli = Cli::parse();
     match cli.command {
         Commands::Run { agent, passthrough } => run_cmd(agent, passthrough).await,
@@ -89,9 +94,9 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
     .context("failed to read awsAuthRefresh from ~/.claude/settings.json or ~/.claude.json")?;
     let mcp_servers = mcp::load_servers(&host.home.join(".claude.json"))
         .context("failed to load MCP servers from ~/.claude.json")?;
-    let policy = policy::McpPolicy::load().context(
-        "failed to load MCP allowlist policy; fix or remove ~/.config/agent-container/mcp.toml",
-    )?;
+    let policy = settings::Settings::load_merged(&host.workspace)
+        .context("failed to load agent-container settings (global + workspace)")?
+        .mcp;
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain()
             .context("failed to load MCP OAuth entries from Keychain")?,
@@ -206,7 +211,9 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
     .ok()
     .flatten();
     let mcp_servers = mcp::load_servers(&host.home.join(".claude.json")).unwrap_or_default();
-    let policy = policy::McpPolicy::load().unwrap_or_default();
+    let policy = settings::Settings::load_merged(&host.workspace)
+        .unwrap_or_default()
+        .mcp;
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().unwrap_or_default(),
     ));

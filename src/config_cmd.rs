@@ -11,6 +11,7 @@ use crate::mcp_client::{Tool, fetch_tools, fetch_tools_stdio};
 use crate::oauth::{OAuthStore, load_from_keychain};
 use crate::paths::HostPaths;
 use crate::policy::McpPolicy;
+use crate::settings::{self, Settings};
 use crate::tui::{self, Outcome, ToolEntry};
 
 pub async fn run() -> Result<()> {
@@ -26,7 +27,9 @@ pub async fn run() -> Result<()> {
     let oauth = Arc::new(OAuthStore::new(
         load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
     ));
-    let policy = McpPolicy::load().context("failed to load existing MCP allowlist")?;
+    let policy: McpPolicy = Settings::load_merged(&host.workspace)
+        .context("failed to load agent-container settings")?
+        .mcp;
 
     println!("Fetching tools from {} MCP server(s)...", servers.len());
     let mut entries: Vec<ToolEntry> = Vec::new();
@@ -71,9 +74,15 @@ pub async fn run() -> Result<()> {
 
     match tui::run_selection(entries)? {
         Outcome::Save(entries) => {
-            let mut policy = policy;
-            apply_entries(&mut policy, &entries);
-            let path = policy.save().context("failed to save MCP allowlist")?;
+            // Legacy `config mcp` always writes to the global scope; the
+            // richer scope-aware editor lives behind `agent-container
+            // config` (no subcommand). We preserve that behaviour here so
+            // current users see no change in where their edits land.
+            let mut global = Settings::load_global()
+                .context("failed to load global settings for save")?;
+            apply_entries(&mut global.mcp, &entries);
+            let path = settings::global_path()?;
+            global.save_to(&path).context("failed to save settings")?;
             println!("Saved to {}", path.display());
             if !skipped.is_empty() {
                 println!(
@@ -125,10 +134,3 @@ fn apply_entries(policy: &mut McpPolicy, entries: &[ToolEntry]) {
     }
 }
 
-// Touch the unused symbol so the config module continues to pull in
-// policy::config_path (documented contract for callers who want to know
-// where the allowlist lives).
-#[allow(dead_code)]
-fn _hint_config_path() -> anyhow::Result<std::path::PathBuf> {
-    crate::policy::config_path()
-}
