@@ -10,6 +10,7 @@
 //! `show` defaults to the merged view — matching VS Code semantics where
 //! the workspace is the usual place to pin project-specific overrides.
 
+use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -69,9 +70,12 @@ pub async fn run_editor(scope: Scope) -> Result<()> {
         .context("failed to load scope-local settings")?;
     let merged = Settings::load_merged(&host.workspace)
         .context("failed to load agent-container settings")?;
-    let base_mcp: McpPolicy = match scope {
-        Scope::Workspace => Settings::load_global().unwrap_or_default().mcp,
-        Scope::Global => McpPolicy::default(),
+    let (base_mcp, base_tasks) = match scope {
+        Scope::Workspace => {
+            let global = Settings::load_global().unwrap_or_default();
+            (global.mcp, global.task_runner.tasks)
+        }
+        Scope::Global => (McpPolicy::default(), BTreeMap::new()),
     };
 
     let mut entries: Vec<ToolEntry> = Vec::new();
@@ -121,6 +125,7 @@ pub async fn run_editor(scope: Scope) -> Result<()> {
         },
         proxy_allow: scope_settings.proxy.allow.clone(),
         tool_entries: entries,
+        tasks: merged.task_runner.tasks.clone(),
     };
 
     match tui::run_selection(input)? {
@@ -131,6 +136,7 @@ pub async fn run_editor(scope: Scope) -> Result<()> {
                 .context("failed to reload target-scope settings for save")?;
             target.proxy.allow = out.proxy_allow;
             apply_entries_scoped(&mut target.mcp, &base_mcp, &out.tool_entries);
+            target.task_runner.tasks = minimise_tasks_against_base(out.tasks, &base_tasks);
             let path = settings::path(scope, &host.workspace)?;
             target.save_to(&path).context("failed to save settings")?;
             println!("Saved to {} ({:?} scope)", path.display(), scope);
@@ -247,6 +253,18 @@ async fn fetch_any(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> 
         }
         McpServer::Stdio(s) => fetch_tools_stdio(s).await,
     }
+}
+
+/// Strip task entries from `final_tasks` whose value matches what the
+/// scope would inherit from the `base` layer. Keeps the target scope's
+/// `[task_runner.tasks]` sparse — workspace files only carry overrides,
+/// never redundant copies of global tasks.
+fn minimise_tasks_against_base(
+    mut final_tasks: BTreeMap<String, String>,
+    base: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    final_tasks.retain(|name, cmd| base.get(name).map(|b| b != cmd).unwrap_or(true));
+    final_tasks
 }
 
 /// Produce a minimal per-scope `McpPolicy` by only writing entries that

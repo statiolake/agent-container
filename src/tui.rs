@@ -8,6 +8,10 @@
 //! - **MCP** — a collapsible tree of servers → tools. `Space` toggles the
 //!   highlighted item (collapse on a server row, enable/disable on a
 //!   tool row). `a`/`A` bulk-toggles every tool in the focused server.
+//!   The built-in `task-runner` always sits at the top of the tree; its
+//!   children are editable `name = command` entries that become MCP
+//!   tools for host-side command execution. `i`/`+` adds, `e`/`Enter`
+//!   edits, `d` removes.
 //!
 //! Cross-tab:
 //!
@@ -19,7 +23,7 @@
 //! The alternate screen is entered so the prior terminal contents come
 //! back untouched on exit.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::time::Duration;
 
@@ -55,11 +59,16 @@ pub struct TuiInput {
     /// runtime view. Changes compared back to this set decide which
     /// entries land in the target scope at save time.
     pub tool_entries: Vec<ToolEntry>,
+    /// Merged `[task_runner.tasks]` map shown inline in the MCP tab as
+    /// the built-in task-runner server. Editable; the save pass diffs
+    /// this against the inherited base to keep the scope file sparse.
+    pub tasks: BTreeMap<String, String>,
 }
 
 pub struct TuiOutput {
     pub proxy_allow: Vec<String>,
     pub tool_entries: Vec<ToolEntry>,
+    pub tasks: BTreeMap<String, String>,
 }
 
 pub enum Outcome {
@@ -100,6 +109,30 @@ enum Mode {
         buffer: String,
         editing_idx: Option<usize>,
     },
+    TaskInput {
+        name: String,
+        command: String,
+        focus: TaskField,
+        /// Original name of the task being edited, or None for a fresh
+        /// add. Used on commit to delete the old key when a rename
+        /// happens.
+        editing: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskField {
+    Name,
+    Command,
+}
+
+impl TaskField {
+    fn toggle(self) -> Self {
+        match self {
+            TaskField::Name => TaskField::Command,
+            TaskField::Command => TaskField::Name,
+        }
+    }
 }
 
 struct ProxyState {
@@ -154,13 +187,20 @@ impl ProxyState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum McpRow {
+    TaskRunnerHeader,
+    TaskRow(String),
+    TaskAddHint,
     Server(usize),
     Tool(usize),
 }
 
 struct McpState {
+    /// Built-in task-runner tasks (name -> command). Rendered as the
+    /// top-most "server" of the MCP tree so users can edit them inline.
+    tasks: BTreeMap<String, String>,
+    task_runner_expanded: bool,
     server_names: Vec<String>,
     /// Per-server collapse state. Initially expanded when a server has
     /// any overrides visible so the user can immediately see them.
@@ -173,7 +213,7 @@ struct McpState {
 }
 
 impl McpState {
-    fn new(mut entries: Vec<ToolEntry>) -> Self {
+    fn new(mut entries: Vec<ToolEntry>, tasks: BTreeMap<String, String>) -> Self {
         entries.sort_by(|a, b| {
             a.server_name
                 .cmp(&b.server_name)
@@ -194,6 +234,8 @@ impl McpState {
 
         let expanded = vec![true; server_names.len()];
         Self {
+            tasks,
+            task_runner_expanded: true,
             server_names,
             expanded,
             entries,
@@ -205,6 +247,13 @@ impl McpState {
     /// Flat list of currently-visible rows (respecting expanded state).
     fn visible_rows(&self) -> Vec<McpRow> {
         let mut rows = Vec::new();
+        rows.push(McpRow::TaskRunnerHeader);
+        if self.task_runner_expanded {
+            for name in self.tasks.keys() {
+                rows.push(McpRow::TaskRow(name.clone()));
+            }
+            rows.push(McpRow::TaskAddHint);
+        }
         for (si, name) in self.server_names.iter().enumerate() {
             rows.push(McpRow::Server(si));
             if self.expanded[si] {
@@ -219,7 +268,7 @@ impl McpState {
     }
 
     fn current_row(&self) -> Option<McpRow> {
-        self.visible_rows().get(self.cursor).copied()
+        self.visible_rows().get(self.cursor).cloned()
     }
 
     fn move_up(&mut self) {
@@ -242,15 +291,26 @@ impl McpState {
         self.cursor = len.saturating_sub(1);
     }
 
-    fn toggle(&mut self) {
+    /// Toggle the currently-focused row. Returns a [`RowAction`] when the
+    /// row can't handle the toggle locally (e.g. a task row needs the
+    /// outer event loop to spawn an input modal).
+    fn toggle(&mut self) -> RowAction {
         match self.current_row() {
+            Some(McpRow::TaskRunnerHeader) => {
+                self.task_runner_expanded = !self.task_runner_expanded;
+                RowAction::Handled
+            }
             Some(McpRow::Server(si)) => {
                 self.expanded[si] = !self.expanded[si];
+                RowAction::Handled
             }
             Some(McpRow::Tool(ti)) => {
                 self.entries[ti].enabled = !self.entries[ti].enabled;
+                RowAction::Handled
             }
-            None => {}
+            Some(McpRow::TaskRow(name)) => RowAction::EditTask(name),
+            Some(McpRow::TaskAddHint) => RowAction::AddTask,
+            None => RowAction::Handled,
         }
     }
 
@@ -264,7 +324,7 @@ impl McpState {
                     .position(|n| n == &self.entries[ti].server_name)
                     .unwrap_or(0)
             }
-            None => return,
+            _ => return,
         };
         let Some(name) = self.server_names.get(server_idx) else {
             return;
@@ -272,6 +332,16 @@ impl McpState {
         if let Some((start, count)) = self.server_ranges.get(name).copied() {
             for i in start..(start + count) {
                 self.entries[i].enabled = enable;
+            }
+        }
+    }
+
+    fn delete_task_at_cursor(&mut self) {
+        if let Some(McpRow::TaskRow(name)) = self.current_row() {
+            self.tasks.remove(&name);
+            let len = self.visible_rows().len();
+            if self.cursor >= len {
+                self.cursor = len.saturating_sub(1);
             }
         }
     }
@@ -291,6 +361,15 @@ impl McpState {
     }
 }
 
+/// Outcome of invoking the toggle action on an MCP row. Task rows need
+/// the outer event loop to spawn an input modal (can't be done inside
+/// `&mut self` without borrowing the App).
+enum RowAction {
+    Handled,
+    EditTask(String),
+    AddTask,
+}
+
 struct App {
     scope_label: String,
     tab: TopTab,
@@ -308,7 +387,7 @@ impl App {
             scope_label: input.scope_label,
             tab: TopTab::Proxy,
             proxy: ProxyState::new(input.proxy_allow),
-            mcp: McpState::new(input.tool_entries),
+            mcp: McpState::new(input.tool_entries, input.tasks),
             mode: Mode::Normal,
             list_state,
         }
@@ -326,6 +405,7 @@ impl App {
         TuiOutput {
             proxy_allow: self.proxy.allow,
             tool_entries: self.mcp.entries,
+            tasks: self.mcp.tasks,
         }
     }
 }
@@ -374,6 +454,99 @@ fn handle_proxy_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
     }
 }
 
+fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    let Mode::TaskInput {
+        mut name,
+        mut command,
+        mut focus,
+        editing,
+    } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => {
+            // canceled — mode already reset
+            return;
+        }
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+            return;
+        }
+        KeyCode::Enter => {
+            let name_tr = name.trim().to_string();
+            let cmd_tr = command.trim().to_string();
+            if name_tr.is_empty() || cmd_tr.is_empty() {
+                // Nudge focus back to the empty field and stay in input mode.
+                focus = if name_tr.is_empty() {
+                    TaskField::Name
+                } else {
+                    TaskField::Command
+                };
+                app.mode = Mode::TaskInput {
+                    name,
+                    command,
+                    focus,
+                    editing,
+                };
+                return;
+            }
+            // Rename clears the old key.
+            if let Some(orig) = &editing {
+                if orig != &name_tr {
+                    app.mcp.tasks.remove(orig);
+                }
+            }
+            app.mcp.tasks.insert(name_tr, cmd_tr);
+            return;
+        }
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => {
+            focus = focus.toggle();
+        }
+        KeyCode::Backspace => {
+            match focus {
+                TaskField::Name => {
+                    name.pop();
+                }
+                TaskField::Command => {
+                    command.pop();
+                }
+            }
+        }
+        KeyCode::Char(c) => match focus {
+            TaskField::Name => name.push(c),
+            TaskField::Command => command.push(c),
+        },
+        _ => {}
+    }
+
+    app.mode = Mode::TaskInput {
+        name,
+        command,
+        focus,
+        editing,
+    };
+}
+
+fn start_task_edit(app: &mut App, name: String) {
+    let command = app.mcp.tasks.get(&name).cloned().unwrap_or_default();
+    app.mode = Mode::TaskInput {
+        name: name.clone(),
+        command,
+        focus: TaskField::Command,
+        editing: Some(name),
+    };
+}
+
+fn start_task_add(app: &mut App) {
+    app.mode = Mode::TaskInput {
+        name: String::new(),
+        command: String::new(),
+        focus: TaskField::Name,
+        editing: None,
+    };
+}
+
 pub fn run_selection(input: TuiInput) -> Result<Outcome> {
     enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = io::stdout();
@@ -406,6 +579,10 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
         // Input mode handling short-circuits every other binding.
         if matches!(app.mode, Mode::ProxyInput { .. }) {
             handle_proxy_input_key(&mut app, key.code, key.modifiers);
+            continue;
+        }
+        if matches!(app.mode, Mode::TaskInput { .. }) {
+            handle_task_input_key(&mut app, key.code, key.modifiers);
             continue;
         }
 
@@ -446,13 +623,20 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                         };
                     }
                 }
-                TopTab::Mcp => app.mcp.toggle(),
+                TopTab::Mcp => match app.mcp.toggle() {
+                    RowAction::Handled => {}
+                    RowAction::EditTask(name) => start_task_edit(&mut app, name),
+                    RowAction::AddTask => start_task_add(&mut app),
+                },
             },
             KeyCode::Char('i') | KeyCode::Char('+') if app.tab == TopTab::Proxy => {
                 app.mode = Mode::ProxyInput {
                     buffer: String::new(),
                     editing_idx: None,
                 };
+            }
+            KeyCode::Char('i') | KeyCode::Char('+') if app.tab == TopTab::Mcp => {
+                start_task_add(&mut app);
             }
             KeyCode::Char('e') if app.tab == TopTab::Proxy => {
                 if let Some(cur) = app.proxy.current().cloned() {
@@ -462,8 +646,16 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                     };
                 }
             }
+            KeyCode::Char('e') if app.tab == TopTab::Mcp => {
+                if let Some(McpRow::TaskRow(name)) = app.mcp.current_row() {
+                    start_task_edit(&mut app, name);
+                }
+            }
             KeyCode::Char('d') if app.tab == TopTab::Proxy => {
                 app.proxy.remove_current();
+            }
+            KeyCode::Char('d') if app.tab == TopTab::Mcp => {
+                app.mcp.delete_task_at_cursor();
             }
             KeyCode::Char('a') if app.tab == TopTab::Mcp => {
                 app.mcp.toggle_all_in_focused_server(true);
@@ -499,6 +691,16 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         TopTab::Mcp => render_mcp(f, chunks[2], app),
     }
     render_footer(f, chunks[3], app);
+
+    if let Mode::TaskInput {
+        ref name,
+        ref command,
+        focus,
+        ref editing,
+    } = app.mode
+    {
+        render_task_input_modal(f, area, name, command, focus, editing.is_some());
+    }
 
     // Overlay modal for proxy input.
     if let Mode::ProxyInput {
@@ -569,8 +771,55 @@ fn render_proxy(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
 fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let rows = app.mcp.visible_rows();
     let items: Vec<ListItem> = rows
-        .iter()
-        .map(|row| match *row {
+        .into_iter()
+        .map(|row| match row {
+            McpRow::TaskRunnerHeader => {
+                let marker = if app.mcp.task_runner_expanded {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                let count = app.mcp.tasks.len();
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{marker} task-runner"),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  ({count} task{})", if count == 1 { "" } else { "s" }),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        "  host commands exposed as MCP tools",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            }
+            McpRow::TaskRow(name) => {
+                let command = app
+                    .mcp
+                    .tasks
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default();
+                ListItem::new(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(name, Style::default().fg(Color::Cyan)),
+                    Span::raw(" = "),
+                    Span::styled(command, Style::default().fg(Color::White)),
+                ]))
+            }
+            McpRow::TaskAddHint => ListItem::new(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    "+ add task (i)",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ])),
             McpRow::Server(si) => {
                 let name = &app.mcp.server_names[si];
                 let (enabled, total) = app.mcp.enabled_count_for(si);
@@ -661,9 +910,11 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             key("j/k", Color::Cyan),
             Span::raw(" move · "),
             key("space", Color::Cyan),
-            Span::raw(" toggle/collapse · "),
+            Span::raw(" toggle · "),
+            key("i/e/d", Color::Cyan),
+            Span::raw(" task add/edit/del · "),
             key("a/A", Color::Cyan),
-            Span::raw(" bulk on/off · "),
+            Span::raw(" bulk · "),
             key("s", Color::Green),
             Span::raw(" save · "),
             key("q", Color::Red),
@@ -684,7 +935,8 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             let enabled = app.mcp.entries.iter().filter(|e| e.enabled).count();
             Line::from(vec![Span::styled(
                 format!(
-                    "{enabled}/{total} tool(s) enabled across {} server(s)",
+                    "{} task(s) · {enabled}/{total} tool(s) enabled across {} server(s)",
+                    app.mcp.tasks.len(),
                     app.mcp.server_names.len()
                 ),
                 Style::default().fg(Color::DarkGray),
@@ -728,6 +980,62 @@ fn render_proxy_input_modal(
     )]);
     let body = Line::from(vec![Span::raw("> "), Span::raw(buffer.to_string())]);
     let para = Paragraph::new(vec![hint, Line::from(""), body]);
+    f.render_widget(para, inner);
+}
+
+fn render_task_input_modal(
+    f: &mut ratatui::Frame<'_>,
+    parent: Rect,
+    name: &str,
+    command: &str,
+    focus: TaskField,
+    is_edit: bool,
+) {
+    let w = parent.width.min(80).max(50);
+    let h: u16 = 8;
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    let y = parent.y + (parent.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, area);
+    let title = if is_edit {
+        " Edit task "
+    } else {
+        " Add task "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let focus_style = |f: TaskField, row: TaskField| {
+        if f == row {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    };
+
+    let hint = Line::from(vec![Span::styled(
+        "Tab/↑↓ switch fields · Enter commit (both required) · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )]);
+    let name_line = Line::from(vec![
+        Span::styled(" name    ", focus_style(focus, TaskField::Name)),
+        Span::raw("  "),
+        Span::raw(name.to_string()),
+    ]);
+    let cmd_line = Line::from(vec![
+        Span::styled(" command ", focus_style(focus, TaskField::Command)),
+        Span::raw("  "),
+        Span::raw(command.to_string()),
+    ]);
+    let para = Paragraph::new(vec![hint, Line::from(""), name_line, Line::from(""), cmd_line]);
     f.render_widget(para, inner);
 }
 
