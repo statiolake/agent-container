@@ -35,10 +35,169 @@ use crossterm::terminal::{
 use crossterm::{cursor, execute};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs};
+
+/// Single-line text buffer with readline-style editing primitives.
+///
+/// Stores content as a `Vec<char>` so cursor arithmetic is character- (not
+/// byte-) based, which Just Works with multi-byte codepoints. Callers use
+/// [`value`] to snapshot the current string and [`prefix_width`] to place
+/// the terminal caret in the correct display column (unicode-width aware
+/// via ratatui's `Span::width`).
+///
+/// [`value`]: TextField::value
+/// [`prefix_width`]: TextField::prefix_width
+#[derive(Clone, Default)]
+struct TextField {
+    chars: Vec<char>,
+    cursor: usize,
+}
+
+impl TextField {
+    fn from_str(s: &str) -> Self {
+        let chars: Vec<char> = s.chars().collect();
+        let cursor = chars.len();
+        Self { chars, cursor }
+    }
+
+    fn value(&self) -> String {
+        self.chars.iter().collect()
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.chars.insert(self.cursor, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            self.chars.remove(self.cursor);
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        if self.cursor < self.chars.len() {
+            self.chars.remove(self.cursor);
+        }
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor < self.chars.len() {
+            self.cursor += 1;
+        }
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.chars.len();
+    }
+
+    fn kill_to_end(&mut self) {
+        self.chars.truncate(self.cursor);
+    }
+
+    fn kill_to_home(&mut self) {
+        self.chars.drain(0..self.cursor);
+        self.cursor = 0;
+    }
+
+    fn kill_word_backward(&mut self) {
+        let mut i = self.cursor;
+        while i > 0 && self.chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !self.chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        self.chars.drain(i..self.cursor);
+        self.cursor = i;
+    }
+
+    fn kill_word_forward(&mut self) {
+        let mut i = self.cursor;
+        while i < self.chars.len() && self.chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < self.chars.len() && !self.chars[i].is_whitespace() {
+            i += 1;
+        }
+        self.chars.drain(self.cursor..i);
+    }
+
+    fn move_word_left(&mut self) {
+        let mut i = self.cursor;
+        while i > 0 && self.chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !self.chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        self.cursor = i;
+    }
+
+    fn move_word_right(&mut self) {
+        let mut i = self.cursor;
+        while i < self.chars.len() && self.chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < self.chars.len() && !self.chars[i].is_whitespace() {
+            i += 1;
+        }
+        self.cursor = i;
+    }
+
+    /// Terminal cells occupied by the substring before the cursor — use
+    /// this to offset the caret from the field's starting column.
+    fn prefix_width(&self) -> u16 {
+        let prefix: String = self.chars[..self.cursor].iter().collect();
+        Span::raw(prefix).width() as u16
+    }
+}
+
+/// Apply one readline-style editing key to `field`. Returns `true` if the
+/// key was consumed (so the caller knows not to fall through to mode-level
+/// handling such as Enter/Esc/Tab).
+fn apply_editing_key(field: &mut TextField, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    match code {
+        KeyCode::Left if alt => field.move_word_left(),
+        KeyCode::Right if alt => field.move_word_right(),
+        KeyCode::Left => field.move_left(),
+        KeyCode::Right => field.move_right(),
+        KeyCode::Home => field.move_home(),
+        KeyCode::End => field.move_end(),
+        KeyCode::Delete => field.delete_forward(),
+        KeyCode::Backspace if ctrl || alt => field.kill_word_backward(),
+        KeyCode::Backspace => field.backspace(),
+        KeyCode::Char('a') if ctrl => field.move_home(),
+        KeyCode::Char('e') if ctrl => field.move_end(),
+        KeyCode::Char('b') if ctrl => field.move_left(),
+        KeyCode::Char('f') if ctrl => field.move_right(),
+        KeyCode::Char('b') if alt => field.move_word_left(),
+        KeyCode::Char('f') if alt => field.move_word_right(),
+        KeyCode::Char('d') if ctrl => field.delete_forward(),
+        KeyCode::Char('d') if alt => field.kill_word_forward(),
+        KeyCode::Char('h') if ctrl => field.backspace(),
+        KeyCode::Char('k') if ctrl => field.kill_to_end(),
+        KeyCode::Char('u') if ctrl => field.kill_to_home(),
+        KeyCode::Char('w') if ctrl => field.kill_word_backward(),
+        KeyCode::Char(c) if !ctrl && !alt => field.insert_char(c),
+        _ => return false,
+    }
+    true
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolEntry {
@@ -106,12 +265,12 @@ impl TopTab {
 enum Mode {
     Normal,
     ProxyInput {
-        buffer: String,
+        buffer: TextField,
         editing_idx: Option<usize>,
     },
     TaskInput {
-        name: String,
-        command: String,
+        name: TextField,
+        command: TextField,
         focus: TaskField,
         /// Original name of the task being edited, or None for a fresh
         /// add. Used on commit to delete the old key when a rename
@@ -421,37 +580,23 @@ fn handle_proxy_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         return;
     };
 
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     match code {
-        KeyCode::Esc => {
-            // mode is already Normal; nothing else to do
-        }
+        KeyCode::Esc => return,
+        KeyCode::Char('c') if ctrl => return,
         KeyCode::Enter => {
-            app.proxy.upsert(buffer, editing_idx);
-        }
-        KeyCode::Backspace => {
-            buffer.pop();
-            app.mode = Mode::ProxyInput {
-                buffer,
-                editing_idx,
-            };
-        }
-        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-            // cancel — mode already reset to Normal
-        }
-        KeyCode::Char(c) => {
-            buffer.push(c);
-            app.mode = Mode::ProxyInput {
-                buffer,
-                editing_idx,
-            };
+            app.proxy.upsert(buffer.value(), editing_idx);
+            return;
         }
         _ => {
-            app.mode = Mode::ProxyInput {
-                buffer,
-                editing_idx,
-            };
+            apply_editing_key(&mut buffer, code, modifiers);
         }
     }
+
+    app.mode = Mode::ProxyInput {
+        buffer,
+        editing_idx,
+    };
 }
 
 fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -465,17 +610,13 @@ fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) 
         return;
     };
 
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     match code {
-        KeyCode::Esc => {
-            // canceled — mode already reset
-            return;
-        }
-        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-            return;
-        }
+        KeyCode::Esc => return,
+        KeyCode::Char('c') if ctrl => return,
         KeyCode::Enter => {
-            let name_tr = name.trim().to_string();
-            let cmd_tr = command.trim().to_string();
+            let name_tr = name.value().trim().to_string();
+            let cmd_tr = command.value().trim().to_string();
             if name_tr.is_empty() || cmd_tr.is_empty() {
                 // Nudge focus back to the empty field and stay in input mode.
                 focus = if name_tr.is_empty() {
@@ -483,41 +624,30 @@ fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) 
                 } else {
                     TaskField::Command
                 };
-                app.mode = Mode::TaskInput {
-                    name,
-                    command,
-                    focus,
-                    editing,
-                };
+            } else {
+                // Rename clears the old key.
+                if let Some(orig) = &editing {
+                    if orig != &name_tr {
+                        app.mcp.tasks.remove(orig);
+                    }
+                }
+                app.mcp.tasks.insert(name_tr, cmd_tr);
                 return;
             }
-            // Rename clears the old key.
-            if let Some(orig) = &editing {
-                if orig != &name_tr {
-                    app.mcp.tasks.remove(orig);
-                }
-            }
-            app.mcp.tasks.insert(name_tr, cmd_tr);
-            return;
         }
-        KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => {
+        // Tab / Up / Down switch focus between the two fields. Up/Down
+        // have no in-line meaning on a single-line field, so we repurpose
+        // them for field navigation — matching most form-style TUIs.
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
             focus = focus.toggle();
         }
-        KeyCode::Backspace => {
-            match focus {
-                TaskField::Name => {
-                    name.pop();
-                }
-                TaskField::Command => {
-                    command.pop();
-                }
-            }
+        _ => {
+            let target = match focus {
+                TaskField::Name => &mut name,
+                TaskField::Command => &mut command,
+            };
+            apply_editing_key(target, code, modifiers);
         }
-        KeyCode::Char(c) => match focus {
-            TaskField::Name => name.push(c),
-            TaskField::Command => command.push(c),
-        },
-        _ => {}
     }
 
     app.mode = Mode::TaskInput {
@@ -531,8 +661,8 @@ fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) 
 fn start_task_edit(app: &mut App, name: String) {
     let command = app.mcp.tasks.get(&name).cloned().unwrap_or_default();
     app.mode = Mode::TaskInput {
-        name: name.clone(),
-        command,
+        name: TextField::from_str(&name),
+        command: TextField::from_str(&command),
         focus: TaskField::Command,
         editing: Some(name),
     };
@@ -540,8 +670,8 @@ fn start_task_edit(app: &mut App, name: String) {
 
 fn start_task_add(app: &mut App) {
     app.mode = Mode::TaskInput {
-        name: String::new(),
-        command: String::new(),
+        name: TextField::default(),
+        command: TextField::default(),
         focus: TaskField::Name,
         editing: None,
     };
@@ -618,7 +748,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 TopTab::Proxy => {
                     if let Some(cur) = app.proxy.current().cloned() {
                         app.mode = Mode::ProxyInput {
-                            buffer: cur,
+                            buffer: TextField::from_str(&cur),
                             editing_idx: Some(app.proxy.cursor),
                         };
                     }
@@ -631,7 +761,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             },
             KeyCode::Char('i') | KeyCode::Char('+') if app.tab == TopTab::Proxy => {
                 app.mode = Mode::ProxyInput {
-                    buffer: String::new(),
+                    buffer: TextField::default(),
                     editing_idx: None,
                 };
             }
@@ -641,7 +771,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             KeyCode::Char('e') if app.tab == TopTab::Proxy => {
                 if let Some(cur) = app.proxy.current().cloned() {
                     app.mode = Mode::ProxyInput {
-                        buffer: cur,
+                        buffer: TextField::from_str(&cur),
                         editing_idx: Some(app.proxy.cursor),
                     };
                 }
@@ -951,7 +1081,7 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn render_proxy_input_modal(
     f: &mut ratatui::Frame<'_>,
     parent: Rect,
-    buffer: &str,
+    buffer: &TextField,
     editing_idx: Option<usize>,
 ) {
     // Centered 60-char-wide 5-line modal.
@@ -975,19 +1105,25 @@ fn render_proxy_input_modal(
     f.render_widget(block, area);
 
     let hint = Line::from(vec![Span::styled(
-        "POSIX extended regex matched against the request host. Enter to commit, Esc to cancel.",
+        "POSIX extended regex. Enter commit · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
         Style::default().fg(Color::DarkGray),
     )]);
-    let body = Line::from(vec![Span::raw("> "), Span::raw(buffer.to_string())]);
+    let body = Line::from(vec![Span::raw("> "), Span::raw(buffer.value())]);
     let para = Paragraph::new(vec![hint, Line::from(""), body]);
     f.render_widget(para, inner);
+
+    // Place the terminal caret after the "> " prefix plus whatever the
+    // buffer has already consumed up to the logical cursor.
+    let cursor_x = inner.x + 2 + buffer.prefix_width();
+    let cursor_y = inner.y + 2;
+    f.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
 fn render_task_input_modal(
     f: &mut ratatui::Frame<'_>,
     parent: Rect,
-    name: &str,
-    command: &str,
+    name: &TextField,
+    command: &TextField,
     focus: TaskField,
     is_edit: bool,
 ) {
@@ -1022,20 +1158,177 @@ fn render_task_input_modal(
     };
 
     let hint = Line::from(vec![Span::styled(
-        "Tab/↑↓ switch fields · Enter commit (both required) · Esc cancel",
+        "Tab/↑↓ switch · Enter commit · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
         Style::default().fg(Color::DarkGray),
     )]);
     let name_line = Line::from(vec![
         Span::styled(" name    ", focus_style(focus, TaskField::Name)),
         Span::raw("  "),
-        Span::raw(name.to_string()),
+        Span::raw(name.value()),
     ]);
     let cmd_line = Line::from(vec![
         Span::styled(" command ", focus_style(focus, TaskField::Command)),
         Span::raw("  "),
-        Span::raw(command.to_string()),
+        Span::raw(command.value()),
     ]);
     let para = Paragraph::new(vec![hint, Line::from(""), name_line, Line::from(""), cmd_line]);
     f.render_widget(para, inner);
+
+    // Field text starts 11 cells in from the modal's inner-left: 9-char
+    // label (" name    " / " command ") + 2-space separator. The hint sits
+    // on row 0, a blank row on 1, so the fields are at rows 2 and 4.
+    let (active_field, row) = match focus {
+        TaskField::Name => (name, 2),
+        TaskField::Command => (command, 4),
+    };
+    let cursor_x = inner.x + 11 + active_field.prefix_width();
+    let cursor_y = inner.y + row;
+    f.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_field_insert_backspace_and_cursor_track() {
+        let mut f = TextField::default();
+        f.insert_char('a');
+        f.insert_char('b');
+        f.insert_char('c');
+        assert_eq!(f.value(), "abc");
+        assert_eq!(f.cursor, 3);
+        f.backspace();
+        assert_eq!(f.value(), "ab");
+        f.move_left();
+        f.backspace();
+        assert_eq!(f.value(), "b");
+        assert_eq!(f.cursor, 0);
+    }
+
+    #[test]
+    fn text_field_from_str_puts_cursor_at_end() {
+        let f = TextField::from_str("hello");
+        assert_eq!(f.cursor, 5);
+        assert_eq!(f.value(), "hello");
+    }
+
+    #[test]
+    fn text_field_home_end_and_delete_forward() {
+        let mut f = TextField::from_str("hello");
+        f.move_home();
+        assert_eq!(f.cursor, 0);
+        f.delete_forward();
+        assert_eq!(f.value(), "ello");
+        f.move_end();
+        assert_eq!(f.cursor, 4);
+        f.delete_forward(); // past-end should be a no-op
+        assert_eq!(f.value(), "ello");
+    }
+
+    #[test]
+    fn text_field_kill_to_end_and_home() {
+        let mut f = TextField::from_str("hello world");
+        for _ in 0..5 {
+            f.move_left();
+        }
+        f.kill_to_end();
+        assert_eq!(f.value(), "hello ");
+
+        let mut f = TextField::from_str("hello world");
+        for _ in 0..5 {
+            f.move_left();
+        }
+        f.kill_to_home();
+        assert_eq!(f.value(), "world");
+        assert_eq!(f.cursor, 0);
+    }
+
+    #[test]
+    fn text_field_word_navigation_hops_whitespace() {
+        let mut f = TextField::from_str("foo bar  baz");
+        f.move_word_left();
+        assert_eq!(f.cursor, 9); // start of "baz"
+        f.move_word_left();
+        assert_eq!(f.cursor, 4); // start of "bar"
+        f.move_word_right();
+        assert_eq!(f.cursor, 7); // end of "bar"
+    }
+
+    #[test]
+    fn text_field_kill_word_backward_and_forward() {
+        let mut f = TextField::from_str("foo bar baz");
+        f.kill_word_backward();
+        assert_eq!(f.value(), "foo bar ");
+        f.kill_word_backward();
+        assert_eq!(f.value(), "foo ");
+
+        let mut f = TextField::from_str("foo bar baz");
+        f.move_home();
+        f.kill_word_forward();
+        assert_eq!(f.value(), " bar baz");
+        f.kill_word_forward();
+        assert_eq!(f.value(), " baz");
+    }
+
+    #[test]
+    fn text_field_edits_multibyte_per_char_not_per_byte() {
+        let mut f = TextField::from_str("日本語");
+        assert_eq!(f.cursor, 3);
+        f.backspace();
+        assert_eq!(f.value(), "日本");
+        f.move_home();
+        f.delete_forward();
+        assert_eq!(f.value(), "本");
+    }
+
+    #[test]
+    fn apply_editing_key_dispatches_common_readline_bindings() {
+        let mut f = TextField::from_str("hello");
+        assert!(apply_editing_key(
+            &mut f,
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL
+        ));
+        assert_eq!(f.cursor, 0);
+        assert!(apply_editing_key(
+            &mut f,
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL
+        ));
+        assert_eq!(f.cursor, 5);
+        assert!(apply_editing_key(
+            &mut f,
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL
+        ));
+        // At end-of-buffer, kill-to-end is a no-op.
+        assert_eq!(f.value(), "hello");
+        apply_editing_key(&mut f, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        apply_editing_key(&mut f, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(f.value(), "");
+
+        // Plain 'a' (no modifiers) inserts.
+        let mut f = TextField::default();
+        assert!(apply_editing_key(
+            &mut f,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        ));
+        assert_eq!(f.value(), "a");
+    }
+
+    #[test]
+    fn apply_editing_key_ignores_unmapped_ctrl_combos() {
+        // Ctrl+Z isn't bound — must return false so the outer event loop
+        // can fall through without the field silently absorbing a 'z'.
+        let mut f = TextField::from_str("x");
+        assert!(!apply_editing_key(
+            &mut f,
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL
+        ));
+        assert_eq!(f.value(), "x");
+    }
 }
 
