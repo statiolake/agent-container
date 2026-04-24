@@ -1,3 +1,4 @@
+/.agent-container
 /target
 /.claude/settings.local.json
 /diag-mcp-auth.sh
