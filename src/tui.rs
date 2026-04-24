@@ -17,7 +17,10 @@
 //!
 //! - `h`/`l` (or ←/→, Tab/Shift+Tab) switch between Proxy and MCP.
 //! - `j`/`k` (or ↑/↓) move within the current tab.
-//! - `s` saves.
+//! - `t` toggles the scope target between Global and Workspace (the save
+//!   destination). Each scope keeps its own in-memory proxy allow list so
+//!   switching back and forth preserves edits.
+//! - `s` saves to the currently-active scope.
 //! - `q`, `Esc`, or `Ctrl+C` cancels.
 //!
 //! The alternate screen is entered so the prior terminal contents come
@@ -39,6 +42,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs};
+
+use crate::settings::Scope;
 
 /// Single-line text buffer with readline-style editing primitives.
 ///
@@ -209,11 +214,13 @@ pub struct ToolEntry {
 }
 
 pub struct TuiInput {
-    /// "Global" or "Workspace" — purely decorative, shown in the header.
-    pub scope_label: String,
-    /// The target-scope's current `proxy.allow` list (not merged — the
-    /// editor writes the list verbatim back to that scope).
-    pub proxy_allow: Vec<String>,
+    /// Scope the editor starts on. `t` flips it to the other scope.
+    pub initial_scope: Scope,
+    /// Each scope's current `proxy.allow` list as it lives on disk. Both
+    /// are loaded up-front so scope-switching doesn't need to re-enter
+    /// the TUI.
+    pub proxy_allow_global: Vec<String>,
+    pub proxy_allow_workspace: Vec<String>,
     /// Merged MCP tool catalogue with effective-enabled state from the
     /// runtime view. Changes compared back to this set decide which
     /// entries land in the target scope at save time.
@@ -225,7 +232,11 @@ pub struct TuiInput {
 }
 
 pub struct TuiOutput {
-    pub proxy_allow: Vec<String>,
+    /// Which scope was active when the user hit `s`. The save pass writes
+    /// only this scope; the other scope's buffer is discarded.
+    pub saved_scope: Scope,
+    pub proxy_allow_global: Vec<String>,
+    pub proxy_allow_workspace: Vec<String>,
     pub tool_entries: Vec<ToolEntry>,
     pub tasks: BTreeMap<String, String>,
 }
@@ -530,9 +541,12 @@ enum RowAction {
 }
 
 struct App {
-    scope_label: String,
+    scope: Scope,
     tab: TopTab,
-    proxy: ProxyState,
+    /// Scope-local proxy buffers. Only the active one is displayed; the
+    /// other keeps its cursor and edits across a switch.
+    proxy_global: ProxyState,
+    proxy_workspace: ProxyState,
     mcp: McpState,
     mode: Mode,
     list_state: ListState,
@@ -543,18 +557,40 @@ impl App {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         Self {
-            scope_label: input.scope_label,
+            scope: input.initial_scope,
             tab: TopTab::Proxy,
-            proxy: ProxyState::new(input.proxy_allow),
+            proxy_global: ProxyState::new(input.proxy_allow_global),
+            proxy_workspace: ProxyState::new(input.proxy_allow_workspace),
             mcp: McpState::new(input.tool_entries, input.tasks),
             mode: Mode::Normal,
             list_state,
         }
     }
 
+    fn proxy(&self) -> &ProxyState {
+        match self.scope {
+            Scope::Global => &self.proxy_global,
+            Scope::Workspace => &self.proxy_workspace,
+        }
+    }
+
+    fn proxy_mut(&mut self) -> &mut ProxyState {
+        match self.scope {
+            Scope::Global => &mut self.proxy_global,
+            Scope::Workspace => &mut self.proxy_workspace,
+        }
+    }
+
+    fn toggle_scope(&mut self) {
+        self.scope = match self.scope {
+            Scope::Global => Scope::Workspace,
+            Scope::Workspace => Scope::Global,
+        };
+    }
+
     fn sync_list_state(&mut self) {
         let cur = match self.tab {
-            TopTab::Proxy => self.proxy.cursor,
+            TopTab::Proxy => self.proxy().cursor,
             TopTab::Mcp => self.mcp.cursor,
         };
         self.list_state.select(Some(cur));
@@ -562,7 +598,9 @@ impl App {
 
     fn into_output(self) -> TuiOutput {
         TuiOutput {
-            proxy_allow: self.proxy.allow,
+            saved_scope: self.scope,
+            proxy_allow_global: self.proxy_global.allow,
+            proxy_allow_workspace: self.proxy_workspace.allow,
             tool_entries: self.mcp.entries,
             tasks: self.mcp.tasks,
         }
@@ -585,7 +623,7 @@ fn handle_proxy_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         KeyCode::Esc => return,
         KeyCode::Char('c') if ctrl => return,
         KeyCode::Enter => {
-            app.proxy.upsert(buffer.value(), editing_idx);
+            app.proxy_mut().upsert(buffer.value(), editing_idx);
             return;
         }
         _ => {
@@ -726,30 +764,33 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             KeyCode::BackTab => app.tab = app.tab.prev(),
             KeyCode::Left | KeyCode::Char('h') => app.tab = app.tab.prev(),
             KeyCode::Right | KeyCode::Char('l') => app.tab = app.tab.next(),
+            KeyCode::Char('t') => app.toggle_scope(),
             KeyCode::Up | KeyCode::Char('k') => match app.tab {
-                TopTab::Proxy => app.proxy.move_up(),
+                TopTab::Proxy => app.proxy_mut().move_up(),
                 TopTab::Mcp => app.mcp.move_up(),
             },
             KeyCode::Down | KeyCode::Char('j') => match app.tab {
-                TopTab::Proxy => app.proxy.move_down(),
+                TopTab::Proxy => app.proxy_mut().move_down(),
                 TopTab::Mcp => app.mcp.move_down(),
             },
             KeyCode::Home | KeyCode::Char('g') => match app.tab {
-                TopTab::Proxy => app.proxy.cursor = 0,
+                TopTab::Proxy => app.proxy_mut().cursor = 0,
                 TopTab::Mcp => app.mcp.jump_home(),
             },
             KeyCode::End | KeyCode::Char('G') => match app.tab {
                 TopTab::Proxy => {
-                    app.proxy.cursor = app.proxy.allow.len().saturating_sub(1);
+                    let end = app.proxy().allow.len().saturating_sub(1);
+                    app.proxy_mut().cursor = end;
                 }
                 TopTab::Mcp => app.mcp.jump_end(),
             },
             KeyCode::Char(' ') | KeyCode::Enter => match app.tab {
                 TopTab::Proxy => {
-                    if let Some(cur) = app.proxy.current().cloned() {
+                    let pair = app.proxy().current().cloned().map(|c| (c, app.proxy().cursor));
+                    if let Some((cur, idx)) = pair {
                         app.mode = Mode::ProxyInput {
                             buffer: TextField::from_str(&cur),
-                            editing_idx: Some(app.proxy.cursor),
+                            editing_idx: Some(idx),
                         };
                     }
                 }
@@ -769,10 +810,11 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 start_task_add(&mut app);
             }
             KeyCode::Char('e') if app.tab == TopTab::Proxy => {
-                if let Some(cur) = app.proxy.current().cloned() {
+                let pair = app.proxy().current().cloned().map(|c| (c, app.proxy().cursor));
+                if let Some((cur, idx)) = pair {
                     app.mode = Mode::ProxyInput {
                         buffer: TextField::from_str(&cur),
-                        editing_idx: Some(app.proxy.cursor),
+                        editing_idx: Some(idx),
                     };
                 }
             }
@@ -782,7 +824,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 }
             }
             KeyCode::Char('d') if app.tab == TopTab::Proxy => {
-                app.proxy.remove_current();
+                app.proxy_mut().remove_current();
             }
             KeyCode::Char('d') if app.tab == TopTab::Mcp => {
                 app.mcp.delete_task_at_cursor();
@@ -843,27 +885,47 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
 }
 
 fn render_title(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let scope_label = match app.scope {
+        Scope::Global => "Global",
+        Scope::Workspace => "Workspace",
+    };
+    // Brand tag uses a deep blue so it doesn't collide with the active-tab
+    // highlight below (cyan was ambiguous with the old tab style).
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
             " agent-container ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(Color::White)
+                .bg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("  settings ({})", app.scope_label)),
+        Span::raw("  settings  "),
+        Span::styled(
+            format!("[{scope_label}]"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  (t to switch scope)",
+            Style::default().fg(Color::DarkGray),
+        ),
     ]));
     f.render_widget(title, area);
 }
 
 fn render_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    // Pad labels so the highlight background feels like a chip instead of a
+    // bare word, then drop the default "|" divider — the coloured background
+    // on the active tab is already enough of a separator.
     let titles: Vec<Line> = TopTab::titles()
         .iter()
-        .map(|s| Line::from(Span::raw(*s)))
+        .map(|s| Line::from(Span::raw(format!(" {s} "))))
         .collect();
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::BOTTOM))
         .select(app.tab.index())
+        .divider("")
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
             Style::default()
@@ -875,13 +937,14 @@ fn render_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_proxy(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
-    let items: Vec<ListItem> = if app.proxy.allow.is_empty() {
+    let proxy = app.proxy();
+    let items: Vec<ListItem> = if proxy.allow.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  (no scope-local allow patterns; press `i` to add)",
             Style::default().fg(Color::DarkGray),
         )))]
     } else {
-        app.proxy
+        proxy
             .allow
             .iter()
             .map(|p| ListItem::new(Line::from(Span::raw(p.clone()))))
@@ -1029,6 +1092,8 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Span::raw(" edit · "),
             key("d", Color::Cyan),
             Span::raw(" delete · "),
+            key("t", Color::Yellow),
+            Span::raw(" scope · "),
             key("s", Color::Green),
             Span::raw(" save · "),
             key("q", Color::Red),
@@ -1045,6 +1110,8 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Span::raw(" task add/edit/del · "),
             key("a/A", Color::Cyan),
             Span::raw(" bulk · "),
+            key("t", Color::Yellow),
+            Span::raw(" scope · "),
             key("s", Color::Green),
             Span::raw(" save · "),
             key("q", Color::Red),
@@ -1055,8 +1122,9 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let status = match app.tab {
         TopTab::Proxy => Line::from(vec![Span::styled(
             format!(
-                "{} allow pattern(s) in this scope",
-                app.proxy.allow.len()
+                "Global: {} · Workspace: {} allow pattern(s)",
+                app.proxy_global.allow.len(),
+                app.proxy_workspace.allow.len(),
             ),
             Style::default().fg(Color::DarkGray),
         )]),

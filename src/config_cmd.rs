@@ -47,7 +47,7 @@ pub fn resolve_scope_opt(global: bool, workspace: bool) -> Option<Scope> {
 }
 
 /// Entry point for the scope-aware TUI editor.
-pub async fn run_editor(scope: Scope) -> Result<()> {
+pub async fn run_editor(initial_scope: Scope) -> Result<()> {
     let host = HostPaths::detect()?;
 
     let servers = mcp::load_servers(&host.home.join(".claude.json"))
@@ -57,26 +57,15 @@ pub async fn run_editor(scope: Scope) -> Result<()> {
         load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
     ));
 
-    // Three views of settings we need at the same time:
-    //
-    // - `scope_settings` is what's on disk for the target scope (editor
-    //   inputs for proxy.allow come from here — workspace shouldn't see
-    //   inherited-global rules in its own file view).
-    // - `merged` drives the MCP tool-row enabled bit so the UI reflects
-    //   what actually takes effect at runtime.
-    // - `base_mcp` is the policy without the target scope, used at save
-    //   time so we only persist entries that diverge from inheritance.
-    let scope_settings = Settings::load_scope(scope, &host.workspace)
-        .context("failed to load scope-local settings")?;
+    // Load both scope files up-front so the TUI can switch between them
+    // without re-entering. `merged` drives the MCP tool-row enabled bit
+    // so the UI reflects what actually takes effect at runtime.
+    let global_settings = Settings::load_scope(Scope::Global, &host.workspace)
+        .context("failed to load global settings")?;
+    let workspace_settings = Settings::load_scope(Scope::Workspace, &host.workspace)
+        .context("failed to load workspace settings")?;
     let merged = Settings::load_merged(&host.workspace)
         .context("failed to load agent-container settings")?;
-    let (base_mcp, base_tasks) = match scope {
-        Scope::Workspace => {
-            let global = Settings::load_global().unwrap_or_default();
-            (global.mcp, global.task_runner.tasks)
-        }
-        Scope::Global => (McpPolicy::default(), BTreeMap::new()),
-    };
 
     let mut entries: Vec<ToolEntry> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
@@ -119,27 +108,39 @@ pub async fn run_editor(scope: Scope) -> Result<()> {
     }
 
     let input = TuiInput {
-        scope_label: match scope {
-            Scope::Global => "Global".to_string(),
-            Scope::Workspace => "Workspace".to_string(),
-        },
-        proxy_allow: scope_settings.proxy.allow.clone(),
+        initial_scope,
+        proxy_allow_global: global_settings.proxy.allow.clone(),
+        proxy_allow_workspace: workspace_settings.proxy.allow.clone(),
         tool_entries: entries,
         tasks: merged.task_runner.tasks.clone(),
     };
 
     match tui::run_selection(input)? {
         Outcome::Save(out) => {
+            let saved_scope = out.saved_scope;
+            // Base for MCP/task minimisation is the *other* scope. For
+            // Global there is no lower layer, so base falls back to the
+            // policy default.
+            let (base_mcp, base_tasks) = match saved_scope {
+                Scope::Workspace => (
+                    global_settings.mcp.clone(),
+                    global_settings.task_runner.tasks.clone(),
+                ),
+                Scope::Global => (McpPolicy::default(), BTreeMap::new()),
+            };
             // Load the target scope fresh (not merged) so untouched sections
             // of its settings.toml survive this save verbatim.
-            let mut target = Settings::load_scope(scope, &host.workspace)
+            let mut target = Settings::load_scope(saved_scope, &host.workspace)
                 .context("failed to reload target-scope settings for save")?;
-            target.proxy.allow = out.proxy_allow;
+            target.proxy.allow = match saved_scope {
+                Scope::Global => out.proxy_allow_global,
+                Scope::Workspace => out.proxy_allow_workspace,
+            };
             apply_entries_scoped(&mut target.mcp, &base_mcp, &out.tool_entries);
             target.task_runner.tasks = minimise_tasks_against_base(out.tasks, &base_tasks);
-            let path = settings::path(scope, &host.workspace)?;
+            let path = settings::path(saved_scope, &host.workspace)?;
             target.save_to(&path).context("failed to save settings")?;
-            println!("Saved to {} ({:?} scope)", path.display(), scope);
+            println!("Saved to {} ({:?} scope)", path.display(), saved_scope);
             if !skipped.is_empty() {
                 println!(
                     "Skipped {} server(s); their existing policy entries were not touched:",
