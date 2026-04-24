@@ -15,8 +15,13 @@
 //!
 //! [mcp.servers.github]
 //! enabled = true
+//!
+//! [task_runner.tasks]
+//! lint = "cargo check"
+//! build = "cargo build --release"
 //! ```
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +37,8 @@ pub struct Settings {
     pub proxy: ProxyPolicy,
     #[serde(default, skip_serializing_if = "McpPolicy::is_empty_policy")]
     pub mcp: McpPolicy,
+    #[serde(default, skip_serializing_if = "TaskRunnerPolicy::is_empty")]
+    pub task_runner: TaskRunnerPolicy,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +53,22 @@ pub struct ProxyPolicy {
 impl ProxyPolicy {
     pub fn is_empty(&self) -> bool {
         self.allow.is_empty()
+    }
+}
+
+/// User-defined shell commands surfaced to the container as MCP tools by
+/// the built-in `task-runner` server. Each key becomes a tool name; the
+/// value is the command line executed on the host when the tool is
+/// invoked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRunnerPolicy {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tasks: BTreeMap<String, String>,
+}
+
+impl TaskRunnerPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
     }
 }
 
@@ -115,6 +138,8 @@ impl Settings {
     ///   entry replaces the base entry (matching VS Code's "workspace
     ///   setting wins at the key" semantics). Servers unmentioned by
     ///   overlay keep their base definition.
+    /// - `task_runner.tasks.<name>`: same as MCP — overlay's same-named
+    ///   task replaces the base's, others pass through.
     pub fn merge_in_place(&mut self, overlay: Self) {
         for pat in overlay.proxy.allow {
             if !self.proxy.allow.contains(&pat) {
@@ -123,6 +148,9 @@ impl Settings {
         }
         for (name, sp) in overlay.mcp.servers {
             self.mcp.servers.insert(name, sp);
+        }
+        for (name, cmd) in overlay.task_runner.tasks {
+            self.task_runner.tasks.insert(name, cmd);
         }
     }
 }
@@ -161,8 +189,8 @@ pub fn migrate_legacy_global_if_needed() -> Result<()> {
     let mcp: McpPolicy = toml::from_str(&raw)
         .with_context(|| format!("invalid TOML at {}", legacy.display()))?;
     let settings = Settings {
-        proxy: ProxyPolicy::default(),
         mcp,
+        ..Default::default()
     };
     settings.save_to(&new_path)?;
     fs::remove_file(&legacy).ok();
@@ -208,16 +236,18 @@ mod tests {
 
     #[test]
     fn empty_sections_are_not_emitted() {
-        // Sparse configs stay sparse — no empty `[mcp]` header on disk.
+        // Sparse configs stay sparse — no empty `[mcp]` or `[task_runner]`
+        // header on disk when the corresponding policy is empty.
         let settings = Settings {
             proxy: ProxyPolicy {
                 allow: vec!["^example\\.com$".into()],
             },
-            mcp: McpPolicy::default(),
+            ..Default::default()
         };
         let raw = toml::to_string_pretty(&settings).unwrap();
         assert!(raw.contains("[proxy]"));
         assert!(!raw.contains("[mcp"));
+        assert!(!raw.contains("[task_runner"));
     }
 
     #[test]
@@ -226,19 +256,74 @@ mod tests {
             proxy: ProxyPolicy {
                 allow: vec!["a".into(), "b".into()],
             },
-            mcp: McpPolicy::default(),
+            ..Default::default()
         };
         let overlay = Settings {
             proxy: ProxyPolicy {
                 allow: vec!["b".into(), "c".into()],
             },
-            mcp: McpPolicy::default(),
+            ..Default::default()
         };
         base.merge_in_place(overlay);
         assert_eq!(
             base.proxy.allow,
             vec!["a".to_string(), "b".into(), "c".into()]
         );
+    }
+
+    #[test]
+    fn merge_workspace_task_replaces_global_same_name() {
+        let mut base = Settings::default();
+        base.task_runner
+            .tasks
+            .insert("lint".into(), "cargo check".into());
+        base.task_runner
+            .tasks
+            .insert("test".into(), "cargo test".into());
+
+        let mut overlay = Settings::default();
+        overlay
+            .task_runner
+            .tasks
+            .insert("lint".into(), "cargo clippy".into());
+        overlay
+            .task_runner
+            .tasks
+            .insert("build".into(), "cargo build --release".into());
+
+        base.merge_in_place(overlay);
+        assert_eq!(
+            base.task_runner.tasks.get("lint").map(String::as_str),
+            Some("cargo clippy"),
+            "overlay overrides same-named task"
+        );
+        assert_eq!(
+            base.task_runner.tasks.get("test").map(String::as_str),
+            Some("cargo test"),
+            "untouched task survives"
+        );
+        assert_eq!(
+            base.task_runner.tasks.get("build").map(String::as_str),
+            Some("cargo build --release"),
+            "new task from overlay is added"
+        );
+    }
+
+    #[test]
+    fn task_runner_roundtrips_through_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let mut written = Settings::default();
+        written
+            .task_runner
+            .tasks
+            .insert("lint".into(), "cargo check".into());
+        written.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[task_runner.tasks]"));
+        assert!(raw.contains("lint"));
+        let read = Settings::load_from(&path).unwrap();
+        assert_eq!(read, written);
     }
 
     #[test]
