@@ -25,15 +25,32 @@ use clap::Parser;
 
 use crate::cli::{AgentKind, Cli, Commands, ConfigCommands};
 
-/// Initialise the tracing subscriber. If `AGENT_CONTAINER_LOG_FILE` is
-/// set, logs go there (append, no ANSI) via a non-blocking writer so the
-/// container's TUI on stderr/stdout stays unharmed. Otherwise logs go to
-/// stderr as before.
-fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+/// Initialise the tracing subscriber.
+///
+/// Logs go to a file by default — `$XDG_STATE_HOME/agent-container/log`
+/// on Linux, a platform-appropriate fallback elsewhere — because this
+/// binary regularly shares the terminal with a TUI (Claude Code inside
+/// the container, or our own `config` editor) and any stderr writes
+/// during that would corrupt the rendered frame.
+///
+/// Override with `AGENT_CONTAINER_LOG_FILE`:
+/// - a path → append there
+/// - `-`    → opt back into stderr (handy for ad-hoc debugging)
+fn init_tracing() -> (Option<tracing_appender::non_blocking::WorkerGuard>, Option<PathBuf>) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agent_container=info,warn"));
 
-    if let Ok(path) = std::env::var("AGENT_CONTAINER_LOG_FILE") {
+    let env = std::env::var("AGENT_CONTAINER_LOG_FILE").ok();
+    let destination: Option<PathBuf> = match env.as_deref() {
+        Some("-") => None,
+        Some(s) if !s.is_empty() => Some(PathBuf::from(s)),
+        _ => default_log_path(),
+    };
+
+    if let Some(path) = destination {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -47,11 +64,12 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
                     .with_ansi(false)
                     .with_writer(writer)
                     .init();
-                return Some(guard);
+                return (Some(guard), Some(path));
             }
             Err(e) => {
                 eprintln!(
-                    "[agent-container] failed to open log file {path}: {e}; falling back to stderr"
+                    "[agent-container] failed to open log file {}: {e}; falling back to stderr",
+                    path.display()
                 );
             }
         }
@@ -61,12 +79,29 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
         .with_env_filter(filter)
         .with_target(false)
         .init();
-    None
+    (None, None)
+}
+
+/// Resolve the default log file path: prefer XDG state (Linux), fall
+/// back to XDG data-local (macOS/Windows, where `state_dir()` is None).
+fn default_log_path() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "agent-container")?;
+    let base = dirs
+        .state_dir()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| dirs.data_local_dir().to_path_buf());
+    Some(base.join("agent-container.log"))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _log_guard = init_tracing();
+    let (_log_guard, log_path) = init_tracing();
+    if let Some(p) = &log_path {
+        eprintln!(
+            "[agent-container] logs: {} (set AGENT_CONTAINER_LOG_FILE=- to route to stderr instead)",
+            p.display()
+        );
+    }
 
     if let Err(e) = settings::migrate_legacy_global_if_needed() {
         eprintln!("[agent-container] legacy mcp.toml migration failed: {e:#}");
