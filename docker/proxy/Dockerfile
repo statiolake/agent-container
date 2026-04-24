@@ -5,7 +5,8 @@ RUN apk add --no-cache tinyproxy \
     && chown -R nobody:nobody /var/run/tinyproxy
 
 COPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
-COPY allowlist.txt /etc/tinyproxy/allowlist.txt
+# /etc/tinyproxy/allowlist.txt is bind-mounted at runtime by the CLI
+# (see proxy_allowlist::generate) — nothing is baked into the image.
 
 EXPOSE 8888
 

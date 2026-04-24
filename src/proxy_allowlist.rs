@@ -1,16 +1,14 @@
 //! Runtime generation of the tinyproxy allowlist.
 //!
 //! The list is written from `settings.proxy.allow` (merged across global
-//! and workspace) directly — no hidden base layer. The bundled
-//! [`DEFAULT_ALLOWLIST_TEXT`] lives here only as the seed for a
-//! freshly-created global `settings.toml`; once the file is on disk
-//! every rule behaves like any other user-authored one.
+//! and workspace) directly — no hidden base layer. [`DEFAULT_ALLOW_ENTRIES`]
+//! lives here only as the seed for a freshly-created global
+//! `settings.toml`; once the file is on disk every rule behaves like any
+//! other user-authored one.
 //!
 //! The generated file is placed under XDG cache with the invoker's PID
 //! embedded so concurrent invocations don't race on the same filename.
 //! tinyproxy bind-mounts it read-only.
-//!
-//! [`DEFAULT_ALLOWLIST_TEXT`]: fn@default_allow_entries
 
 use std::fs;
 use std::path::PathBuf;
@@ -18,23 +16,66 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 
-/// Verbatim contents of `docker/proxy/allowlist.txt`, baked into the
-/// binary at compile time. Acts as the seed for `Settings::load_global`
-/// when no global `settings.toml` exists yet — after the first save,
-/// the on-disk file is authoritative and this constant is no longer
-/// consulted.
-pub const DEFAULT_ALLOWLIST_TEXT: &str =
-    include_str!("../docker/proxy/allowlist.txt");
+/// Bundled default allow-list, seeded into a fresh global `settings.toml`.
+///
+/// Curated to avoid hosts that expose destructive write endpoints — most
+/// visibly `api.github.com` and `uploads.github.com`, where a stolen PAT
+/// in the workspace could delete repos or upload arbitrary release
+/// assets via the REST API. `github.com` itself stays for `git clone`
+/// and release artifact fetches. Package registries are included for
+/// install paths; users with publish credentials on those same hosts
+/// should be aware of the residual risk.
+pub const DEFAULT_ALLOW_ENTRIES: &[&str] = &[
+    // agent-container host broker (fresh AWS creds, MCP proxy)
+    r"^host\.docker\.internal$",
+    // Claude / Anthropic
+    r"^api\.anthropic\.com$",
+    r"^statsig\.anthropic\.com$",
+    r"^platform\.claude\.com$",
+    r"^claude\.ai$",
+    r"^console\.anthropic\.com$",
+    // OpenAI / ChatGPT (Codex with ChatGPT subscription auth)
+    r"^chatgpt\.com$",
+    r"^api\.openai\.com$",
+    r"^auth\.openai\.com$",
+    // AWS Bedrock (only used when CLAUDE_CODE_USE_BEDROCK is set)
+    r"^bedrock-runtime\.[a-z0-9-]+\.amazonaws\.com$",
+    r"^bedrock\.[a-z0-9-]+\.amazonaws\.com$",
+    // Rust toolchain
+    r"^crates\.io$",
+    r"^static\.crates\.io$",
+    r"^index\.crates\.io$",
+    r"^static\.rust-lang\.org$",
+    r"^sh\.rustup\.rs$",
+    // Node / npm
+    r"^registry\.npmjs\.org$",
+    r"^registry\.yarnpkg\.com$",
+    // Python
+    r"^pypi\.org$",
+    r"^files\.pythonhosted\.org$",
+    // Go modules
+    r"^proxy\.golang\.org$",
+    r"^sum\.golang\.org$",
+    // GitHub read-path only (clone + release artifacts).
+    r"^github\.com$",
+    r"^codeload\.github\.com$",
+    r"^raw\.githubusercontent\.com$",
+    r"^objects\.githubusercontent\.com$",
+    r"^release-assets\.githubusercontent\.com$",
+    // Debian / Ubuntu apt repos (container base image updates)
+    r"^deb\.debian\.org$",
+    r"^security\.debian\.org$",
+    r"^archive\.ubuntu\.com$",
+    r"^security\.ubuntu\.com$",
+    r"^ports\.ubuntu\.com$",
+    // Alpine package repos
+    r"^dl-cdn\.alpinelinux\.org$",
+];
 
-/// Parse [`DEFAULT_ALLOWLIST_TEXT`] into the individual allow patterns
-/// (skipping blanks and `#` comments), preserving declaration order so
-/// the materialised defaults read the same as the source file.
 pub fn default_allow_entries() -> Vec<String> {
-    DEFAULT_ALLOWLIST_TEXT
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(String::from)
+    DEFAULT_ALLOW_ENTRIES
+        .iter()
+        .map(|s| (*s).to_string())
         .collect()
 }
 
@@ -79,7 +120,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_entries_are_nonempty_and_comment_free() {
+    fn default_entries_are_nonempty_and_well_formed() {
         let entries = default_allow_entries();
         assert!(!entries.is_empty(), "bundled defaults should not be empty");
         for e in &entries {
@@ -96,14 +137,23 @@ mod tests {
     }
 
     #[test]
+    fn defaults_omit_destructive_github_endpoints() {
+        // Guard against regression. See the doc comment on
+        // DEFAULT_ALLOW_ENTRIES for the rationale.
+        let entries = default_allow_entries();
+        for banned in ["api.github.com", "uploads.github.com"] {
+            assert!(
+                entries.iter().all(|e| !e.contains(banned)),
+                "{banned} must stay off the bundled defaults",
+            );
+        }
+    }
+
+    #[test]
     fn generate_writes_patterns_one_per_line() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("out.txt");
-        generate(
-            &vec!["^a\\.com$".into(), "^b\\.com$".into()],
-            &dest,
-        )
-        .unwrap();
+        generate(&vec!["^a\\.com$".into(), "^b\\.com$".into()], &dest).unwrap();
         let got = fs::read_to_string(&dest).unwrap();
         let rules: Vec<&str> = got
             .lines()
@@ -116,11 +166,7 @@ mod tests {
     fn generate_skips_blank_entries() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("out.txt");
-        generate(
-            &vec!["".into(), "   ".into(), "^x$".into()],
-            &dest,
-        )
-        .unwrap();
+        generate(&vec!["".into(), "   ".into(), "^x$".into()], &dest).unwrap();
         let got = fs::read_to_string(&dest).unwrap();
         let rules: Vec<&str> = got
             .lines()

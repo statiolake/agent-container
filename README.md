@@ -143,12 +143,18 @@ Same networking, mounts and auths as `run`, but no agent is started.
 
 ### Proxy allowlist
 
-`docker/proxy/allowlist.txt` is bind-mounted into the proxy container at
-start-up. Edit it and restart the run; the file is a tinyproxy filter
-list (extended regex, one pattern per line). The defaults cover the
-Anthropic / OpenAI APIs, major package registries (crates.io,
-registry.npmjs.org, pypi.org, …), GitHub, apt repos and the agent
-broker.
+The proxy's filter list is generated at run-time from `proxy.allow` in
+`settings.toml` (global + workspace, merged) and bind-mounted into the
+container. Entries are tinyproxy extended regex patterns, one per line.
+
+The bundled defaults (see `DEFAULT_ALLOW_ENTRIES` in
+`src/proxy_allowlist.rs`) cover the Anthropic / OpenAI APIs, major
+package registries (crates.io, registry.npmjs.org, pypi.org, …), apt
+repos, the agent broker, and GitHub read-path hosts (`github.com`,
+`codeload`, `raw`, release artifacts). `api.github.com` and
+`uploads.github.com` are intentionally omitted so a stolen PAT can't
+drive destructive REST operations — opt in via
+`agent-container config --global` or `--workspace` if you need them.
 
 ### Bedrock
 
