@@ -206,44 +206,6 @@ pub fn workspace_path(workspace: &Path) -> PathBuf {
     workspace.join(".agent-container").join("settings.toml")
 }
 
-/// One-shot migration from the legacy standalone `mcp.toml` into the
-/// unified global `settings.toml`. Runs only when the new file does not
-/// yet exist; leaves things alone on any subsequent invocation.
-pub fn migrate_legacy_global_if_needed() -> Result<()> {
-    let new_path = global_path()?;
-    if new_path.is_file() {
-        return Ok(());
-    }
-    let legacy = legacy_mcp_path()?;
-    if !legacy.is_file() {
-        return Ok(());
-    }
-    let raw = fs::read_to_string(&legacy)
-        .with_context(|| format!("failed to read {}", legacy.display()))?;
-    let mcp: McpPolicy = toml::from_str(&raw)
-        .with_context(|| format!("invalid TOML at {}", legacy.display()))?;
-    // Seed with the bundled defaults so the new file is a complete
-    // global config, then overlay whatever the legacy mcp.toml said.
-    let settings = Settings {
-        mcp,
-        ..Settings::default_global()
-    };
-    settings.save_to(&new_path)?;
-    fs::remove_file(&legacy).ok();
-    eprintln!(
-        "[agent-container] migrated {} -> {} (legacy file removed)",
-        legacy.display(),
-        new_path.display(),
-    );
-    Ok(())
-}
-
-fn legacy_mcp_path() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("", "", "agent-container")
-        .context("failed to resolve XDG project directories")?;
-    Ok(dirs.config_dir().join("mcp.toml"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -103,10 +103,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    if let Err(e) = settings::migrate_legacy_global_if_needed() {
-        eprintln!("[agent-container] legacy mcp.toml migration failed: {e:#}");
-    }
-
     let cli = Cli::parse();
     match cli.command {
         Commands::Run { agent, passthrough } => run_cmd(agent, passthrough).await,
