@@ -107,12 +107,46 @@ impl Settings {
         Ok(())
     }
 
+    /// Default global configuration — the one we would have shipped if
+    /// the user ran `agent-container` before writing any settings. Seeds
+    /// the proxy allow list with the defaults baked into the CLI so
+    /// they behave exactly like user-authored entries: visible in
+    /// `config show`, editable in the TUI, and actively read on save.
+    ///
+    /// Workspace files don't use this — their own `Self::default()`
+    /// (everything empty) is the right starting point.
+    pub fn default_global() -> Self {
+        Self {
+            proxy: ProxyPolicy {
+                allow: crate::proxy_allowlist::default_allow_entries(),
+            },
+            mcp: McpPolicy::default(),
+            task_runner: TaskRunnerPolicy::default(),
+        }
+    }
+
+    /// Load the global settings — or materialise [`Self::default_global`]
+    /// when the file does not yet exist. Once the user saves anything,
+    /// the file is authoritative and the bundled defaults are no longer
+    /// consulted.
     pub fn load_global() -> Result<Self> {
-        Self::load_from(&global_path()?)
+        Self::load_from_or(&global_path()?, Self::default_global)
     }
 
     pub fn load_workspace(workspace: &Path) -> Result<Self> {
         Self::load_from(&workspace_path(workspace))
+    }
+
+    /// Like [`Self::load_from`], but the caller supplies the fallback
+    /// to use when the file is missing. Lets `load_global` inject the
+    /// bundled defaults while `load_workspace` keeps using the
+    /// everything-empty `Default::default()`.
+    pub fn load_from_or(path: &Path, fallback: impl FnOnce() -> Self) -> Result<Self> {
+        if path.is_file() {
+            Self::load_from(path)
+        } else {
+            Ok(fallback())
+        }
     }
 
     pub fn load_scope(scope: Scope, workspace: &Path) -> Result<Self> {
@@ -188,9 +222,11 @@ pub fn migrate_legacy_global_if_needed() -> Result<()> {
         .with_context(|| format!("failed to read {}", legacy.display()))?;
     let mcp: McpPolicy = toml::from_str(&raw)
         .with_context(|| format!("invalid TOML at {}", legacy.display()))?;
+    // Seed with the bundled defaults so the new file is a complete
+    // global config, then overlay whatever the legacy mcp.toml said.
     let settings = Settings {
         mcp,
-        ..Default::default()
+        ..Settings::default_global()
     };
     settings.save_to(&new_path)?;
     fs::remove_file(&legacy).ok();
@@ -217,6 +253,38 @@ mod tests {
         let p = std::env::temp_dir().join("agent-container-never-here-settings.toml");
         let s = Settings::load_from(&p).unwrap();
         assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn default_global_includes_bundled_proxy_defaults() {
+        let g = Settings::default_global();
+        assert!(
+            !g.proxy.allow.is_empty(),
+            "bundled defaults should seed proxy.allow"
+        );
+        assert!(g.proxy.allow.iter().any(|p| p.contains("anthropic")));
+    }
+
+    #[test]
+    fn load_from_or_falls_back_when_file_is_missing() {
+        let p = std::env::temp_dir().join("agent-container-never-here-global.toml");
+        let s = Settings::load_from_or(&p, Settings::default_global).unwrap();
+        assert_eq!(s, Settings::default_global());
+    }
+
+    #[test]
+    fn load_from_or_reads_on_disk_file_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        // Sparse file — no proxy section. Defaults must NOT fill it
+        // back in; the on-disk file is authoritative once it exists.
+        std::fs::write(&path, "[mcp.servers.gh]\nenabled = true\n").unwrap();
+        let s = Settings::load_from_or(&path, Settings::default_global).unwrap();
+        assert!(
+            s.proxy.allow.is_empty(),
+            "existing file should not be padded with bundled defaults"
+        );
+        assert!(s.mcp.servers.contains_key("gh"));
     }
 
     #[test]

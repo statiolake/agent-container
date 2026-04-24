@@ -99,10 +99,9 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
 
-    let base_allowlist = default_dockerfile_dir().join("proxy").join("allowlist.txt");
     let allowlist_path = crate::proxy_allowlist::cache_path_for(std::process::id())?;
-    crate::proxy_allowlist::generate(&base_allowlist, &opts.proxy_allow, &allowlist_path)
-        .context("failed to materialise merged proxy allowlist for tinyproxy")?;
+    crate::proxy_allowlist::generate(&opts.proxy_allow, &allowlist_path)
+        .context("failed to materialise proxy allowlist for tinyproxy")?;
 
     let mut env: HashMap<String, String> = [
         (
