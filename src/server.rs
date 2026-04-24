@@ -34,10 +34,12 @@ use crate::mcp::{HttpMcpServer, McpServer};
 use crate::oauth::OAuthStore;
 use crate::policy::McpPolicy;
 use crate::stdio_mcp::{self, PathBridge, StdioHandle};
+use crate::task_runner::{self, TaskRunner};
 
 enum McpBackend {
     Http(HttpMcpServer),
     Stdio(StdioHandle),
+    TaskRunner(Arc<TaskRunner>),
 }
 
 struct BrokerState {
@@ -58,6 +60,7 @@ pub struct RunningServer {
 pub async fn spawn(
     bedrock: Option<(BedrockSetup, Option<String>)>,
     mcp_servers: Vec<McpServer>,
+    task_runner: Option<TaskRunner>,
     policy: McpPolicy,
     oauth: Arc<OAuthStore>,
     stdio_bridge: Option<PathBridge>,
@@ -90,6 +93,19 @@ pub async fn spawn(
                     );
                 }
             },
+        }
+    }
+    if let Some(runner) = task_runner {
+        if mcp.contains_key(task_runner::NAME) {
+            eprintln!(
+                "[agent-container] note: a user-declared MCP server named '{}' already exists — skipping the built-in task-runner",
+                task_runner::NAME
+            );
+        } else if !runner.is_empty() {
+            mcp.insert(
+                task_runner::NAME.to_string(),
+                McpBackend::TaskRunner(Arc::new(runner)),
+            );
         }
     }
 
@@ -173,6 +189,7 @@ async fn forward_mcp(
     let backend_kind = state.mcp.get(name).map(|b| match b {
         McpBackend::Http(_) => BackendKind::Http,
         McpBackend::Stdio(_) => BackendKind::Stdio,
+        McpBackend::TaskRunner(_) => BackendKind::TaskRunner,
     });
     let Some(kind) = backend_kind else {
         return (
@@ -185,6 +202,7 @@ async fn forward_mcp(
     let result = match kind {
         BackendKind::Http => forward_http(state, name, rest, req).await,
         BackendKind::Stdio => forward_stdio(state, name, req).await,
+        BackendKind::TaskRunner => forward_task_runner(state, name, req).await,
     };
     match result {
         Ok(resp) => resp,
@@ -198,6 +216,7 @@ async fn forward_mcp(
 enum BackendKind {
     Http,
     Stdio,
+    TaskRunner,
 }
 
 async fn forward_http(
@@ -310,6 +329,51 @@ async fn forward_http(
         .expect("response builder headers") = out_headers;
     let stream = upstream.bytes_stream();
     Ok(builder.body(Body::from_stream(stream))?)
+}
+
+async fn forward_task_runner(
+    state: Arc<BrokerState>,
+    server_name: &str,
+    req: Request,
+) -> Result<Response> {
+    let runner = match state.mcp.get(server_name) {
+        Some(McpBackend::TaskRunner(r)) => r.clone(),
+        _ => bail!("internal: expected TaskRunner backend for '{server_name}'"),
+    };
+
+    // Only POST has meaning for the task-runner — everything else would
+    // just be Claude Code probing for SSE / optional protocol bits that
+    // we don't need. Answer the common ones cleanly.
+    if req.method() != axum::http::Method::POST {
+        return Ok(Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(axum::http::header::ALLOW, "POST")
+            .body(Body::from("task-runner accepts POST only"))?);
+    }
+
+    let (_parts, body) = req.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .context("failed to buffer request body")?;
+
+    tracing::debug!(
+        server = %server_name,
+        body_len = body_bytes.len(),
+        "task-runner incoming request",
+    );
+
+    match runner.handle(&body_bytes).await {
+        Some(value) => {
+            let bytes = serde_json::to_vec(&value).context("encoding task-runner response")?;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(bytes))?)
+        }
+        None => Ok(Response::builder()
+            .status(StatusCode::ACCEPTED)
+            .body(Body::empty())?),
+    }
 }
 
 async fn forward_stdio(

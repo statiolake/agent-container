@@ -59,6 +59,10 @@ pub struct SyncOptions<'a> {
     /// `http://host.docker.internal:<broker port>` as seen from the container.
     pub broker_url_from_container: &'a str,
     pub mcp_servers: &'a [McpServer],
+    /// When true, inject an `mcpServers.task-runner` entry pointing at
+    /// the broker's built-in route so Claude Code inside the container
+    /// can call the host-side task commands.
+    pub task_runner_enabled: bool,
 }
 
 impl SyncOptions<'_> {
@@ -181,12 +185,13 @@ fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
         // case a stale persistent home still has it.
         obj.remove("awsAuthRefresh");
 
-        if !opts.mcp_servers.is_empty() {
+        if !opts.mcp_servers.is_empty() || opts.task_runner_enabled {
             obj.insert(
                 "mcpServers".to_string(),
                 Value::Object(build_proxy_mcp_map(
                     opts.broker_url_from_container,
                     opts.mcp_servers,
+                    opts.task_runner_enabled,
                 )),
             );
         }
@@ -201,6 +206,7 @@ fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
 fn build_proxy_mcp_map(
     broker_url: &str,
     servers: &[McpServer],
+    task_runner_enabled: bool,
 ) -> serde_json::Map<String, Value> {
     let mut map = serde_json::Map::new();
     for s in servers {
@@ -223,6 +229,25 @@ fn build_proxy_mcp_map(
             )),
         );
         map.insert(s.name().to_string(), Value::Object(entry));
+    }
+    if task_runner_enabled {
+        let name = crate::task_runner::NAME;
+        // Skip if the user already has an entry by this name — main.rs's
+        // build_task_runner() drops the built-in in that case, and this
+        // guard keeps sync in step with that decision.
+        if !map.contains_key(name) {
+            let mut entry = serde_json::Map::new();
+            entry.insert("type".into(), Value::String("http".into()));
+            entry.insert(
+                "url".into(),
+                Value::String(format!(
+                    "{}/mcp/{}",
+                    broker_url.trim_end_matches('/'),
+                    name
+                )),
+            );
+            map.insert(name.to_string(), Value::Object(entry));
+        }
     }
     map
 }
@@ -419,6 +444,7 @@ mod tests {
                 bedrock: None,
                 broker_url_from_container: "http://host.docker.internal:0",
                 mcp_servers: &[],
+                task_runner_enabled: false,
             },
         )
         .unwrap();
@@ -474,6 +500,7 @@ mod tests {
                 bedrock: Some(&sample_bedrock()),
                 broker_url_from_container: "http://host.docker.internal:0",
                 mcp_servers: &[],
+                task_runner_enabled: false,
             },
         )
         .unwrap();
@@ -535,6 +562,7 @@ mod tests {
                 bedrock: None,
                 broker_url_from_container: "http://host.docker.internal:9999",
                 mcp_servers: &servers,
+                task_runner_enabled: false,
             },
         )
         .unwrap();
@@ -560,7 +588,46 @@ mod tests {
         assert!(mcp["github"].get("headers").is_none());
     }
 
-#[test]
+    #[test]
+    fn task_runner_enabled_adds_builtin_server_to_claude_json() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = tmp_home.path().join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let claude_root = tmp_home.path().join(".claude");
+        fs::create_dir_all(&claude_root).unwrap();
+        fs::write(tmp_home.path().join(".claude.json"), r#"{}"#).unwrap();
+
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root,
+            workspace,
+            container_home: container_home.path().to_path_buf(),
+        };
+        sync_claude_json(
+            &host,
+            &SyncOptions {
+                bedrock: None,
+                broker_url_from_container: "http://host.docker.internal:7000",
+                mcp_servers: &[],
+                task_runner_enabled: true,
+            },
+        )
+        .unwrap();
+
+        let out: Value = serde_json::from_str(
+            &fs::read_to_string(container_home.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        let tr = &out["mcpServers"]["task-runner"];
+        assert_eq!(tr["type"].as_str(), Some("http"));
+        assert_eq!(
+            tr["url"].as_str(),
+            Some("http://host.docker.internal:7000/mcp/task-runner")
+        );
+    }
+
+    #[test]
     fn settings_json_is_filtered() {
         let tmp_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
@@ -593,6 +660,7 @@ mod tests {
                 bedrock: None,
                 broker_url_from_container: "http://unused",
                 mcp_servers: &[],
+                task_runner_enabled: false,
             },
         )
         .unwrap();
@@ -630,6 +698,7 @@ mod tests {
                 bedrock: Some(&sample_bedrock()),
                 broker_url_from_container: "http://unused",
                 mcp_servers: &[],
+                task_runner_enabled: false,
             },
         )
         .unwrap();

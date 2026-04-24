@@ -14,6 +14,7 @@ mod server;
 mod settings;
 mod stdio_mcp;
 mod sync;
+mod task_runner;
 mod tui;
 
 use std::path::PathBuf;
@@ -124,6 +125,7 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
         .context("failed to load agent-container settings (global + workspace)")?;
     let policy = merged_settings.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
+    let task_runner = build_task_runner(&merged_settings.task_runner.tasks, &mcp_servers);
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain()
             .context("failed to load MCP OAuth entries from Keychain")?,
@@ -146,6 +148,13 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
             labels.join(", ")
         );
     }
+    if let Some(runner) = &task_runner {
+        eprintln!(
+            "[agent-container] task-runner MCP exposing {} task(s): {}",
+            runner.tasks.len(),
+            runner.tasks.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
 
     // Always attempt to materialise both agents' auth so that whichever
     // agent runs as primary, the other can still be invoked from inside
@@ -164,9 +173,11 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
         container_root: "/workspace".to_string(),
         host_root: host.workspace.display().to_string(),
     };
+    let task_runner_enabled = task_runner.is_some();
     let broker = server::spawn(
         bedrock.clone().map(|b| (b, refresh.clone())),
         mcp_servers.clone(),
+        task_runner,
         policy,
         oauth_store.clone(),
         Some(stdio_bridge),
@@ -182,6 +193,7 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
             bedrock: bedrock.as_ref(),
             broker_url_from_container: &broker_url_from_container,
             mcp_servers: &mcp_servers,
+            task_runner_enabled,
         },
     )
     .context("failed to sync host Claude Code state into container")?;
@@ -243,6 +255,7 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
         settings::Settings::load_merged(&host.workspace).unwrap_or_default();
     let policy = merged_settings.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
+    let task_runner = build_task_runner(&merged_settings.task_runner.tasks, &mcp_servers);
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().unwrap_or_default(),
     ));
@@ -270,9 +283,11 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
         container_root: "/workspace".to_string(),
         host_root: host.workspace.display().to_string(),
     };
+    let task_runner_enabled = task_runner.is_some();
     let broker = server::spawn(
         bedrock.clone().map(|b| (b, refresh.clone())),
         mcp_servers.clone(),
+        task_runner,
         policy,
         oauth_store,
         Some(stdio_bridge),
@@ -287,6 +302,7 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
             bedrock: bedrock.as_ref(),
             broker_url_from_container: &broker_url_from_container,
             mcp_servers: &mcp_servers,
+            task_runner_enabled,
         },
     )
     .context("failed to sync host Claude Code state into container")?;
@@ -360,6 +376,27 @@ fn prepare_claude_credentials(
             "failed to prepare Claude OAuth credentials; run `claude /login` on the host first",
         ),
     }
+}
+
+/// Build the optional task-runner backend, skipping it if the user
+/// already has an MCP server by the same name declared in
+/// `~/.claude.json` (we'd clobber their setup otherwise). Empty task
+/// tables resolve to None so the broker doesn't register an empty MCP.
+fn build_task_runner(
+    tasks: &std::collections::BTreeMap<String, String>,
+    declared_servers: &[mcp::McpServer],
+) -> Option<task_runner::TaskRunner> {
+    if tasks.is_empty() {
+        return None;
+    }
+    if declared_servers.iter().any(|s| s.name() == task_runner::NAME) {
+        eprintln!(
+            "[agent-container] note: skipping built-in task-runner because ~/.claude.json already declares an MCP server named '{}'",
+            task_runner::NAME
+        );
+        return None;
+    }
+    Some(task_runner::TaskRunner::new(tasks.clone()))
 }
 
 fn prepare_codex_auth(
