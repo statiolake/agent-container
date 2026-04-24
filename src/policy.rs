@@ -79,6 +79,10 @@ impl McpPolicy {
             .insert(tool.to_string(), enabled);
     }
 
+    /// Not yet wired into the TUI (which only toggles per-tool entries),
+    /// but used by tests — and it's the obvious knob for the planned
+    /// "disable a whole MCP server" UI gesture, so it's retained.
+    #[allow(dead_code)]
     pub fn set_server_enabled(&mut self, server: &str, enabled: bool) {
         self.servers
             .entry(server.to_string())

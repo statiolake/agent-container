@@ -24,12 +24,10 @@ pub fn generate(base: &Path, user_allow: &[String], dest: &Path) -> Result<()> {
     let base_raw = fs::read_to_string(base)
         .with_context(|| format!("failed to read base allowlist at {}", base.display()))?;
 
-    let base_lines: Vec<&str> = base_raw.lines().collect();
-    let already_present: std::collections::HashSet<&str> = base_lines
-        .iter()
-        .map(|l| l.trim())
+    let already_present: std::collections::HashSet<&str> = base_raw
+        .lines()
+        .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .copied()
         .collect();
 
     let mut out = base_raw.clone();
