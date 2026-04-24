@@ -39,8 +39,11 @@ const CONTAINER_WORKSPACE: &str = "/workspace";
 /// - `env`: exports can reference host tool paths that don't exist here.
 /// - `hooks`: shell commands that typically shell out to host binaries.
 /// - `permissions`: we run with `--dangerously-skip-permissions` anyway.
-/// - `sandbox`: Claude Code's in-process sandbox is redundant (and bypassed)
-///   inside the container.
+/// - `sandbox`: Claude Code's in-process sandbox is redundant (and noisy)
+///   inside the container. The top-level settings.json gets an explicit
+///   `{"enabled": false}` re-injected after the strip — Claude Code
+///   defaults to sandbox-enabled when the key is absent, and the docker
+///   container is already our isolation boundary.
 const COMMON_STRIP: &[&str] = &[
     "mcpServers",
     "mcpContextUris",
@@ -264,6 +267,15 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
     };
     if let Some(obj) = settings.as_object_mut() {
         strip_keys(obj);
+        // Positively disable Claude Code's Bash sandbox inside the
+        // container. The key was just stripped above; without a positive
+        // re-injection Claude Code falls back to its default of
+        // sandbox-enabled, which would then second-guess writes and
+        // network egress that the docker boundary is already mediating.
+        obj.insert(
+            "sandbox".to_string(),
+            serde_json::json!({ "enabled": false }),
+        );
         // Mirror the awsCredentialExport injection we do for .claude.json
         // — Claude Code looks in settings.json first for user-level
         // configuration, which is where the operator most naturally puts
@@ -670,9 +682,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["theme"], serde_json::json!("dark"));
-        for key in ["env", "hooks", "permissions", "sandbox", "mcpServers"] {
+        for key in ["env", "hooks", "permissions", "mcpServers"] {
             assert!(out.get(key).is_none(), "{key} should be stripped");
         }
+        // The host's `{"mode": "strict"}` must not survive; the container
+        // gets an explicit `enabled: false` injection instead.
+        assert_eq!(
+            out["sandbox"],
+            serde_json::json!({ "enabled": false }),
+            "sandbox should be forced off inside the container",
+        );
         assert!(out.get("awsAuthRefresh").is_none());
     }
 
