@@ -40,14 +40,16 @@
 ^proxy\.golang\.org$
 ^sum\.golang\.org$
 
-# --- GitHub (clone, release artifacts, API) ---
+# --- GitHub read-path only (clone + release artifacts) ---
+# `api.github.com` and `uploads.github.com` are intentionally omitted:
+# a stolen PAT in the workspace could delete repos / change settings via
+# the REST API, or upload arbitrary release assets. Users who need them
+# can opt in via workspace/global `proxy.allow`.
 ^github\.com$
-^api\.github\.com$
 ^codeload\.github\.com$
 ^raw\.githubusercontent\.com$
 ^objects\.githubusercontent\.com$
 ^release-assets\.githubusercontent\.com$
-^uploads\.github\.com$
 
 # --- Debian / Ubuntu apt repos (container base image updates) ---
 ^deb\.debian\.org$
