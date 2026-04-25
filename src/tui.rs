@@ -43,6 +43,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs};
 
+use crate::policy::McpPolicy;
 use crate::settings::Scope;
 
 /// Single-line text buffer with readline-style editing primitives.
@@ -204,13 +205,16 @@ fn apply_editing_key(field: &mut TextField, code: KeyCode, modifiers: KeyModifie
     true
 }
 
+/// Catalog row for the MCP tab — describes a tool's identity and
+/// upstream-declared safety hint. The effective enabled state is *not*
+/// stored here; it is computed on the fly from the active scope's
+/// [`McpPolicy`] (see [`McpState::effective_tool_allowed`]).
 #[derive(Debug, Clone)]
 pub struct ToolEntry {
     pub server_name: String,
     pub tool_name: String,
     pub description: String,
     pub read_only_hint: Option<bool>,
-    pub enabled: bool,
 }
 
 pub struct TuiInput {
@@ -221,14 +225,19 @@ pub struct TuiInput {
     /// the TUI.
     pub proxy_allow_global: Vec<String>,
     pub proxy_allow_workspace: Vec<String>,
-    /// Merged MCP tool catalogue with effective-enabled state from the
-    /// runtime view. Changes compared back to this set decide which
-    /// entries land in the target scope at save time.
-    pub tool_entries: Vec<ToolEntry>,
-    /// Merged `[task_runner.tasks]` map shown inline in the MCP tab as
-    /// the built-in task-runner server. Editable; the save pass diffs
-    /// this against the inherited base to keep the scope file sparse.
-    pub tasks: BTreeMap<String, String>,
+    /// Static catalog of every (server, tool) the merged settings know
+    /// about — used to render the MCP tab regardless of scope.
+    pub tool_catalog: Vec<ToolEntry>,
+    /// Each scope's MCP policy as it lives on disk. The TUI displays the
+    /// effective enabled state (Workspace view = global ∪ workspace at
+    /// the tool granularity, Global view = global only) and writes
+    /// toggles back into the active scope only.
+    pub mcp_global: McpPolicy,
+    pub mcp_workspace: McpPolicy,
+    /// Each scope's `[task_runner.tasks]` map. Workspace entries shadow
+    /// global ones with the same name in the merged display.
+    pub tasks_global: BTreeMap<String, String>,
+    pub tasks_workspace: BTreeMap<String, String>,
 }
 
 pub struct TuiOutput {
@@ -237,8 +246,10 @@ pub struct TuiOutput {
     pub saved_scope: Scope,
     pub proxy_allow_global: Vec<String>,
     pub proxy_allow_workspace: Vec<String>,
-    pub tool_entries: Vec<ToolEntry>,
-    pub tasks: BTreeMap<String, String>,
+    pub mcp_global: McpPolicy,
+    pub mcp_workspace: McpPolicy,
+    pub tasks_global: BTreeMap<String, String>,
+    pub tasks_workspace: BTreeMap<String, String>,
 }
 
 pub enum Outcome {
@@ -367,15 +378,24 @@ enum McpRow {
 }
 
 struct McpState {
-    /// Built-in task-runner tasks (name -> command). Rendered as the
-    /// top-most "server" of the MCP tree so users can edit them inline.
-    tasks: BTreeMap<String, String>,
+    /// Per-scope tasks. The visible list is derived: for `Workspace` we
+    /// merge `tasks_global` ∪ `tasks_workspace` (workspace wins); for
+    /// `Global` we show only `tasks_global`.
+    tasks_global: BTreeMap<String, String>,
+    tasks_workspace: BTreeMap<String, String>,
+    /// Per-scope MCP policies. Edits go into the active scope's policy
+    /// only; the other one is kept untouched until the next `t` switch
+    /// or save-and-quit.
+    mcp_global: McpPolicy,
+    mcp_workspace: McpPolicy,
     task_runner_expanded: bool,
     server_names: Vec<String>,
     /// Per-server collapse state. Initially expanded when a server has
     /// any overrides visible so the user can immediately see them.
     expanded: Vec<bool>,
-    entries: Vec<ToolEntry>,
+    /// Static catalog of (server, tool, hint, description) tuples — the
+    /// tool inventory itself doesn't change between scopes.
+    catalog: Vec<ToolEntry>,
     /// Precomputed map from `server_name -> first-tool-index, tool-count`
     /// so expand/collapse doesn't have to scan the full list each frame.
     server_ranges: HashMap<String, (usize, usize)>,
@@ -383,8 +403,14 @@ struct McpState {
 }
 
 impl McpState {
-    fn new(mut entries: Vec<ToolEntry>, tasks: BTreeMap<String, String>) -> Self {
-        entries.sort_by(|a, b| {
+    fn new(
+        mut catalog: Vec<ToolEntry>,
+        mcp_global: McpPolicy,
+        mcp_workspace: McpPolicy,
+        tasks_global: BTreeMap<String, String>,
+        tasks_workspace: BTreeMap<String, String>,
+    ) -> Self {
+        catalog.sort_by(|a, b| {
             a.server_name
                 .cmp(&b.server_name)
                 .then_with(|| a.tool_name.cmp(&b.tool_name))
@@ -392,7 +418,7 @@ impl McpState {
 
         let mut server_names: Vec<String> = Vec::new();
         let mut server_ranges: HashMap<String, (usize, usize)> = HashMap::new();
-        for (i, e) in entries.iter().enumerate() {
+        for (i, e) in catalog.iter().enumerate() {
             match server_ranges.get_mut(&e.server_name) {
                 Some((_, count)) => *count += 1,
                 None => {
@@ -404,22 +430,105 @@ impl McpState {
 
         let expanded = vec![true; server_names.len()];
         Self {
-            tasks,
+            tasks_global,
+            tasks_workspace,
+            mcp_global,
+            mcp_workspace,
             task_runner_expanded: true,
             server_names,
             expanded,
-            entries,
+            catalog,
             server_ranges,
             cursor: 0,
         }
     }
 
-    /// Flat list of currently-visible rows (respecting expanded state).
-    fn visible_rows(&self) -> Vec<McpRow> {
+    /// Tasks visible for `scope`. Workspace shows the merged view
+    /// (workspace overlay wins on collisions); Global shows only its
+    /// own map.
+    fn effective_tasks(&self, scope: Scope) -> BTreeMap<String, String> {
+        match scope {
+            Scope::Global => self.tasks_global.clone(),
+            Scope::Workspace => {
+                let mut merged = self.tasks_global.clone();
+                for (k, v) in &self.tasks_workspace {
+                    merged.insert(k.clone(), v.clone());
+                }
+                merged
+            }
+        }
+    }
+
+    /// Whether a task at the given key is currently overridden in the
+    /// active scope (used for the `[W]` annotation while editing
+    /// Workspace).
+    fn task_is_workspace_override(&self, name: &str) -> bool {
+        self.tasks_workspace.contains_key(name)
+    }
+
+    /// Effective enabled state for the indexed catalog entry under the
+    /// active scope. Workspace mode does a *tool-level* merge (workspace
+    /// override wins, otherwise fall through to global) so the user sees
+    /// "what would actually be enabled if I saved right now".
+    fn effective_tool_allowed(&self, scope: Scope, idx: usize) -> bool {
+        let entry = &self.catalog[idx];
+        match scope {
+            Scope::Global => self.mcp_global.tool_allowed(
+                &entry.server_name,
+                &entry.tool_name,
+                entry.read_only_hint,
+            ),
+            Scope::Workspace => {
+                if let Some(ws_server) = self.mcp_workspace.servers.get(&entry.server_name) {
+                    if !ws_server.enabled {
+                        return false;
+                    }
+                    if let Some(t) = ws_server.tools.get(&entry.tool_name) {
+                        return *t;
+                    }
+                }
+                self.mcp_global.tool_allowed(
+                    &entry.server_name,
+                    &entry.tool_name,
+                    entry.read_only_hint,
+                )
+            }
+        }
+    }
+
+    /// Whether the (server, tool) at `idx` carries an explicit
+    /// per-tool entry in the workspace policy. Used for the `[W]`
+    /// annotation that distinguishes "inherited from global" from
+    /// "overridden here".
+    fn tool_is_workspace_override(&self, idx: usize) -> bool {
+        let entry = &self.catalog[idx];
+        self.mcp_workspace
+            .servers
+            .get(&entry.server_name)
+            .and_then(|sp| sp.tools.get(&entry.tool_name))
+            .is_some()
+    }
+
+    /// Apply a desired enabled state to the indexed catalog entry under
+    /// `scope`. Writes through the policy's `set_tool` so the change is
+    /// always representable; the save pass minimises redundant entries
+    /// against the inheritance base afterwards.
+    fn set_tool_for(&mut self, scope: Scope, idx: usize, enabled: bool) {
+        let entry = &self.catalog[idx];
+        let policy = match scope {
+            Scope::Global => &mut self.mcp_global,
+            Scope::Workspace => &mut self.mcp_workspace,
+        };
+        policy.set_tool(&entry.server_name, &entry.tool_name, enabled);
+    }
+
+    /// Flat list of currently-visible rows (respecting expanded state)
+    /// for the active scope.
+    fn visible_rows(&self, scope: Scope) -> Vec<McpRow> {
         let mut rows = Vec::new();
         rows.push(McpRow::TaskRunnerHeader);
         if self.task_runner_expanded {
-            for name in self.tasks.keys() {
+            for name in self.effective_tasks(scope).keys() {
                 rows.push(McpRow::TaskRow(name.clone()));
             }
             rows.push(McpRow::TaskAddHint);
@@ -437,16 +546,16 @@ impl McpState {
         rows
     }
 
-    fn current_row(&self) -> Option<McpRow> {
-        self.visible_rows().get(self.cursor).cloned()
+    fn current_row(&self, scope: Scope) -> Option<McpRow> {
+        self.visible_rows(scope).get(self.cursor).cloned()
     }
 
     fn move_up(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
 
-    fn move_down(&mut self) {
-        let max = self.visible_rows().len();
+    fn move_down(&mut self, scope: Scope) {
+        let max = self.visible_rows(scope).len();
         if self.cursor + 1 < max {
             self.cursor += 1;
         }
@@ -456,16 +565,16 @@ impl McpState {
         self.cursor = 0;
     }
 
-    fn jump_end(&mut self) {
-        let len = self.visible_rows().len();
+    fn jump_end(&mut self, scope: Scope) {
+        let len = self.visible_rows(scope).len();
         self.cursor = len.saturating_sub(1);
     }
 
     /// Toggle the currently-focused row. Returns a [`RowAction`] when the
     /// row can't handle the toggle locally (e.g. a task row needs the
     /// outer event loop to spawn an input modal).
-    fn toggle(&mut self) -> RowAction {
-        match self.current_row() {
+    fn toggle(&mut self, scope: Scope) -> RowAction {
+        match self.current_row(scope) {
             Some(McpRow::TaskRunnerHeader) => {
                 self.task_runner_expanded = !self.task_runner_expanded;
                 RowAction::Handled
@@ -475,7 +584,8 @@ impl McpState {
                 RowAction::Handled
             }
             Some(McpRow::Tool(ti)) => {
-                self.entries[ti].enabled = !self.entries[ti].enabled;
+                let cur = self.effective_tool_allowed(scope, ti);
+                self.set_tool_for(scope, ti, !cur);
                 RowAction::Handled
             }
             Some(McpRow::TaskRow(name)) => RowAction::EditTask(name),
@@ -484,48 +594,78 @@ impl McpState {
         }
     }
 
-    fn toggle_all_in_focused_server(&mut self, enable: bool) {
-        let server_idx = match self.current_row() {
+    fn toggle_all_in_focused_server(&mut self, scope: Scope, enable: bool) {
+        let server_idx = match self.current_row(scope) {
             Some(McpRow::Server(si)) => si,
-            Some(McpRow::Tool(ti)) => {
-                // find which server owns entries[ti]
-                self.server_names
-                    .iter()
-                    .position(|n| n == &self.entries[ti].server_name)
-                    .unwrap_or(0)
-            }
+            Some(McpRow::Tool(ti)) => self
+                .server_names
+                .iter()
+                .position(|n| n == &self.catalog[ti].server_name)
+                .unwrap_or(0),
             _ => return,
         };
-        let Some(name) = self.server_names.get(server_idx) else {
+        let Some(name) = self.server_names.get(server_idx).cloned() else {
             return;
         };
-        if let Some((start, count)) = self.server_ranges.get(name).copied() {
+        if let Some((start, count)) = self.server_ranges.get(&name).copied() {
             for i in start..(start + count) {
-                self.entries[i].enabled = enable;
+                self.set_tool_for(scope, i, enable);
             }
         }
     }
 
-    fn delete_task_at_cursor(&mut self) {
-        if let Some(McpRow::TaskRow(name)) = self.current_row() {
-            self.tasks.remove(&name);
-            let len = self.visible_rows().len();
-            if self.cursor >= len {
-                self.cursor = len.saturating_sub(1);
+    /// Delete the task focused by the cursor under `scope`. Workspace
+    /// only deletes the workspace-side entry — a global-only task stays
+    /// visible (the user has to switch to Global to remove it). Visible
+    /// for the user via the `[W]` annotation in the row.
+    fn delete_task_at_cursor(&mut self, scope: Scope) {
+        let Some(McpRow::TaskRow(name)) = self.current_row(scope) else {
+            return;
+        };
+        match scope {
+            Scope::Global => {
+                self.tasks_global.remove(&name);
             }
+            Scope::Workspace => {
+                self.tasks_workspace.remove(&name);
+            }
+        };
+        let len = self.visible_rows(scope).len();
+        if self.cursor >= len {
+            self.cursor = len.saturating_sub(1);
         }
     }
 
-    fn enabled_count_for(&self, server_idx: usize) -> (usize, usize) {
+    fn set_task_for(&mut self, scope: Scope, name: String, command: String) {
+        match scope {
+            Scope::Global => self.tasks_global.insert(name, command),
+            Scope::Workspace => self.tasks_workspace.insert(name, command),
+        };
+    }
+
+    fn task_command_for(&self, scope: Scope, name: &str) -> Option<String> {
+        // For Workspace the editor preloads the merged value (so editing
+        // a global-only task starts from its global definition), so the
+        // user sees the same value the merged display showed them.
+        match scope {
+            Scope::Global => self.tasks_global.get(name).cloned(),
+            Scope::Workspace => self
+                .tasks_workspace
+                .get(name)
+                .or_else(|| self.tasks_global.get(name))
+                .cloned(),
+        }
+    }
+
+    fn enabled_count_for(&self, scope: Scope, server_idx: usize) -> (usize, usize) {
         let Some(name) = self.server_names.get(server_idx) else {
             return (0, 0);
         };
         let Some((start, count)) = self.server_ranges.get(name).copied() else {
             return (0, 0);
         };
-        let enabled = self.entries[start..start + count]
-            .iter()
-            .filter(|e| e.enabled)
+        let enabled = (start..start + count)
+            .filter(|i| self.effective_tool_allowed(scope, *i))
             .count();
         (enabled, count)
     }
@@ -561,7 +701,13 @@ impl App {
             tab: TopTab::Proxy,
             proxy_global: ProxyState::new(input.proxy_allow_global),
             proxy_workspace: ProxyState::new(input.proxy_allow_workspace),
-            mcp: McpState::new(input.tool_entries, input.tasks),
+            mcp: McpState::new(
+                input.tool_catalog,
+                input.mcp_global,
+                input.mcp_workspace,
+                input.tasks_global,
+                input.tasks_workspace,
+            ),
             mode: Mode::Normal,
             list_state,
         }
@@ -601,8 +747,10 @@ impl App {
             saved_scope: self.scope,
             proxy_allow_global: self.proxy_global.allow,
             proxy_allow_workspace: self.proxy_workspace.allow,
-            tool_entries: self.mcp.entries,
-            tasks: self.mcp.tasks,
+            mcp_global: self.mcp.mcp_global,
+            mcp_workspace: self.mcp.mcp_workspace,
+            tasks_global: self.mcp.tasks_global,
+            tasks_workspace: self.mcp.tasks_workspace,
         }
     }
 }
@@ -663,13 +811,23 @@ fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) 
                     TaskField::Command
                 };
             } else {
-                // Rename clears the old key.
+                let scope = app.scope;
+                // Rename clears the old key in the active scope's map.
+                // (A workspace rename never touches the global map — the
+                // global definition stays put as the inheritance fallback.)
                 if let Some(orig) = &editing {
                     if orig != &name_tr {
-                        app.mcp.tasks.remove(orig);
+                        match scope {
+                            Scope::Global => {
+                                app.mcp.tasks_global.remove(orig);
+                            }
+                            Scope::Workspace => {
+                                app.mcp.tasks_workspace.remove(orig);
+                            }
+                        }
                     }
                 }
-                app.mcp.tasks.insert(name_tr, cmd_tr);
+                app.mcp.set_task_for(scope, name_tr, cmd_tr);
                 return;
             }
         }
@@ -697,7 +855,10 @@ fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) 
 }
 
 fn start_task_edit(app: &mut App, name: String) {
-    let command = app.mcp.tasks.get(&name).cloned().unwrap_or_default();
+    let command = app
+        .mcp
+        .task_command_for(app.scope, &name)
+        .unwrap_or_default();
     app.mode = Mode::TaskInput {
         name: TextField::from_str(&name),
         command: TextField::from_str(&command),
@@ -771,7 +932,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             },
             KeyCode::Down | KeyCode::Char('j') => match app.tab {
                 TopTab::Proxy => app.proxy_mut().move_down(),
-                TopTab::Mcp => app.mcp.move_down(),
+                TopTab::Mcp => app.mcp.move_down(app.scope),
             },
             KeyCode::Home | KeyCode::Char('g') => match app.tab {
                 TopTab::Proxy => app.proxy_mut().cursor = 0,
@@ -782,7 +943,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                     let end = app.proxy().allow.len().saturating_sub(1);
                     app.proxy_mut().cursor = end;
                 }
-                TopTab::Mcp => app.mcp.jump_end(),
+                TopTab::Mcp => app.mcp.jump_end(app.scope),
             },
             KeyCode::Char(' ') | KeyCode::Enter => match app.tab {
                 TopTab::Proxy => {
@@ -794,7 +955,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                         };
                     }
                 }
-                TopTab::Mcp => match app.mcp.toggle() {
+                TopTab::Mcp => match app.mcp.toggle(app.scope) {
                     RowAction::Handled => {}
                     RowAction::EditTask(name) => start_task_edit(&mut app, name),
                     RowAction::AddTask => start_task_add(&mut app),
@@ -819,7 +980,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 }
             }
             KeyCode::Char('e') if app.tab == TopTab::Mcp => {
-                if let Some(McpRow::TaskRow(name)) = app.mcp.current_row() {
+                if let Some(McpRow::TaskRow(name)) = app.mcp.current_row(app.scope) {
                     start_task_edit(&mut app, name);
                 }
             }
@@ -827,13 +988,13 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 app.proxy_mut().remove_current();
             }
             KeyCode::Char('d') if app.tab == TopTab::Mcp => {
-                app.mcp.delete_task_at_cursor();
+                app.mcp.delete_task_at_cursor(app.scope);
             }
             KeyCode::Char('a') if app.tab == TopTab::Mcp => {
-                app.mcp.toggle_all_in_focused_server(true);
+                app.mcp.toggle_all_in_focused_server(app.scope, true);
             }
             KeyCode::Char('A') if app.tab == TopTab::Mcp => {
-                app.mcp.toggle_all_in_focused_server(false);
+                app.mcp.toggle_all_in_focused_server(app.scope, false);
             }
             _ => {}
         }
@@ -962,7 +1123,9 @@ fn render_proxy(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
-    let rows = app.mcp.visible_rows();
+    let scope = app.scope;
+    let rows = app.mcp.visible_rows(scope);
+    let visible_tasks = app.mcp.effective_tasks(scope);
     let items: Vec<ListItem> = rows
         .into_iter()
         .map(|row| match row {
@@ -972,7 +1135,7 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 } else {
                     "▸"
                 };
-                let count = app.mcp.tasks.len();
+                let count = visible_tasks.len();
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("{marker} task-runner"),
@@ -991,21 +1154,24 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 ]))
             }
             McpRow::TaskRow(name) => {
-                let command = app
-                    .mcp
-                    .tasks
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or_default();
+                let command = visible_tasks.get(&name).cloned().unwrap_or_default();
+                let overlay = scope == Scope::Workspace
+                    && app.mcp.task_is_workspace_override(&name);
                 ListItem::new(Line::from(vec![
                     Span::raw("    "),
+                    Span::styled(
+                        if overlay { "* " } else { "  " }.to_string(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(name, Style::default().fg(Color::Cyan)),
                     Span::raw(" = "),
                     Span::styled(command, Style::default().fg(Color::White)),
                 ]))
             }
             McpRow::TaskAddHint => ListItem::new(Line::from(vec![
-                Span::raw("    "),
+                Span::raw("      "),
                 Span::styled(
                     "+ add task (i)",
                     Style::default()
@@ -1015,7 +1181,7 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             ])),
             McpRow::Server(si) => {
                 let name = &app.mcp.server_names[si];
-                let (enabled, total) = app.mcp.enabled_count_for(si);
+                let (enabled, total) = app.mcp.enabled_count_for(scope, si);
                 let marker = if app.mcp.expanded[si] { "▾" } else { "▸" };
                 ListItem::new(Line::from(vec![
                     Span::styled(
@@ -1028,7 +1194,11 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     ),
                 ]))
             }
-            McpRow::Tool(ti) => render_tool_row(&app.mcp.entries[ti]),
+            McpRow::Tool(ti) => render_tool_row(
+                &app.mcp.catalog[ti],
+                app.mcp.effective_tool_allowed(scope, ti),
+                scope == Scope::Workspace && app.mcp.tool_is_workspace_override(ti),
+            ),
         })
         .collect();
     let list = List::new(items)
@@ -1042,8 +1212,12 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn render_tool_row(entry: &ToolEntry) -> ListItem<'static> {
-    let cb = if entry.enabled { "[x]" } else { "[ ]" };
+/// `mark_overlay` paints a small `*` in front of the tool name when the
+/// active scope owns an explicit per-tool entry (so the user can see
+/// which checkbox states are inherited from global vs. overridden in
+/// workspace).
+fn render_tool_row(entry: &ToolEntry, enabled: bool, mark_overlay: bool) -> ListItem<'static> {
+    let cb = if enabled { "[x]" } else { "[ ]" };
     let first_line = entry.description.lines().next().unwrap_or("").trim();
     let desc = if first_line.len() > 64 {
         format!("{}…", &first_line[..64])
@@ -1060,6 +1234,12 @@ fn render_tool_row(entry: &ToolEntry) -> ListItem<'static> {
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw("    "),
         Span::raw(format!("{cb} ")),
+        Span::styled(
+            if mark_overlay { "* " } else { "  " }.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(entry.tool_name.clone()),
     ];
     if let Some(tag) = annotation {
@@ -1129,12 +1309,14 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray),
         )]),
         TopTab::Mcp => {
-            let total = app.mcp.entries.len();
-            let enabled = app.mcp.entries.iter().filter(|e| e.enabled).count();
+            let total = app.mcp.catalog.len();
+            let enabled = (0..total)
+                .filter(|i| app.mcp.effective_tool_allowed(app.scope, *i))
+                .count();
+            let task_count = app.mcp.effective_tasks(app.scope).len();
             Line::from(vec![Span::styled(
                 format!(
-                    "{} task(s) · {enabled}/{total} tool(s) enabled across {} server(s)",
-                    app.mcp.tasks.len(),
+                    "{task_count} task(s) · {enabled}/{total} tool(s) enabled across {} server(s)",
                     app.mcp.server_names.len()
                 ),
                 Style::default().fg(Color::DarkGray),
@@ -1397,6 +1579,159 @@ mod tests {
             KeyModifiers::CONTROL
         ));
         assert_eq!(f.value(), "x");
+    }
+
+    fn make_state(
+        catalog: Vec<ToolEntry>,
+        mcp_global: McpPolicy,
+        mcp_workspace: McpPolicy,
+        tasks_global: BTreeMap<String, String>,
+        tasks_workspace: BTreeMap<String, String>,
+    ) -> McpState {
+        McpState::new(
+            catalog,
+            mcp_global,
+            mcp_workspace,
+            tasks_global,
+            tasks_workspace,
+        )
+    }
+
+    fn entry(server: &str, tool: &str, ro: Option<bool>) -> ToolEntry {
+        ToolEntry {
+            server_name: server.to_string(),
+            tool_name: tool.to_string(),
+            description: String::new(),
+            read_only_hint: ro,
+        }
+    }
+
+    #[test]
+    fn effective_tool_allowed_workspace_falls_through_to_global() {
+        // Global has an explicit override that flips the read_only_hint
+        // default (a writable tool turned on). Workspace has no entry —
+        // workspace mode should still report it enabled.
+        let mut g = McpPolicy::default();
+        g.set_tool("github", "create_issue", true);
+        let state = make_state(
+            vec![entry("github", "create_issue", Some(false))],
+            g,
+            McpPolicy::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert!(state.effective_tool_allowed(Scope::Global, 0));
+        assert!(state.effective_tool_allowed(Scope::Workspace, 0));
+    }
+
+    #[test]
+    fn effective_tool_allowed_workspace_override_wins() {
+        // Global says enabled; workspace explicitly turns it off.
+        let mut g = McpPolicy::default();
+        g.set_tool("s", "t", true);
+        let mut w = McpPolicy::default();
+        w.set_tool("s", "t", false);
+        let state = make_state(
+            vec![entry("s", "t", Some(true))],
+            g,
+            w,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert!(state.effective_tool_allowed(Scope::Global, 0));
+        assert!(!state.effective_tool_allowed(Scope::Workspace, 0));
+    }
+
+    #[test]
+    fn set_tool_for_targets_only_active_scope() {
+        let state_seed = || {
+            make_state(
+                vec![entry("s", "t", Some(false))],
+                McpPolicy::default(),
+                McpPolicy::default(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+        };
+        // Global toggle writes to mcp_global, leaves mcp_workspace empty.
+        let mut s = state_seed();
+        s.set_tool_for(Scope::Global, 0, true);
+        assert!(s.mcp_global.servers.get("s").is_some());
+        assert!(s.mcp_workspace.servers.get("s").is_none());
+
+        // Workspace toggle writes to mcp_workspace, leaves mcp_global empty.
+        let mut s = state_seed();
+        s.set_tool_for(Scope::Workspace, 0, true);
+        assert!(s.mcp_global.servers.get("s").is_none());
+        assert!(s.mcp_workspace.servers.get("s").is_some());
+    }
+
+    #[test]
+    fn effective_tasks_show_global_only_for_global_scope() {
+        let mut tg = BTreeMap::new();
+        tg.insert("a".to_string(), "echo a".to_string());
+        let mut tw = BTreeMap::new();
+        tw.insert("b".to_string(), "echo b".to_string());
+        let state = make_state(
+            vec![],
+            McpPolicy::default(),
+            McpPolicy::default(),
+            tg,
+            tw,
+        );
+        let g = state.effective_tasks(Scope::Global);
+        assert_eq!(g.len(), 1);
+        assert!(g.contains_key("a"));
+        assert!(!g.contains_key("b"));
+
+        let w = state.effective_tasks(Scope::Workspace);
+        assert_eq!(w.len(), 2);
+        assert_eq!(w.get("a").unwrap(), "echo a");
+        assert_eq!(w.get("b").unwrap(), "echo b");
+    }
+
+    #[test]
+    fn effective_tasks_workspace_overrides_global_on_collision() {
+        let mut tg = BTreeMap::new();
+        tg.insert("k".to_string(), "global".to_string());
+        let mut tw = BTreeMap::new();
+        tw.insert("k".to_string(), "workspace".to_string());
+        let state = make_state(
+            vec![],
+            McpPolicy::default(),
+            McpPolicy::default(),
+            tg,
+            tw,
+        );
+        assert_eq!(
+            state.effective_tasks(Scope::Workspace).get("k").unwrap(),
+            "workspace",
+        );
+    }
+
+    #[test]
+    fn tool_is_workspace_override_only_true_when_workspace_has_explicit_entry() {
+        let mut g = McpPolicy::default();
+        g.set_tool("s", "t", true);
+        let state = make_state(
+            vec![entry("s", "t", Some(true))],
+            g,
+            McpPolicy::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert!(!state.tool_is_workspace_override(0));
+
+        let mut w = McpPolicy::default();
+        w.set_tool("s", "t", false);
+        let state = make_state(
+            vec![entry("s", "t", Some(true))],
+            McpPolicy::default(),
+            w,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        assert!(state.tool_is_workspace_override(0));
     }
 }
 

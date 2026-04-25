@@ -83,14 +83,11 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
                     println!(" {} tool(s)", tools.len());
                     for tool in tools {
                         let read_only_hint = tool.read_only_hint();
-                        let enabled =
-                            merged.mcp.tool_allowed(&name, &tool.name, read_only_hint);
                         entries.push(ToolEntry {
                             server_name: name.clone(),
                             tool_name: tool.name,
                             description: tool.description.unwrap_or_default(),
                             read_only_hint,
-                            enabled,
                         });
                     }
                 }
@@ -107,13 +104,22 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
         });
     }
 
+    // The TUI keeps two complete McpPolicy / tasks views in memory and
+    // edits the active scope's view directly. Keep a copy of the catalog
+    // here so the post-save minimisation can inspect every (server,
+    // tool) pair regardless of which scope the user wound up saving.
+    let catalog = entries.clone();
     let input = TuiInput {
         initial_scope,
         proxy_allow_global: global_settings.proxy.allow.clone(),
         proxy_allow_workspace: workspace_settings.proxy.allow.clone(),
-        tool_entries: entries,
-        tasks: merged.task_runner.tasks.clone(),
+        tool_catalog: entries,
+        mcp_global: global_settings.mcp.clone(),
+        mcp_workspace: workspace_settings.mcp.clone(),
+        tasks_global: global_settings.task_runner.tasks.clone(),
+        tasks_workspace: workspace_settings.task_runner.tasks.clone(),
     };
+    let _ = merged; // formerly drove the per-row enabled bit; now per-scope.
 
     match tui::run_selection(input)? {
         Outcome::Save(out) => {
@@ -136,8 +142,16 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
                 Scope::Global => out.proxy_allow_global,
                 Scope::Workspace => out.proxy_allow_workspace,
             };
-            apply_entries_scoped(&mut target.mcp, &base_mcp, &out.tool_entries);
-            target.task_runner.tasks = minimise_tasks_against_base(out.tasks, &base_tasks);
+            target.mcp = match saved_scope {
+                Scope::Global => out.mcp_global,
+                Scope::Workspace => out.mcp_workspace,
+            };
+            minimise_policy_against_base(&mut target.mcp, &base_mcp, &catalog);
+            let edited_tasks = match saved_scope {
+                Scope::Global => out.tasks_global,
+                Scope::Workspace => out.tasks_workspace,
+            };
+            target.task_runner.tasks = minimise_tasks_against_base(edited_tasks, &base_tasks);
             let path = settings::path(saved_scope, &host.workspace)?;
             target.save_to(&path).context("failed to save settings")?;
             println!("Saved to {} ({:?} scope)", path.display(), saved_scope);
@@ -268,24 +282,24 @@ fn minimise_tasks_against_base(
     final_tasks
 }
 
-/// Produce a minimal per-scope `McpPolicy` by only writing entries that
-/// diverge from `base` (the merged view without this scope).
-///
-/// Tools matching the inherited state get their per-tool entry cleared
-/// so the layered settings file stays as sparse as possible. Servers end
-/// up in the scope file only when they have at least one divergent tool.
-fn apply_entries_scoped(target: &mut McpPolicy, base: &McpPolicy, entries: &[ToolEntry]) {
-    for entry in entries {
+/// Strip per-tool entries from `target` that match what the scope would
+/// inherit from `base` (`McpPolicy::default()` for Global; the global
+/// policy when saving Workspace). Then drop servers whose `tools` map
+/// is empty *and* whose `enabled` field also matches the base, so the
+/// scope file stays as sparse as possible.
+fn minimise_policy_against_base(target: &mut McpPolicy, base: &McpPolicy, catalog: &[ToolEntry]) {
+    for entry in catalog {
+        let Some(sp) = target.servers.get_mut(&entry.server_name) else {
+            continue;
+        };
+        let Some(target_state) = sp.tools.get(&entry.tool_name).copied() else {
+            continue;
+        };
         let base_state = base.tool_allowed(&entry.server_name, &entry.tool_name, entry.read_only_hint);
-        if entry.enabled == base_state {
-            if let Some(sp) = target.servers.get_mut(&entry.server_name) {
-                sp.tools.remove(&entry.tool_name);
-            }
-        } else {
-            target.set_tool(&entry.server_name, &entry.tool_name, entry.enabled);
+        if target_state == base_state {
+            sp.tools.remove(&entry.tool_name);
         }
     }
-    // Drop server entries that no longer carry any override.
     target.servers.retain(|name, sp| {
         if !sp.tools.is_empty() {
             return true;
