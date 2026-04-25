@@ -302,6 +302,10 @@ enum Mode {
         /// happens.
         editing: Option<String>,
     },
+    /// Confirmation prompt before discarding unsaved edits. Displayed
+    /// when the user hits `q`/Esc/^C while [`App::has_unsaved_changes`]
+    /// is true.
+    ConfirmQuit,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -789,6 +793,18 @@ enum RowAction {
     AddTask,
 }
 
+/// Frozen snapshot of every editable buffer at TUI launch. Used to
+/// decide whether `q` should pop a confirm-quit dialog.
+#[derive(Clone)]
+struct Snapshot {
+    proxy_global: Vec<String>,
+    proxy_workspace: Vec<String>,
+    mcp_global: McpPolicy,
+    mcp_workspace: McpPolicy,
+    tasks_global: BTreeMap<String, String>,
+    tasks_workspace: BTreeMap<String, String>,
+}
+
 struct App {
     scope: Scope,
     tab: TopTab,
@@ -798,12 +814,21 @@ struct App {
     mcp: McpState,
     mode: Mode,
     list_state: ListState,
+    initial: Snapshot,
 }
 
 impl App {
     fn new(input: TuiInput) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+        let initial = Snapshot {
+            proxy_global: input.proxy_allow_global.clone(),
+            proxy_workspace: input.proxy_allow_workspace.clone(),
+            mcp_global: input.mcp_global.clone(),
+            mcp_workspace: input.mcp_workspace.clone(),
+            tasks_global: input.tasks_global.clone(),
+            tasks_workspace: input.tasks_workspace.clone(),
+        };
         Self {
             scope: input.initial_scope,
             tab: TopTab::Proxy,
@@ -817,7 +842,17 @@ impl App {
             ),
             mode: Mode::Normal,
             list_state,
+            initial,
         }
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.proxy.global != self.initial.proxy_global
+            || self.proxy.workspace != self.initial.proxy_workspace
+            || self.mcp.mcp_global != self.initial.mcp_global
+            || self.mcp.mcp_workspace != self.initial.mcp_workspace
+            || self.mcp.tasks_global != self.initial.tasks_global
+            || self.mcp.tasks_workspace != self.initial.tasks_workspace
     }
 
     fn toggle_scope(&mut self) {
@@ -1014,12 +1049,38 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             handle_task_input_key(&mut app, key.code, key.modifiers);
             continue;
         }
+        if matches!(app.mode, Mode::ConfirmQuit) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => break Outcome::Cancel,
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    break Outcome::Save(app.into_output());
+                }
+                KeyCode::Char('n')
+                | KeyCode::Char('N')
+                | KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Char('q') => {
+                    app.mode = Mode::Normal;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        let want_quit = match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
+            _ => false,
+        };
+        if want_quit {
+            if app.has_unsaved_changes() {
+                app.mode = Mode::ConfirmQuit;
+                continue;
+            }
+            break Outcome::Cancel;
+        }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => break Outcome::Cancel,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                break Outcome::Cancel;
-            }
             KeyCode::Char('s') => break Outcome::Save(app.into_output()),
             KeyCode::Tab => app.tab = app.tab.next(),
             KeyCode::BackTab => app.tab = app.tab.prev(),
@@ -1144,6 +1205,10 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     } = app.mode
     {
         render_proxy_input_modal(f, area, buffer, editing.is_some());
+    }
+
+    if matches!(app.mode, Mode::ConfirmQuit) {
+        render_confirm_quit_modal(f, area);
     }
 }
 
@@ -1494,6 +1559,40 @@ fn render_proxy_input_modal(
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
+fn render_confirm_quit_modal(f: &mut ratatui::Frame<'_>, parent: Rect) {
+    let w = parent.width.min(56).max(40);
+    let h: u16 = 7;
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    let y = parent.y + (parent.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Discard unsaved changes? ")
+        .style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let key_style = |c: Color| Style::default().fg(c).add_modifier(Modifier::BOLD);
+    let lines = vec![
+        Line::from(Span::styled(
+            "You have edits that haven't been saved.",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("y", key_style(Color::Red)),
+            Span::raw(" discard and quit  ·  "),
+            Span::styled("n", key_style(Color::Cyan)),
+            Span::raw(" keep editing  ·  "),
+            Span::styled("s", key_style(Color::Green)),
+            Span::raw(" save and quit"),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_task_input_modal(
     f: &mut ratatui::Frame<'_>,
     parent: Rect,
@@ -1832,6 +1931,49 @@ mod tests {
             state.effective_tasks(Scope::Workspace).get("k").unwrap(),
             "workspace",
         );
+    }
+
+    fn fresh_input() -> TuiInput {
+        TuiInput {
+            initial_scope: Scope::Workspace,
+            proxy_allow_global: vec!["g".into()],
+            proxy_allow_workspace: vec!["w".into()],
+            tool_catalog: vec![entry("s", "t", Some(true))],
+            mcp_global: McpPolicy::default(),
+            mcp_workspace: McpPolicy::default(),
+            tasks_global: BTreeMap::new(),
+            tasks_workspace: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn has_unsaved_changes_reports_no_diff_at_launch() {
+        let app = App::new(fresh_input());
+        assert!(!app.has_unsaved_changes());
+    }
+
+    #[test]
+    fn has_unsaved_changes_detects_proxy_edit() {
+        let mut app = App::new(fresh_input());
+        app.proxy.workspace.push("w2".into());
+        assert!(app.has_unsaved_changes());
+    }
+
+    #[test]
+    fn has_unsaved_changes_detects_mcp_toggle() {
+        let mut app = App::new(fresh_input());
+        // Catalog has one (s, t) pair; flipping it writes through to mcp_workspace.
+        let cur = app.mcp.effective_tool_allowed(Scope::Workspace, 0);
+        app.mcp.set_tool_for(Scope::Workspace, 0, !cur);
+        assert!(app.has_unsaved_changes());
+    }
+
+    #[test]
+    fn has_unsaved_changes_detects_task_edit() {
+        let mut app = App::new(fresh_input());
+        app.mcp
+            .set_task_for(Scope::Global, "new".into(), "echo new".into());
+        assert!(app.has_unsaved_changes());
     }
 
     #[test]
