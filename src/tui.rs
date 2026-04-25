@@ -288,7 +288,10 @@ enum Mode {
     Normal,
     ProxyInput {
         buffer: TextField,
-        editing_idx: Option<usize>,
+        /// `Some(row)` when editing an existing entry; `None` for adds.
+        /// The row carries the origin scope so the commit knows whether
+        /// to update or refuse the write.
+        editing: Option<ProxyRow>,
     },
     TaskInput {
         name: TextField,
@@ -316,53 +319,159 @@ impl TaskField {
     }
 }
 
+/// Origin scope of a proxy row in the merged display.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProxyOrigin {
+    Global,
+    Workspace,
+}
+
+impl ProxyOrigin {
+    fn from_scope(scope: Scope) -> Self {
+        match scope {
+            Scope::Global => ProxyOrigin::Global,
+            Scope::Workspace => ProxyOrigin::Workspace,
+        }
+    }
+}
+
+/// One row in the rendered proxy list. `idx_within_scope` points back
+/// into the origin scope's `Vec<String>` so edits / deletes know where
+/// to write — the merged display index isn't usable directly.
+#[derive(Clone, Debug)]
+struct ProxyRow {
+    origin: ProxyOrigin,
+    pattern: String,
+    idx_within_scope: usize,
+}
+
 struct ProxyState {
-    allow: Vec<String>,
+    /// Each scope's allow patterns. Workspace view shows a tool-level
+    /// (here, pattern-level) merge: every global pattern, then any
+    /// workspace patterns that don't already appear in global. Global
+    /// view shows only `global`.
+    global: Vec<String>,
+    workspace: Vec<String>,
     cursor: usize,
 }
 
 impl ProxyState {
-    fn new(allow: Vec<String>) -> Self {
-        Self { allow, cursor: 0 }
+    fn new(global: Vec<String>, workspace: Vec<String>) -> Self {
+        Self {
+            global,
+            workspace,
+            cursor: 0,
+        }
+    }
+
+    fn list_mut(&mut self, origin: ProxyOrigin) -> &mut Vec<String> {
+        match origin {
+            ProxyOrigin::Global => &mut self.global,
+            ProxyOrigin::Workspace => &mut self.workspace,
+        }
+    }
+
+    fn visible_rows(&self, scope: Scope) -> Vec<ProxyRow> {
+        let mut rows: Vec<ProxyRow> = self
+            .global
+            .iter()
+            .enumerate()
+            .map(|(i, p)| ProxyRow {
+                origin: ProxyOrigin::Global,
+                pattern: p.clone(),
+                idx_within_scope: i,
+            })
+            .collect();
+        if scope == Scope::Workspace {
+            for (i, p) in self.workspace.iter().enumerate() {
+                if !self.global.contains(p) {
+                    rows.push(ProxyRow {
+                        origin: ProxyOrigin::Workspace,
+                        pattern: p.clone(),
+                        idx_within_scope: i,
+                    });
+                }
+            }
+        }
+        rows
     }
 
     fn move_up(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
 
-    fn move_down(&mut self) {
-        if self.cursor + 1 < self.allow.len() {
+    fn move_down(&mut self, scope: Scope) {
+        let len = self.visible_rows(scope).len();
+        if self.cursor + 1 < len {
             self.cursor += 1;
         }
     }
 
-    fn current(&self) -> Option<&String> {
-        self.allow.get(self.cursor)
+    fn jump_home(&mut self) {
+        self.cursor = 0;
     }
 
-    fn remove_current(&mut self) {
-        if self.allow.is_empty() {
+    fn jump_end(&mut self, scope: Scope) {
+        let len = self.visible_rows(scope).len();
+        self.cursor = len.saturating_sub(1);
+    }
+
+    fn current_row(&self, scope: Scope) -> Option<ProxyRow> {
+        self.visible_rows(scope).into_iter().nth(self.cursor)
+    }
+
+    /// Remove the cursor's row, but only if it lives in the active
+    /// scope. Global rows shown in the workspace view are inherited and
+    /// cannot be deleted from here — the user has to switch to Global
+    /// with `t` to remove them.
+    fn remove_current(&mut self, scope: Scope) {
+        let Some(row) = self.current_row(scope) else {
+            return;
+        };
+        if row.origin != ProxyOrigin::from_scope(scope) {
             return;
         }
-        self.allow.remove(self.cursor);
-        if self.cursor > 0 && self.cursor >= self.allow.len() {
-            self.cursor = self.allow.len().saturating_sub(1);
+        let list = self.list_mut(row.origin);
+        if row.idx_within_scope < list.len() {
+            list.remove(row.idx_within_scope);
+        }
+        let len = self.visible_rows(scope).len();
+        if self.cursor >= len {
+            self.cursor = len.saturating_sub(1);
         }
     }
 
-    fn upsert(&mut self, value: String, at: Option<usize>) {
+    /// Apply an upsert at the active scope. When `editing` points at a
+    /// row owned by the active scope, replace it. When it points at a
+    /// foreign-scope row (the user pressed `e` on an inherited global
+    /// pattern while editing Workspace), do nothing — that case is
+    /// blocked at the call site, and treating it as an add would
+    /// silently fork the entry.
+    fn upsert(&mut self, scope: Scope, value: String, editing: Option<ProxyRow>) {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return;
         }
         let v = trimmed.to_string();
-        match at {
-            Some(i) if i < self.allow.len() => {
-                self.allow[i] = v;
+        let active = ProxyOrigin::from_scope(scope);
+        match editing {
+            Some(row) if row.origin == active => {
+                let list = self.list_mut(active);
+                if row.idx_within_scope < list.len() {
+                    list[row.idx_within_scope] = v;
+                }
             }
-            _ => {
-                self.allow.push(v);
-                self.cursor = self.allow.len() - 1;
+            Some(_) => {
+                // Editing target is in the other scope: ignore.
+            }
+            None => {
+                let list = self.list_mut(active);
+                if !list.contains(&v) {
+                    list.push(v);
+                }
+                // Move cursor onto the freshly-appended row.
+                let len = self.visible_rows(scope).len();
+                self.cursor = len.saturating_sub(1);
             }
         }
     }
@@ -683,10 +792,9 @@ enum RowAction {
 struct App {
     scope: Scope,
     tab: TopTab,
-    /// Scope-local proxy buffers. Only the active one is displayed; the
-    /// other keeps its cursor and edits across a switch.
-    proxy_global: ProxyState,
-    proxy_workspace: ProxyState,
+    /// Holds both scopes' allow lists; the visible rows are derived
+    /// from `scope`. Cursor is on the rendered (merged) view.
+    proxy: ProxyState,
     mcp: McpState,
     mode: Mode,
     list_state: ListState,
@@ -699,8 +807,7 @@ impl App {
         Self {
             scope: input.initial_scope,
             tab: TopTab::Proxy,
-            proxy_global: ProxyState::new(input.proxy_allow_global),
-            proxy_workspace: ProxyState::new(input.proxy_allow_workspace),
+            proxy: ProxyState::new(input.proxy_allow_global, input.proxy_allow_workspace),
             mcp: McpState::new(
                 input.tool_catalog,
                 input.mcp_global,
@@ -713,30 +820,26 @@ impl App {
         }
     }
 
-    fn proxy(&self) -> &ProxyState {
-        match self.scope {
-            Scope::Global => &self.proxy_global,
-            Scope::Workspace => &self.proxy_workspace,
-        }
-    }
-
-    fn proxy_mut(&mut self) -> &mut ProxyState {
-        match self.scope {
-            Scope::Global => &mut self.proxy_global,
-            Scope::Workspace => &mut self.proxy_workspace,
-        }
-    }
-
     fn toggle_scope(&mut self) {
         self.scope = match self.scope {
             Scope::Global => Scope::Workspace,
             Scope::Workspace => Scope::Global,
         };
+        // Keep the cursor inside the new visible-row count for whichever
+        // panel happens to be active. The MCP cursor is naturally bounded
+        // by visible_rows(); for the proxy panel we re-clamp here so an
+        // out-of-range cursor doesn't render off-list.
+        if self.tab == TopTab::Proxy {
+            let len = self.proxy.visible_rows(self.scope).len();
+            if self.proxy.cursor >= len {
+                self.proxy.cursor = len.saturating_sub(1);
+            }
+        }
     }
 
     fn sync_list_state(&mut self) {
         let cur = match self.tab {
-            TopTab::Proxy => self.proxy().cursor,
+            TopTab::Proxy => self.proxy.cursor,
             TopTab::Mcp => self.mcp.cursor,
         };
         self.list_state.select(Some(cur));
@@ -745,8 +848,8 @@ impl App {
     fn into_output(self) -> TuiOutput {
         TuiOutput {
             saved_scope: self.scope,
-            proxy_allow_global: self.proxy_global.allow,
-            proxy_allow_workspace: self.proxy_workspace.allow,
+            proxy_allow_global: self.proxy.global,
+            proxy_allow_workspace: self.proxy.workspace,
             mcp_global: self.mcp.mcp_global,
             mcp_workspace: self.mcp.mcp_workspace,
             tasks_global: self.mcp.tasks_global,
@@ -760,7 +863,7 @@ fn handle_proxy_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
     // (to Normal on commit/cancel) without aliasing the same borrow.
     let Mode::ProxyInput {
         mut buffer,
-        editing_idx,
+        editing,
     } = std::mem::replace(&mut app.mode, Mode::Normal)
     else {
         return;
@@ -771,7 +874,7 @@ fn handle_proxy_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         KeyCode::Esc => return,
         KeyCode::Char('c') if ctrl => return,
         KeyCode::Enter => {
-            app.proxy_mut().upsert(buffer.value(), editing_idx);
+            app.proxy.upsert(app.scope, buffer.value(), editing);
             return;
         }
         _ => {
@@ -779,10 +882,7 @@ fn handle_proxy_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
     }
 
-    app.mode = Mode::ProxyInput {
-        buffer,
-        editing_idx,
-    };
+    app.mode = Mode::ProxyInput { buffer, editing };
 }
 
 fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -927,32 +1027,33 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             KeyCode::Right | KeyCode::Char('l') => app.tab = app.tab.next(),
             KeyCode::Char('t') => app.toggle_scope(),
             KeyCode::Up | KeyCode::Char('k') => match app.tab {
-                TopTab::Proxy => app.proxy_mut().move_up(),
+                TopTab::Proxy => app.proxy.move_up(),
                 TopTab::Mcp => app.mcp.move_up(),
             },
             KeyCode::Down | KeyCode::Char('j') => match app.tab {
-                TopTab::Proxy => app.proxy_mut().move_down(),
+                TopTab::Proxy => app.proxy.move_down(app.scope),
                 TopTab::Mcp => app.mcp.move_down(app.scope),
             },
             KeyCode::Home | KeyCode::Char('g') => match app.tab {
-                TopTab::Proxy => app.proxy_mut().cursor = 0,
+                TopTab::Proxy => app.proxy.jump_home(),
                 TopTab::Mcp => app.mcp.jump_home(),
             },
             KeyCode::End | KeyCode::Char('G') => match app.tab {
-                TopTab::Proxy => {
-                    let end = app.proxy().allow.len().saturating_sub(1);
-                    app.proxy_mut().cursor = end;
-                }
+                TopTab::Proxy => app.proxy.jump_end(app.scope),
                 TopTab::Mcp => app.mcp.jump_end(app.scope),
             },
             KeyCode::Char(' ') | KeyCode::Enter => match app.tab {
                 TopTab::Proxy => {
-                    let pair = app.proxy().current().cloned().map(|c| (c, app.proxy().cursor));
-                    if let Some((cur, idx)) = pair {
-                        app.mode = Mode::ProxyInput {
-                            buffer: TextField::from_str(&cur),
-                            editing_idx: Some(idx),
-                        };
+                    if let Some(row) = app.proxy.current_row(app.scope) {
+                        // Inherited (global) rows shown in the workspace
+                        // view are read-only here — `t` to switch scope
+                        // first.
+                        if row.origin == ProxyOrigin::from_scope(app.scope) {
+                            app.mode = Mode::ProxyInput {
+                                buffer: TextField::from_str(&row.pattern),
+                                editing: Some(row),
+                            };
+                        }
                     }
                 }
                 TopTab::Mcp => match app.mcp.toggle(app.scope) {
@@ -964,19 +1065,20 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             KeyCode::Char('i') | KeyCode::Char('+') if app.tab == TopTab::Proxy => {
                 app.mode = Mode::ProxyInput {
                     buffer: TextField::default(),
-                    editing_idx: None,
+                    editing: None,
                 };
             }
             KeyCode::Char('i') | KeyCode::Char('+') if app.tab == TopTab::Mcp => {
                 start_task_add(&mut app);
             }
             KeyCode::Char('e') if app.tab == TopTab::Proxy => {
-                let pair = app.proxy().current().cloned().map(|c| (c, app.proxy().cursor));
-                if let Some((cur, idx)) = pair {
-                    app.mode = Mode::ProxyInput {
-                        buffer: TextField::from_str(&cur),
-                        editing_idx: Some(idx),
-                    };
+                if let Some(row) = app.proxy.current_row(app.scope) {
+                    if row.origin == ProxyOrigin::from_scope(app.scope) {
+                        app.mode = Mode::ProxyInput {
+                            buffer: TextField::from_str(&row.pattern),
+                            editing: Some(row),
+                        };
+                    }
                 }
             }
             KeyCode::Char('e') if app.tab == TopTab::Mcp => {
@@ -985,7 +1087,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 }
             }
             KeyCode::Char('d') if app.tab == TopTab::Proxy => {
-                app.proxy_mut().remove_current();
+                app.proxy.remove_current(app.scope);
             }
             KeyCode::Char('d') if app.tab == TopTab::Mcp => {
                 app.mcp.delete_task_at_cursor(app.scope);
@@ -1038,10 +1140,10 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     // Overlay modal for proxy input.
     if let Mode::ProxyInput {
         ref buffer,
-        editing_idx,
+        ref editing,
     } = app.mode
     {
-        render_proxy_input_modal(f, area, buffer, editing_idx);
+        render_proxy_input_modal(f, area, buffer, editing.is_some());
     }
 }
 
@@ -1098,17 +1200,40 @@ fn render_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_proxy(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
-    let proxy = app.proxy();
-    let items: Vec<ListItem> = if proxy.allow.is_empty() {
+    let scope = app.scope;
+    let rows = app.proxy.visible_rows(scope);
+    let active = ProxyOrigin::from_scope(scope);
+    let items: Vec<ListItem> = if rows.is_empty() {
+        let hint = match scope {
+            Scope::Global => "  (no global allow patterns; press `i` to add)",
+            Scope::Workspace => "  (no allow patterns inherited or set here; press `i` to add)",
+        };
         vec![ListItem::new(Line::from(Span::styled(
-            "  (no scope-local allow patterns; press `i` to add)",
+            hint,
             Style::default().fg(Color::DarkGray),
         )))]
     } else {
-        proxy
-            .allow
-            .iter()
-            .map(|p| ListItem::new(Line::from(Span::raw(p.clone()))))
+        rows.iter()
+            .map(|row| {
+                let overlay = scope == Scope::Workspace && row.origin == ProxyOrigin::Workspace;
+                let is_inherited = row.origin != active;
+                let pattern_style = if is_inherited {
+                    // Slightly dim the inherited rows so the scope they
+                    // belong to is obvious without an extra marker.
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if overlay { "* " } else { "  " }.to_string(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(row.pattern.clone(), pattern_style),
+                ]))
+            })
             .collect()
     };
     let list = List::new(items)
@@ -1303,8 +1428,8 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         TopTab::Proxy => Line::from(vec![Span::styled(
             format!(
                 "Global: {} · Workspace: {} allow pattern(s)",
-                app.proxy_global.allow.len(),
-                app.proxy_workspace.allow.len(),
+                app.proxy.global.len(),
+                app.proxy.workspace.len(),
             ),
             Style::default().fg(Color::DarkGray),
         )]),
@@ -1332,7 +1457,7 @@ fn render_proxy_input_modal(
     f: &mut ratatui::Frame<'_>,
     parent: Rect,
     buffer: &TextField,
-    editing_idx: Option<usize>,
+    is_edit: bool,
 ) {
     // Centered 60-char-wide 5-line modal.
     let w = parent.width.min(72).max(40);
@@ -1342,7 +1467,7 @@ fn render_proxy_input_modal(
     let area = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, area);
-    let title = if editing_idx.is_some() {
+    let title = if is_edit {
         " Edit proxy allow pattern "
     } else {
         " Add proxy allow pattern "
@@ -1707,6 +1832,83 @@ mod tests {
             state.effective_tasks(Scope::Workspace).get("k").unwrap(),
             "workspace",
         );
+    }
+
+    #[test]
+    fn proxy_visible_rows_global_view_shows_only_global() {
+        let p = ProxyState::new(
+            vec!["g1".into(), "g2".into()],
+            vec!["w1".into()],
+        );
+        let rows = p.visible_rows(Scope::Global);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.origin == ProxyOrigin::Global));
+        let patterns: Vec<&str> = rows.iter().map(|r| r.pattern.as_str()).collect();
+        assert_eq!(patterns, ["g1", "g2"]);
+    }
+
+    #[test]
+    fn proxy_visible_rows_workspace_view_appends_workspace_only() {
+        // workspace contains one duplicate of global ("g1") and one
+        // workspace-only entry ("w1"). The merge dedupes the duplicate.
+        let p = ProxyState::new(
+            vec!["g1".into(), "g2".into()],
+            vec!["g1".into(), "w1".into()],
+        );
+        let rows = p.visible_rows(Scope::Workspace);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].origin, ProxyOrigin::Global);
+        assert_eq!(rows[0].pattern, "g1");
+        assert_eq!(rows[1].origin, ProxyOrigin::Global);
+        assert_eq!(rows[1].pattern, "g2");
+        assert_eq!(rows[2].origin, ProxyOrigin::Workspace);
+        assert_eq!(rows[2].pattern, "w1");
+    }
+
+    #[test]
+    fn proxy_remove_current_workspace_view_skips_global_rows() {
+        let mut p = ProxyState::new(
+            vec!["g1".into()],
+            vec!["w1".into()],
+        );
+        // cursor on the global row (index 0): delete should be a no-op.
+        p.cursor = 0;
+        p.remove_current(Scope::Workspace);
+        assert_eq!(p.global, vec!["g1".to_string()]);
+        assert_eq!(p.workspace, vec!["w1".to_string()]);
+
+        // cursor on the workspace row (index 1): deletes from workspace.
+        p.cursor = 1;
+        p.remove_current(Scope::Workspace);
+        assert_eq!(p.global, vec!["g1".to_string()]);
+        assert!(p.workspace.is_empty());
+    }
+
+    #[test]
+    fn proxy_upsert_workspace_does_not_touch_global() {
+        let mut p = ProxyState::new(
+            vec!["g1".into()],
+            vec!["w1".into()],
+        );
+        // Edit the workspace row in workspace view.
+        p.cursor = 1;
+        let row = p.current_row(Scope::Workspace).unwrap();
+        p.upsert(Scope::Workspace, "w1-renamed".to_string(), Some(row));
+        assert_eq!(p.global, vec!["g1".to_string()]);
+        assert_eq!(p.workspace, vec!["w1-renamed".to_string()]);
+
+        // Add a new workspace entry; global stays untouched.
+        p.upsert(Scope::Workspace, "w2".to_string(), None);
+        assert_eq!(p.global, vec!["g1".to_string()]);
+        assert_eq!(p.workspace, vec!["w1-renamed".to_string(), "w2".to_string()]);
+    }
+
+    #[test]
+    fn proxy_upsert_dedupes_within_active_scope() {
+        let mut p = ProxyState::new(vec![], vec!["w1".into()]);
+        p.upsert(Scope::Workspace, "w1".to_string(), None);
+        // Already present, must not be re-appended.
+        assert_eq!(p.workspace, vec!["w1".to_string()]);
     }
 
     #[test]
