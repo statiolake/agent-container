@@ -7,58 +7,42 @@
 //! user namespaces cannot be recreated).
 
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::shared_cred::{HostSync, SharedCredFile, shared_dir};
+
 pub struct CodexAuthFile {
     pub path: PathBuf,
-    cleanup: bool,
+    /// Owns the shared lock; see [`crate::shared_cred`]. The last
+    /// agent-container to drop this writes the (possibly refreshed)
+    /// auth.json back to `~/.codex/auth.json` on the host.
+    _shared: SharedCredFile,
 }
 
-impl Drop for CodexAuthFile {
-    fn drop(&mut self) {
-        if self.cleanup {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Copy `~/.codex/auth.json` into a fresh temp file with 0600 permissions.
+/// Open `~/.codex/auth.json` through the shared-credential machinery.
 ///
-/// We do not bind-mount the host file directly: Codex may rewrite the file
-/// on token refresh, and mirroring that back to the host would mean a
-/// stale in-container session could overwrite a freshly-logged-in token.
-/// Instead, every run starts from the host's current token and discards
-/// any refreshed copy on exit.
+/// All concurrent agent-container processes on this host see the same
+/// `auth.json`, so a token refresh in one container is observable by
+/// the others via the bind-mounted shared file. The host copy is
+/// updated only when the last container exits.
 pub fn prepare_auth(host_home: &Path) -> Result<CodexAuthFile> {
     let src = host_home.join(".codex/auth.json");
-    let raw = fs::read_to_string(&src).with_context(|| {
-        format!(
-            "failed to read Codex auth at {}; run `codex login` on the host first",
-            src.display()
-        )
+    let shared_path = shared_dir()?.join("codex-auth.json");
+    let host_sync = HostSync::File(src.clone());
+    let (shared, _raw) = SharedCredFile::open(shared_path, host_sync, move || {
+        fs::read_to_string(&src).with_context(|| {
+            format!(
+                "failed to read Codex auth at {}; run `codex login` on the host first",
+                src.display()
+            )
+        })
     })?;
-
-    let dir = std::env::temp_dir().join("agent-container");
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to prepare temp dir at {}", dir.display()))?;
-    let path = dir.join(format!("codex-auth-{}.json", std::process::id()));
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("failed to create codex auth file at {}", path.display()))?;
-    file.write_all(raw.as_bytes())
-        .context("failed to write codex auth file")?;
-    file.flush().ok();
-
-    Ok(CodexAuthFile { path, cleanup: true })
+    Ok(CodexAuthFile {
+        path: shared.path.clone(),
+        _shared: shared,
+    })
 }
 
 /// Top-level scalar keys we inherit from the host's `~/.codex/config.toml`

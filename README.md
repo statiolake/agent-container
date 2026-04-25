@@ -32,8 +32,11 @@ shrinks the blast radius to "whatever is in the current workspace":
 ┌──────── host ──────────────────────────────────────────────────┐
 │                                                                │
 │  agent-container CLI (Rust)                                    │
-│   ├─ extracts auth (Keychain / ~/.codex/auth.json) to a 0600   │
-│   │   temp file, deleted on exit                               │
+│   ├─ materialises auth (Keychain / ~/.codex/auth.json) into a  │
+│   │   0600 file under $XDG_DATA/agent-container/shared/,       │
+│   │   shared by every concurrent container via flock —         │
+│   │   the last container out writes refreshed tokens back to   │
+│   │   the host and unlinks the shared copy                     │
 │   ├─ spawns a broker HTTP server on 127.0.0.1:<random>         │
 │   │   serving /aws/credentials + /mcp/<name>/...               │
 │   └─ runs `docker compose -p agent-container-<pid>` with:      │
@@ -247,6 +250,16 @@ state do not recur.
   get the right ownership). The in-container bash has no matching entry
   in `/etc/passwd`, so interactive shells greet you with `I have no
   name!`. Cosmetic only.
+- OAuth refresh-token rotation is unavoidable: if you run the host's
+  Claude Code (or Codex) at the same time as a container, both sides
+  carry an independent copy of the same refresh token, and whichever
+  refreshes first invalidates the other. Concurrent containers on the
+  same host avoid this by sharing one credential file under
+  `$XDG_DATA/agent-container/shared/` (a `flock` decides which process
+  writes the refreshed token back to the Keychain / `~/.codex/auth.json`
+  on exit), but host-and-container parallel use is not protected — when
+  it happens, re-running `claude /login` or `codex login` on the host
+  is the recovery path.
 
 ## License
 

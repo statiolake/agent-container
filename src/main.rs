@@ -12,6 +12,7 @@ mod policy;
 mod proxy_allowlist;
 mod server;
 mod settings;
+mod shared_cred;
 mod stdio_mcp;
 mod sync;
 mod task_runner;
