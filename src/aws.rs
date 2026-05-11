@@ -118,16 +118,30 @@ fn read_refresh_from(path: &Path) -> Result<Option<String>> {
         .filter(|s| !s.is_empty()))
 }
 
-/// Invoke `aws configure export-credentials` on the host; works uniformly
-/// for static keys, SSO sessions, and assume-role profiles. If the first
-/// attempt fails and `refresh` is provided, the refresh command is run
-/// (stdio inherited so SSO prompts are visible) and the resolution is
-/// retried once.
+/// Resolve credentials for the configured profile.
+///
+/// Claude Code's `awsCredentialExport` hook treats `SessionToken` as
+/// effectively mandatory — long-term IAM user keys (no SessionToken)
+/// produce an opaque hang in the container where the agent falls through
+/// to its Anthropic-API code path instead of using Bedrock. To make every
+/// profile shape look the same on the wire we:
+///
+/// 1. Call `aws configure export-credentials --format process` to read
+///    whatever creds the profile resolves to. This handles SSO and
+///    assume-role uniformly and surfaces an SSO-login error if needed.
+/// 2. If the resulting creds already carry a `SessionToken` (SSO,
+///    assume-role, MFA, …) we return them as-is.
+/// 3. Otherwise (static IAM user keys) we upgrade them in place to a
+///    short-term session via `aws sts get-session-token --profile P`.
+///
+/// If the first attempt fails and `refresh` is provided, the refresh
+/// command is run (stdio inherited so SSO prompts are visible) and the
+/// resolution is retried once.
 pub fn resolve_credentials(
     setup: &BedrockSetup,
     refresh: Option<&str>,
 ) -> Result<BedrockCredentials> {
-    match try_export(setup) {
+    match try_resolve(setup) {
         Ok(c) => Ok(c),
         Err(first_err) => {
             let Some(cmd) = refresh else {
@@ -138,13 +152,23 @@ pub fn resolve_credentials(
             );
             run_refresh(cmd)
                 .context("awsAuthRefresh command failed; the original credential resolution error still stands")?;
-            try_export(setup).with_context(|| {
+            try_resolve(setup).with_context(|| {
                 format!(
                     "credential resolution still failed after awsAuthRefresh (original error: {first_err:#})"
                 )
             })
         }
     }
+}
+
+fn try_resolve(setup: &BedrockSetup) -> Result<BedrockCredentials> {
+    let exported = try_export(setup)?;
+    if exported.session_token.is_some() {
+        return Ok(exported);
+    }
+    // Long-term IAM user creds — Claude Code's hook does not accept these
+    // for Bedrock, so trade them in for a short-term session.
+    upgrade_to_session_token(setup)
 }
 
 fn try_export(setup: &BedrockSetup) -> Result<BedrockCredentials> {
@@ -187,6 +211,56 @@ fn try_export(setup: &BedrockSetup) -> Result<BedrockCredentials> {
         access_key_id: parsed.access_key_id,
         secret_access_key: parsed.secret_access_key,
         session_token: parsed.session_token,
+    })
+}
+
+/// Trade long-term IAM user keys for short-term creds via STS
+/// `GetSessionToken`. The resulting creds carry a `SessionToken`, which
+/// is what makes Claude Code's `awsCredentialExport` happy.
+fn upgrade_to_session_token(setup: &BedrockSetup) -> Result<BedrockCredentials> {
+    let output = Command::new("aws")
+        .args([
+            "sts",
+            "get-session-token",
+            "--profile",
+            &setup.profile,
+            "--output",
+            "json",
+        ])
+        .output()
+        .context("failed to invoke `aws sts get-session-token`")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        bail!(
+            "`aws sts get-session-token --profile {}` failed (the profile resolves to long-term IAM user keys, which Claude Code's Bedrock hook does not accept; we tried to mint a short-lived session and the call was rejected).\n{}",
+            setup.profile,
+            stderr
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct StsCreds {
+        #[serde(rename = "AccessKeyId")]
+        access_key_id: String,
+        #[serde(rename = "SecretAccessKey")]
+        secret_access_key: String,
+        #[serde(rename = "SessionToken")]
+        session_token: String,
+    }
+    #[derive(Deserialize)]
+    struct Wrapper {
+        #[serde(rename = "Credentials")]
+        credentials: StsCreds,
+    }
+
+    let wrapped: Wrapper = serde_json::from_slice(&output.stdout)
+        .context("failed to parse `aws sts get-session-token` JSON")?;
+
+    Ok(BedrockCredentials {
+        access_key_id: wrapped.credentials.access_key_id,
+        secret_access_key: wrapped.credentials.secret_access_key,
+        session_token: Some(wrapped.credentials.session_token),
     })
 }
 
