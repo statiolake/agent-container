@@ -59,7 +59,10 @@ const COMMON_STRIP: &[&str] = &[
 
 pub struct SyncOptions<'a> {
     pub bedrock: Option<&'a crate::aws::BedrockSetup>,
-    /// `http://host.docker.internal:<broker port>` as seen from the container.
+    /// `http://<engine-specific host>:<broker port>` as seen from the
+    /// container. The hostname is chosen by `host_kind::HostKind` at
+    /// startup — `host.docker.internal` on Docker Desktop and native
+    /// Linux Docker, `host.lima.internal` on Rancher Desktop.
     pub broker_url_from_container: &'a str,
     pub mcp_servers: &'a [McpServer],
     /// When true, inject an `mcpServers.task-runner` entry pointing at
@@ -319,15 +322,19 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
 
 /// Build the `awsCredentialExport` shell command for the container.
 ///
-/// Two things to notice:
+/// Three things to notice:
 /// - The broker URL is interpolated at sync time rather than referencing
 ///   `$AGENT_CONTAINER_HOST_ENDPOINT`, because Claude Code may spawn the
 ///   hook without a shell that expands env vars.
 /// - `-x http://proxy:8888` forces the curl through the compose
 ///   `proxy` service. The agent container is on a `--internal` network
-///   and has no `extra_hosts`, so `host.docker.internal` only resolves
+///   and has no `extra_hosts`, so the broker host only resolves
 ///   (and routes) when we go via the proxy. We cannot rely on
 ///   `HTTP_PROXY` being inherited by the hook subprocess.
+/// - The hostname inside `broker_url` is not always `host.docker.internal`
+///   — it depends on which Docker engine is hosting us (see
+///   `host_kind::HostKind`). Rancher Desktop, for instance, gets
+///   `host.lima.internal`.
 fn aws_credential_export_command(broker_url: &str) -> String {
     format!(
         "curl -fsS --max-time 15 -x http://proxy:8888 {}/aws/credentials",

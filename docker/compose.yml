@@ -5,8 +5,15 @@ services:
       - jail
       - egress
     extra_hosts:
-      # Needed so the forward proxy can route the container's refresh
-      # script back to the Rust broker on the host.
+      # Solely for native Linux Docker. On Docker Desktop and Rancher
+      # Desktop `host.docker.internal` is already injected into the
+      # container's resolver by the engine itself, so this entry is
+      # redundant (Docker Desktop: also routes correctly; Rancher Desktop:
+      # routes wrong, but we don't rely on it — see host_kind.rs, which
+      # makes the CLI hand the container a `host.lima.internal` URL
+      # instead). On native Linux Docker `host.docker.internal` is not
+      # defined at all, and `host-gateway` resolves it to the docker
+      # bridge gateway — the host as seen from the container.
       - "host.docker.internal:host-gateway"
     volumes:
       - "${ALLOWLIST_PATH}:/etc/tinyproxy/allowlist.txt:ro"

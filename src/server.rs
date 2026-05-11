@@ -65,6 +65,16 @@ pub async fn spawn(
     oauth: Arc<OAuthStore>,
     stdio_bridge: Option<PathBridge>,
 ) -> Result<RunningServer> {
+    // Loopback bind is load-bearing for the security model: this broker
+    // hands out fresh AWS Bedrock credentials and proxies authenticated
+    // MCP traffic, and nothing about the protocol authenticates the
+    // caller. Binding to `0.0.0.0` would expose those endpoints to the
+    // host's LAN — a co-worker on the same Wi-Fi could pull session
+    // tokens off the wire. The container reaches this listener via an
+    // engine-specific hostname (see `host_kind::HostKind`) that tunnels
+    // *only* through the per-engine VM/bridge plumbing into host
+    // loopback, so 127.0.0.1 is sufficient for reachability while
+    // keeping the LAN out.
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("failed to bind broker listener")?;

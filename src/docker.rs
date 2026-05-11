@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -61,7 +60,11 @@ pub struct RunOptions {
     pub credentials_path: PathBuf,
     pub codex_auth_path: PathBuf,
     pub bedrock_setup: Option<BedrockSetup>,
-    pub broker_addr: SocketAddr,
+    /// Pre-built `http://<host>:<port>` URL the container should use to
+    /// reach the broker. The hostname encodes the engine-flavour choice
+    /// (Docker Desktop, Rancher Desktop, native Linux) made up-front by
+    /// `host_kind::HostKind`; everything downstream just reads it.
+    pub broker_url_from_container: String,
     /// The command to invoke inside the container, e.g.
     /// `["claude", "--dangerously-skip-permissions"]` or `["codex"]`.
     pub agent_command: Vec<String>,
@@ -138,9 +141,12 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
 
     // Point the container at the host broker so the in-container refresh
     // script can fetch fresh AWS credentials on demand through the proxy.
+    // The URL's hostname is picked per-engine (see `host_kind::HostKind`)
+    // because `host.docker.internal` doesn't reach the host's loopback on
+    // every flavour (Rancher Desktop in particular).
     env.insert(
         "AGENT_CONTAINER_HOST_ENDPOINT".to_string(),
-        format!("http://host.docker.internal:{}", opts.broker_addr.port()),
+        opts.broker_url_from_container.clone(),
     );
 
     // Forward the host terminal description so in-container TUIs choose

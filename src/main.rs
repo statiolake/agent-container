@@ -4,6 +4,7 @@ mod codex;
 mod config_cmd;
 mod creds;
 mod docker;
+mod host_kind;
 mod mcp;
 mod mcp_client;
 mod oauth;
@@ -216,8 +217,14 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
     )
     .await?;
     tracing::info!(addr = %broker.addr, "host broker listening");
-    let broker_url_from_container =
-        format!("http://host.docker.internal:{}", broker.addr.port());
+    let host_kind = host_kind::HostKind::detect()
+        .context("failed to detect Docker engine flavour for broker hostname")?;
+    let broker_url_from_container = format!(
+        "http://{}:{}",
+        host_kind.broker_host_name(),
+        broker.addr.port()
+    );
+    tracing::info!(?host_kind, broker_url = %broker_url_from_container, "broker URL for container");
 
     sync::sync_host_state(
         &host,
@@ -255,7 +262,7 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
         credentials_path,
         codex_auth_path,
         bedrock_setup: bedrock,
-        broker_addr: broker.addr,
+        broker_url_from_container,
         agent_command,
         extra_args: passthrough,
         proxy_allow,
@@ -325,8 +332,13 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
         Some(stdio_bridge),
     )
     .await?;
-    let broker_url_from_container =
-        format!("http://host.docker.internal:{}", broker.addr.port());
+    let host_kind = host_kind::HostKind::detect()
+        .context("failed to detect Docker engine flavour for broker hostname")?;
+    let broker_url_from_container = format!(
+        "http://{}:{}",
+        host_kind.broker_host_name(),
+        broker.addr.port()
+    );
 
     sync::sync_host_state(
         &host,
@@ -365,7 +377,7 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
         credentials_path,
         codex_auth_path,
         bedrock_setup: bedrock,
-        broker_addr: broker.addr,
+        broker_url_from_container,
         agent_command,
         extra_args: Vec::new(),
         proxy_allow,

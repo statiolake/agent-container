@@ -26,8 +26,13 @@ use directories::ProjectDirs;
 /// install paths; users with publish credentials on those same hosts
 /// should be aware of the residual risk.
 pub const DEFAULT_ALLOW_ENTRIES: &[&str] = &[
-    // agent-container host broker (fresh AWS creds, MCP proxy)
+    // agent-container host broker (fresh AWS creds, MCP proxy). Two
+    // hostnames because the broker URL handed to the container varies
+    // by Docker engine flavour — Docker Desktop / native Linux Docker
+    // use `host.docker.internal`, Rancher Desktop uses
+    // `host.lima.internal`. See `host_kind::HostKind`.
     r"^host\.docker\.internal$",
+    r"^host\.lima\.internal$",
     // Claude / Anthropic
     r"^api\.anthropic\.com$",
     r"^statsig\.anthropic\.com$",
