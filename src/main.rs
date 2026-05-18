@@ -100,6 +100,8 @@ fn default_log_path() -> Option<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
     let (_log_guard, log_path) = init_tracing();
     if let Some(p) = &log_path {
         eprintln!(
@@ -108,7 +110,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    let cli = Cli::parse();
     match cli.command {
         Commands::Run { agent, passthrough } => run_cmd(agent, passthrough).await,
         Commands::Shell { passthrough } => shell_cmd(passthrough).await,
