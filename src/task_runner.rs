@@ -107,17 +107,11 @@ impl TaskRunner {
                 json!({
                     "name": name,
                     "description": format!(
-                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. Extra positional arguments may be passed via the reserved `args` array."
+                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`."
                     ),
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "args": {
-                                "type": "array",
-                                "items": { "type": "string" },
-                                "description": "Extra positional arguments appended to the configured command line."
-                            }
-                        },
+                        "properties": {},
                         "additionalProperties": {
                             "oneOf": [
                                 { "type": "string" },
@@ -160,7 +154,7 @@ impl TaskRunner {
         };
 
         let env_keys: Vec<_> = invocation.env.keys().cloned().collect();
-        tracing::info!(task = %name, command = %command, extra_args = ?invocation.extra_args, env_keys = ?env_keys, "task-runner dispatching");
+        tracing::info!(task = %name, command = %command, env_keys = ?env_keys, "task-runner dispatching");
         match run_command(command, &invocation).await {
             Ok(output) => {
                 let text = format_output(&output);
@@ -179,7 +173,6 @@ impl TaskRunner {
 
 #[derive(Debug, Default)]
 struct CmdInvocation {
-    extra_args: Vec<String>,
     env: BTreeMap<String, String>,
 }
 
@@ -200,19 +193,6 @@ fn parse_invocation(arguments: Option<&Value>) -> std::result::Result<CmdInvocat
     };
 
     for (key, value) in arguments {
-        if key == "args" {
-            let Some(args) = value.as_array() else {
-                return Err("`args` must be an array of strings".to_string());
-            };
-            for arg in args {
-                let Some(arg) = arg.as_str() else {
-                    return Err("`args` must be an array of strings".to_string());
-                };
-                invocation.extra_args.push(arg.to_string());
-            }
-            continue;
-        }
-
         if !is_valid_env_key(key) {
             return Err(format!(
                 "argument key `{key}` is not a valid environment variable name"
@@ -244,14 +224,9 @@ fn is_valid_env_key(key: &str) -> bool {
 async fn run_command(command: &str, invocation: &CmdInvocation) -> Result<CmdOutput> {
     // Wrap the user's command line in `sh -c` so pipes, quoting, and env
     // expansions behave the way the operator expects when they typed it.
-    // Extra positional arguments come in via `"$@"` so the shell quotes
-    // each one verbatim regardless of whitespace.
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(format!("{command} \"$@\"")).arg("--");
+    cmd.arg("-c").arg(command);
     cmd.envs(&invocation.env);
-    for a in &invocation.extra_args {
-        cmd.arg(a);
-    }
     let out = cmd.output().await.context("failed to spawn command")?;
     Ok(CmdOutput {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -400,18 +375,6 @@ mod tests {
                 .unwrap()
                 .contains("unknown task 'nope'")
         );
-    }
-
-    #[tokio::test]
-    async fn extra_args_are_appended_to_command() {
-        let mut tasks = BTreeMap::new();
-        tasks.insert("sh-echo".into(), "printf '%s\\n'".into());
-        let r = TaskRunner::new(tasks);
-        let req = br#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"sh-echo","arguments":{"args":["one","two three"]}}}"#;
-        let resp = r.handle(req).await.unwrap();
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("one"));
-        assert!(text.contains("two three"));
     }
 
     #[tokio::test]

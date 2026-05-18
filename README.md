@@ -250,8 +250,7 @@ inside the container.
 
 Task tool arguments are passed to the host command as environment variables.
 For example, a task command containing `$value` can be called with a MCP
-argument named `value`, and the shell will expand it before execution. The
-reserved `args` array is still appended as positional arguments.
+argument named `value`, and the shell will expand it before execution.
 
 ## Known limitations
 
