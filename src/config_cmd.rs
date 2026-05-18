@@ -11,6 +11,7 @@
 //! the workspace is the usual place to pin project-specific overrides.
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -23,6 +24,10 @@ use crate::paths::HostPaths;
 use crate::policy::McpPolicy;
 use crate::settings::{self, Scope, Settings};
 use crate::tui::{self, Outcome, ToolEntry, TuiInput};
+
+pub fn stdio_is_interactive() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
 
 /// Resolve scope flags to a concrete [`Scope`], defaulting to workspace.
 /// The flags are already mutually exclusive at the clap layer.

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use crate::cli::{AgentKind, Cli, Commands, ConfigCommands};
 
@@ -101,6 +101,10 @@ fn default_log_path() -> Option<PathBuf> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if should_explain_config_instead_of_tui(&cli) {
+        print_config_non_interactive_help()?;
+        return Ok(());
+    }
 
     let (_log_guard, log_path) = init_tracing();
     if let Some(p) = &log_path {
@@ -142,6 +146,33 @@ async fn dispatch_config(
             }
         }
     }
+}
+
+fn should_explain_config_instead_of_tui(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Config {
+            command: None,
+            editor: false,
+            ..
+        } if !config_cmd::stdio_is_interactive()
+    )
+}
+
+fn print_config_non_interactive_help() -> Result<()> {
+    eprintln!(
+        "agent-container config opens an interactive TUI, but stdin/stdout is not a TTY.\n\
+         Use `agent-container config --editor` to edit a settings file, or `agent-container config show` to print TOML.\n"
+    );
+
+    let mut cmd = Cli::command();
+    let Some(config_cmd) = cmd.find_subcommand_mut("config") else {
+        return Ok(());
+    };
+    config_cmd.set_bin_name("agent-container config");
+    config_cmd.print_long_help()?;
+    println!();
+    Ok(())
 }
 
 async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
