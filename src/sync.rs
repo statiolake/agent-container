@@ -10,12 +10,10 @@
 //! - `~/.claude/settings.json` — user-level settings, copied as-is.
 //! - `~/.claude/skills/`, `~/.claude/commands/`, `~/.claude/agents/` — user-
 //!   authored extensions (custom skills, slash commands, subagents).
-//! - `~/.claude/plugins/` — plugin-provided skills, slash commands, and
-//!   subagents. Copied verbatim (including `hooks/`, `scripts/`, `.git/`
-//!   inside each plugin) because Claude Code re-syncs marketplaces via
-//!   `git` on start anyway if they look stale, so pruning subtrees only
-//!   thrashes. Hooks declared inside plugins are dormant until a plugin
-//!   is explicitly installed, and nothing gets installed automatically.
+//! - Plugin-provided `skills/` and `commands/` are flattened into the same
+//!   top-level extension directories. The plugin marketplace/cache tree
+//!   itself is not copied, because Claude Code treats that tree as managed
+//!   marketplace state and may try to refresh it over the network.
 //!
 //! Not copied: user-level hooks, the raw MCP configuration, other projects,
 //! or anything under `~/.claude/` not listed above.
@@ -87,8 +85,7 @@ pub fn sync_host_state(host: &HostPaths, opts: SyncOptions<'_>) -> Result<()> {
 
     sync_claude_json(host, &opts).context("failed to sync .claude.json")?;
     sync_settings_json(host, &opts).context("failed to sync .claude/settings.json")?;
-    sync_user_extensions(host).context("failed to sync user skills/commands/agents")?;
-    sync_plugin_marketplaces(host).context("failed to sync plugin marketplaces")?;
+    sync_claude_extensions(host).context("failed to sync Claude skills/commands/agents")?;
     sync_git_identity(host).context("failed to sync git identity")?;
     Ok(())
 }
@@ -246,11 +243,7 @@ fn build_proxy_mcp_map(
             entry.insert("type".into(), Value::String("http".into()));
             entry.insert(
                 "url".into(),
-                Value::String(format!(
-                    "{}/mcp/{}",
-                    broker_url.trim_end_matches('/'),
-                    name
-                )),
+                Value::String(format!("{}/mcp/{}", broker_url.trim_end_matches('/'), name)),
             );
             map.insert(name.to_string(), Value::Object(entry));
         }
@@ -315,8 +308,7 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
     fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join("settings.json");
     let pretty = serde_json::to_string_pretty(&settings)?;
-    fs::write(&dest, pretty)
-        .with_context(|| format!("failed to write {}", dest.display()))?;
+    fs::write(&dest, pretty).with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
 }
 
@@ -348,40 +340,110 @@ fn strip_keys(obj: &mut serde_json::Map<String, Value>) {
     }
 }
 
-fn sync_user_extensions(host: &HostPaths) -> Result<()> {
-    // Custom user skills / slash commands / subagents live under these
-    // directories. They're markdown data; mirror them verbatim.
-    for name in ["skills", "commands", "agents"] {
+fn sync_claude_extensions(host: &HostPaths) -> Result<()> {
+    // User-authored extensions keep their native top-level shape. Plugin
+    // marketplaces are a different ownership model: Claude Code manages
+    // them as remote state, so the container receives only their portable
+    // skills/commands payloads merged into the top-level extension dirs.
+    for name in ["skills", "commands"] {
         let src = host.claude_root.join(name);
         let dest = host.container_home.join(".claude").join(name);
         mirror_or_clear(&src, &dest)?;
+        merge_plugin_extension_dirs(host, name)
+            .with_context(|| format!("failed to merge plugin {name}"))?;
     }
-    Ok(())
-}
 
-fn sync_plugin_marketplaces(host: &HostPaths) -> Result<()> {
-    // Mirror the entire host plugins tree — marketplaces, cache, installed
-    // manifest, everything. Trying to prune hooks/scripts inside plugin
-    // dirs is pointless because Claude Code re-syncs marketplaces via git
-    // whenever the copy looks incomplete; those files come back every
-    // run. Plugin-internal hooks stay dormant until a plugin is installed
-    // via `installed_plugins.json`, which we do not do automatically.
-    let src = host.claude_root.join("plugins");
-    let dest = host.container_home.join(".claude").join("plugins");
-    mirror_or_clear(&src, &dest)
+    let src = host.claude_root.join("agents");
+    let dest = host.container_home.join(".claude").join("agents");
+    mirror_or_clear(&src, &dest)?;
+
+    // Remove stale copies from older agent-container versions. Leaving this
+    // tree in persistent home reintroduces marketplace refresh behavior.
+    let plugin_dest = host.container_home.join(".claude").join("plugins");
+    clear_path(&plugin_dest)?;
+    Ok(())
 }
 
 /// Mirror `src` → `dest`, wiping any pre-existing container copy first.
 fn mirror_or_clear(src: &Path, dest: &Path) -> Result<()> {
-    if dest.is_dir() {
-        fs::remove_dir_all(dest)
-            .with_context(|| format!("failed to clear {}", dest.display()))?;
-    }
+    clear_path(dest)?;
     if !src.is_dir() {
         return Ok(());
     }
     copy_dir_recursive(src, dest)
         .with_context(|| format!("failed to copy {} to {}", src.display(), dest.display()))?;
+    Ok(())
+}
+
+fn merge_plugin_extension_dirs(host: &HostPaths, name: &str) -> Result<()> {
+    let plugin_root = host.claude_root.join("plugins");
+    let mut extension_dirs = Vec::new();
+    collect_extension_dirs(&plugin_root, name, &mut extension_dirs)?;
+    extension_dirs.sort();
+
+    let dest = host.container_home.join(".claude").join(name);
+    for src in extension_dirs {
+        copy_children_without_overwrite(&src, &dest)?;
+    }
+    Ok(())
+}
+
+fn collect_extension_dirs(
+    root: &Path,
+    name: &str,
+    out: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+
+    let mut entries = fs::read_dir(root)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_name() == name {
+            out.push(path);
+            continue;
+        }
+        collect_extension_dirs(&path, name, out)?;
+    }
+    Ok(())
+}
+
+fn copy_children_without_overwrite(src: &Path, dest: &Path) -> Result<()> {
+    let mut entries = fs::read_dir(src)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    if entries.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(dest)?;
+
+    for entry in entries {
+        let target = dest.join(entry.file_name());
+        if target.exists() {
+            eprintln!(
+                "[agent-container] warning: skipping plugin extension {} because {} already exists",
+                entry.path().display(),
+                target.display()
+            );
+            continue;
+        }
+        copy_entry(&entry.path(), &target, entry.file_type()?)?;
+    }
+    Ok(())
+}
+
+fn clear_path(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path).with_context(|| format!("failed to clear {}", path.display()))?;
+    } else if path.exists() {
+        fs::remove_file(path).with_context(|| format!("failed to clear {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -392,15 +454,20 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
         let file_type = entry.file_type()?;
         let path = entry.path();
         let target = dest.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_recursive(&path, &target)?;
-        } else if file_type.is_symlink() {
-            let link_target = fs::read_link(&path)?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(link_target, &target)?;
-        } else {
-            fs::copy(&path, &target)?;
-        }
+        copy_entry(&path, &target, file_type)?;
+    }
+    Ok(())
+}
+
+fn copy_entry(src: &Path, dest: &Path, file_type: fs::FileType) -> Result<()> {
+    if file_type.is_dir() {
+        copy_dir_recursive(src, dest)?;
+    } else if file_type.is_symlink() {
+        let link_target = fs::read_link(src)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(link_target, dest)?;
+    } else {
+        fs::copy(src, dest)?;
     }
     Ok(())
 }
@@ -473,10 +540,7 @@ mod tests {
         )
         .unwrap();
         for key in ["mcpServers", "env", "hooks", "permissions", "sandbox"] {
-            assert!(
-                out.get(key).is_none(),
-                "top-level {key} must be removed"
-            );
+            assert!(out.get(key).is_none(), "top-level {key} must be removed");
         }
         assert_eq!(out["hasCompletedOnboarding"], serde_json::json!(true));
         let projects = out["projects"].as_object().unwrap();
@@ -528,7 +592,10 @@ mod tests {
             &fs::read_to_string(container_home.path().join(".claude.json")).unwrap(),
         )
         .unwrap();
-        assert!(out.get("awsAuthRefresh").is_none(), "awsAuthRefresh must be cleared");
+        assert!(
+            out.get("awsAuthRefresh").is_none(),
+            "awsAuthRefresh must be cleared"
+        );
         let export = out["awsCredentialExport"].as_str().unwrap();
         assert!(
             export.contains("http://host.docker.internal:0/aws/credentials"),
@@ -749,6 +816,98 @@ mod tests {
     }
 
     #[test]
+    fn claude_extensions_flatten_plugin_skills_and_commands_without_plugins_tree() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = tmp_home.path().join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let claude_root = tmp_home.path().join(".claude");
+        fs::create_dir_all(claude_root.join("skills/user-skill")).unwrap();
+        fs::write(claude_root.join("skills/user-skill/SKILL.md"), "user skill").unwrap();
+        fs::create_dir_all(claude_root.join("commands")).unwrap();
+        fs::write(claude_root.join("commands/user.md"), "user command").unwrap();
+        fs::create_dir_all(claude_root.join("agents")).unwrap();
+        fs::write(claude_root.join("agents/helper.md"), "agent").unwrap();
+
+        let plugin_root = claude_root.join("plugins/cache/vendor/plugin-a");
+        fs::create_dir_all(plugin_root.join("skills/plugin-skill")).unwrap();
+        fs::write(
+            plugin_root.join("skills/plugin-skill/SKILL.md"),
+            "plugin skill",
+        )
+        .unwrap();
+        fs::create_dir_all(plugin_root.join("commands")).unwrap();
+        fs::write(plugin_root.join("commands/plugin.md"), "plugin command").unwrap();
+
+        let stale_plugins = container_home.path().join(".claude/plugins/cache/stale");
+        fs::create_dir_all(&stale_plugins).unwrap();
+        fs::write(stale_plugins.join("manifest.json"), "{}").unwrap();
+
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root,
+            workspace,
+            container_home: container_home.path().to_path_buf(),
+        };
+        sync_claude_extensions(&host).unwrap();
+
+        let out_root = container_home.path().join(".claude");
+        assert_eq!(
+            fs::read_to_string(out_root.join("skills/user-skill/SKILL.md")).unwrap(),
+            "user skill"
+        );
+        assert_eq!(
+            fs::read_to_string(out_root.join("skills/plugin-skill/SKILL.md")).unwrap(),
+            "plugin skill"
+        );
+        assert_eq!(
+            fs::read_to_string(out_root.join("commands/user.md")).unwrap(),
+            "user command"
+        );
+        assert_eq!(
+            fs::read_to_string(out_root.join("commands/plugin.md")).unwrap(),
+            "plugin command"
+        );
+        assert_eq!(
+            fs::read_to_string(out_root.join("agents/helper.md")).unwrap(),
+            "agent"
+        );
+        assert!(
+            !out_root.join("plugins").exists(),
+            "plugin marketplace/cache tree must not be copied"
+        );
+    }
+
+    #[test]
+    fn user_extensions_win_when_plugin_names_collide() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = tmp_home.path().join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let claude_root = tmp_home.path().join(".claude");
+        fs::create_dir_all(claude_root.join("skills/shared")).unwrap();
+        fs::write(claude_root.join("skills/shared/SKILL.md"), "user").unwrap();
+
+        let plugin_root = claude_root.join("plugins/cache/vendor/plugin-a");
+        fs::create_dir_all(plugin_root.join("skills/shared")).unwrap();
+        fs::write(plugin_root.join("skills/shared/SKILL.md"), "plugin").unwrap();
+
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root,
+            workspace,
+            container_home: container_home.path().to_path_buf(),
+        };
+        sync_claude_extensions(&host).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(container_home.path().join(".claude/skills/shared/SKILL.md"))
+                .unwrap(),
+            "user"
+        );
+    }
+
+    #[test]
     fn gitconfig_written_when_both_values_present() {
         let container_home = tempfile::tempdir().unwrap();
         write_container_gitconfig(
@@ -768,8 +927,7 @@ mod tests {
         let dest = container_home.path().join(".gitconfig");
         fs::write(&dest, "[user]\n\tname = stale\n").unwrap();
 
-        write_container_gitconfig(container_home.path(), None, Some("only@example.com"))
-            .unwrap();
+        write_container_gitconfig(container_home.path(), None, Some("only@example.com")).unwrap();
         assert!(!dest.exists(), "stale gitconfig should be removed");
     }
 }

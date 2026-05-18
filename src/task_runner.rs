@@ -1,7 +1,9 @@
 //! Built-in MCP server that executes user-defined shell commands on the
 //! host. Each entry in `settings.toml`'s `[task_runner.tasks]` table
 //! becomes a tool; the model can call them via `tools/call` and receives
-//! the combined stdout/stderr plus exit code.
+//! the combined stdout/stderr plus exit code. Tool arguments are passed
+//! through as environment variables, so a configured command can use
+//! shell expansion such as `$value`.
 //!
 //! The broker serves this entirely in-process — there is no upstream
 //! process to forward to — so it implements just enough of the MCP
@@ -105,7 +107,7 @@ impl TaskRunner {
                 json!({
                     "name": name,
                     "description": format!(
-                        "Run on host: `{cmd}`. Pass extra arguments via the `args` array."
+                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. Extra positional arguments may be passed via the reserved `args` array."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -116,7 +118,14 @@ impl TaskRunner {
                                 "description": "Extra positional arguments appended to the configured command line."
                             }
                         },
-                        "additionalProperties": false
+                        "additionalProperties": {
+                            "oneOf": [
+                                { "type": "string" },
+                                { "type": "number" },
+                                { "type": "boolean" }
+                            ],
+                            "description": "Named value passed to the host command as an environment variable with the same key."
+                        }
                     },
                     // The command is arbitrary shell — never read-only by default.
                     "annotations": { "readOnlyHint": false }
@@ -132,19 +141,14 @@ impl TaskRunner {
             .and_then(|p| p.get("name"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        let extra_args: Vec<String> = params
-            .and_then(|p| p.get("arguments"))
-            .and_then(|a| a.get("args"))
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let arguments = params.and_then(|p| p.get("arguments"));
 
         let Some(name) = name else {
             return invalid_params(id, "tools/call missing `params.name`");
+        };
+        let invocation = match parse_invocation(arguments) {
+            Ok(invocation) => invocation,
+            Err(msg) => return invalid_params(id, &msg),
         };
         let Some(command) = self.tasks.get(&name) else {
             return tool_error(
@@ -155,8 +159,9 @@ impl TaskRunner {
             );
         };
 
-        tracing::info!(task = %name, command = %command, extra_args = ?extra_args, "task-runner dispatching");
-        match run_command(command, &extra_args).await {
+        let env_keys: Vec<_> = invocation.env.keys().cloned().collect();
+        tracing::info!(task = %name, command = %command, extra_args = ?invocation.extra_args, env_keys = ?env_keys, "task-runner dispatching");
+        match run_command(command, &invocation).await {
             Ok(output) => {
                 let text = format_output(&output);
                 success(
@@ -172,6 +177,12 @@ impl TaskRunner {
     }
 }
 
+#[derive(Debug, Default)]
+struct CmdInvocation {
+    extra_args: Vec<String>,
+    env: BTreeMap<String, String>,
+}
+
 struct CmdOutput {
     stdout: String,
     stderr: String,
@@ -179,14 +190,66 @@ struct CmdOutput {
     success: bool,
 }
 
-async fn run_command(command: &str, extra_args: &[String]) -> Result<CmdOutput> {
+fn parse_invocation(arguments: Option<&Value>) -> std::result::Result<CmdInvocation, String> {
+    let mut invocation = CmdInvocation::default();
+    let Some(arguments) = arguments else {
+        return Ok(invocation);
+    };
+    let Some(arguments) = arguments.as_object() else {
+        return Err("tools/call `params.arguments` must be an object".to_string());
+    };
+
+    for (key, value) in arguments {
+        if key == "args" {
+            let Some(args) = value.as_array() else {
+                return Err("`args` must be an array of strings".to_string());
+            };
+            for arg in args {
+                let Some(arg) = arg.as_str() else {
+                    return Err("`args` must be an array of strings".to_string());
+                };
+                invocation.extra_args.push(arg.to_string());
+            }
+            continue;
+        }
+
+        if !is_valid_env_key(key) {
+            return Err(format!(
+                "argument key `{key}` is not a valid environment variable name"
+            ));
+        }
+
+        let value = match value {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            _ => {
+                return Err(format!(
+                    "argument `{key}` must be a string, number, or boolean"
+                ));
+            }
+        };
+        invocation.env.insert(key.clone(), value);
+    }
+
+    Ok(invocation)
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+async fn run_command(command: &str, invocation: &CmdInvocation) -> Result<CmdOutput> {
     // Wrap the user's command line in `sh -c` so pipes, quoting, and env
     // expansions behave the way the operator expects when they typed it.
     // Extra positional arguments come in via `"$@"` so the shell quotes
     // each one verbatim regardless of whitespace.
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(format!("{command} \"$@\"")).arg("--");
-    for a in extra_args {
+    cmd.envs(&invocation.env);
+    for a in &invocation.extra_args {
         cmd.arg(a);
     }
     let out = cmd.output().await.context("failed to spawn command")?;
@@ -349,6 +412,35 @@ mod tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("one"));
         assert!(text.contains("two three"));
+    }
+
+    #[tokio::test]
+    async fn named_arguments_are_exposed_as_environment_variables() {
+        let mut tasks = BTreeMap::new();
+        tasks.insert(
+            "expand".into(),
+            "printf '%s/%s/%s\\n' \"$value\" \"$count\" \"$enabled\"".into(),
+        );
+        let r = TaskRunner::new(tasks);
+        let req = br#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"expand","arguments":{"value":"hello world","count":42,"enabled":true}}}"#;
+        let resp = r.handle(req).await.unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("hello world/42/true"));
+    }
+
+    #[tokio::test]
+    async fn invalid_environment_argument_key_is_rejected() {
+        let r = build();
+        let req = br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"echo","arguments":{"bad-key":"nope"}}}"#;
+        let resp = r.handle(req).await.unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not a valid environment variable name")
+        );
     }
 
     #[tokio::test]

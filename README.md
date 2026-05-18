@@ -224,9 +224,12 @@ container's persistent `$HOME` (kept at
   `sandbox` stripped. Every other project entry is dropped because
   their keys are host-absolute paths.
 - `~/.claude/settings.json` — same stripping.
-- `~/.claude/commands/`, `~/.claude/agents/`, `~/.claude/skills/`,
-  `~/.claude/plugins/` — mirrored verbatim so custom slash commands,
-  subagents, user-authored skills and marketplace plugins all work.
+- `~/.claude/commands/`, `~/.claude/agents/`, `~/.claude/skills/` —
+  user-authored slash commands, subagents and skills are mirrored.
+- Plugin-provided `commands/` and `skills/` are flattened into those same
+  top-level directories. The plugin marketplace/cache tree itself is not
+  copied, so Claude Code does not try to refresh marketplaces from inside
+  the container.
 - `~/.codex/config.toml` — only `model`, `model_reasoning_effort`,
   `personality`, plus pinned `approval_policy = "never"` and
   `sandbox_mode = "danger-full-access"` (the container is the sandbox;
@@ -235,6 +238,20 @@ container's persistent `$HOME` (kept at
 Everything else your agents need is left to the container itself. The
 persistent home survives across runs, so onboarding prompts and login
 state do not recur.
+
+## Host task runner
+
+Commands configured under `[task_runner.tasks]` are exposed to the agent as
+MCP tools named `mcp__task-runner__<task>`. They run on the host, not in the
+container, so agents should prefer them whenever a normal shell command
+would need host-side capabilities such as starting Docker containers,
+touching host-only files, or using network access that is unavailable from
+inside the container.
+
+Task tool arguments are passed to the host command as environment variables.
+For example, a task command containing `$value` can be called with a MCP
+argument named `value`, and the shell will expand it before execution. The
+reserved `args` array is still appended as positional arguments.
 
 ## Known limitations
 
