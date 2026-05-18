@@ -45,7 +45,10 @@ impl HostKind {
             .context("failed to invoke `docker info` — is Docker (or Rancher Desktop) running?")?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!("`docker info --format '{{{{.Name}}}}'` failed: {}", stderr.trim());
+            bail!(
+                "`docker info --format '{{{{.Name}}}}'` failed: {}",
+                stderr.trim()
+            );
         }
         let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
         Self::from_node_name(&name)
@@ -60,7 +63,9 @@ impl HostKind {
         match name {
             "docker-desktop" => Ok(Self::DockerDesktop),
             "lima-rancher-desktop" => Ok(Self::RancherDesktop),
-            "" => bail!("`docker info` returned an empty node name; cannot determine engine flavour"),
+            "" => {
+                bail!("`docker info` returned an empty node name; cannot determine engine flavour")
+            }
             _ => Ok(Self::NativeLinux),
         }
     }
@@ -123,8 +128,17 @@ mod tests {
     fn host_name_differs_only_for_rancher() {
         // Sanity: Docker Desktop and native Linux both use
         // `host.docker.internal`; only Rancher Desktop diverges.
-        assert_eq!(HostKind::DockerDesktop.broker_host_name(), "host.docker.internal");
-        assert_eq!(HostKind::NativeLinux.broker_host_name(), "host.docker.internal");
-        assert_eq!(HostKind::RancherDesktop.broker_host_name(), "host.lima.internal");
+        assert_eq!(
+            HostKind::DockerDesktop.broker_host_name(),
+            "host.docker.internal"
+        );
+        assert_eq!(
+            HostKind::NativeLinux.broker_host_name(),
+            "host.docker.internal"
+        );
+        assert_eq!(
+            HostKind::RancherDesktop.broker_host_name(),
+            "host.lima.internal"
+        );
     }
 }

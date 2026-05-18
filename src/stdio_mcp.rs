@@ -154,10 +154,7 @@ impl StdioHandle {
 /// Spawn the subprocess and its attendant reader/writer tasks. Failures
 /// here surface immediately so misconfigured servers don't cause late
 /// mysterious hangs.
-pub fn spawn_worker(
-    spec: StdioMcpServer,
-    bridge: Option<PathBridge>,
-) -> Result<StdioHandle> {
+pub fn spawn_worker(spec: StdioMcpServer, bridge: Option<PathBridge>) -> Result<StdioHandle> {
     let mut cmd = Command::new(&spec.command);
     cmd.args(&spec.args)
         .envs(spec.env.iter())
@@ -289,7 +286,10 @@ async fn reader_loop(
             }
         };
 
-        let method = value.get("method").and_then(Value::as_str).map(str::to_string);
+        let method = value
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let id = value.get("id").cloned();
 
         // Apply targeted host→container URI rewriting based on the
@@ -376,8 +376,12 @@ fn rewrite_known_uris(v: &mut Value, method: &str, dir: Direction, bridge: &Path
     let container_root = bridge.container_root.clone();
     let host_root = bridge.host_root.clone();
     let map_owned: Box<dyn Fn(&str) -> Option<String>> = match dir {
-        Direction::ClientToServer => Box::new(move |s: &str| rewrite_root(s, &container_root, &host_root)),
-        Direction::ServerToClient => Box::new(move |s: &str| rewrite_root(s, &host_root, &container_root)),
+        Direction::ClientToServer => {
+            Box::new(move |s: &str| rewrite_root(s, &container_root, &host_root))
+        }
+        Direction::ServerToClient => {
+            Box::new(move |s: &str| rewrite_root(s, &host_root, &container_root))
+        }
     };
 
     match (method, dir) {
@@ -514,10 +518,7 @@ mod tests {
         });
         rewrite_known_uris(&mut v, "roots/list", Direction::ClientToServer, &b);
         let roots = v["result"]["roots"].as_array().unwrap();
-        assert_eq!(
-            roots[0]["uri"].as_str(),
-            Some("file:///Users/test/project")
-        );
+        assert_eq!(roots[0]["uri"].as_str(), Some("file:///Users/test/project"));
         assert_eq!(
             roots[1]["uri"].as_str(),
             Some("file:///Users/test/project/nested")

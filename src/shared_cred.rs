@@ -73,9 +73,8 @@ impl SharedCredFile {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("failed to open lock at {}", lock_path.display()))?;
-        flock(&lock_file, FlockOperation::LockShared).with_context(|| {
-            format!("failed to take shared lock on {}", lock_path.display())
-        })?;
+        flock(&lock_file, FlockOperation::LockShared)
+            .with_context(|| format!("failed to take shared lock on {}", lock_path.display()))?;
 
         let raw = if shared_file_is_populated(&shared_path) {
             fs::read_to_string(&shared_path).with_context(|| {
@@ -107,10 +106,7 @@ fn shared_file_is_populated(p: &Path) -> bool {
 }
 
 fn lock_path_for(p: &Path) -> PathBuf {
-    let mut name = p
-        .file_name()
-        .map(|s| s.to_os_string())
-        .unwrap_or_default();
+    let mut name = p.file_name().map(|s| s.to_os_string()).unwrap_or_default();
     name.push(".lock");
     p.with_file_name(name)
 }
@@ -255,7 +251,10 @@ mod tests {
         }
 
         assert_eq!(fs::read_to_string(&dest).unwrap(), "refreshed");
-        assert!(!shared.exists(), "shared file should be removed on last exit");
+        assert!(
+            !shared.exists(),
+            "shared file should be removed on last exit"
+        );
         assert!(!lock.exists(), "lock file should be removed on last exit");
     }
 
@@ -280,11 +279,17 @@ mod tests {
         // and the shared file must stay so B keeps using it.
         drop(handle_a);
         assert!(!dest.exists(), "host file must not be touched mid-session");
-        assert!(shared.exists(), "shared file must remain while B holds the lock");
+        assert!(
+            shared.exists(),
+            "shared file must remain while B holds the lock"
+        );
 
         // Now drop B: this is the last container, it owns the cleanup.
         drop(handle_b);
         assert!(dest.exists(), "host file must be written on the last drop");
-        assert!(!shared.exists(), "shared file must be removed on the last drop");
+        assert!(
+            !shared.exists(),
+            "shared file must be removed on the last drop"
+        );
     }
 }

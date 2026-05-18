@@ -91,10 +91,7 @@ fn truthy(v: Option<&Value>) -> bool {
 ///
 /// When present, it is invoked on the host before retrying AWS credential
 /// resolution — typically `aws sso login --profile XXX` or a thin wrapper.
-pub fn detect_refresh_command(
-    settings_json: &Path,
-    claude_json: &Path,
-) -> Result<Option<String>> {
+pub fn detect_refresh_command(settings_json: &Path, claude_json: &Path) -> Result<Option<String>> {
     for path in [settings_json, claude_json] {
         if let Some(cmd) = read_refresh_from(path)? {
             return Ok(Some(cmd));
@@ -107,8 +104,8 @@ fn read_refresh_from(path: &Path) -> Result<Option<String>> {
     if !path.is_file() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let cfg: Value = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse {} as JSON", path.display()))?;
     Ok(cfg
@@ -294,7 +291,10 @@ mod tests {
         );
         let s = detect_setup(f.path()).unwrap().unwrap();
         assert_eq!(s.profile, "dev");
-        assert_eq!(s.model.as_deref(), Some("anthropic.claude-3-5-sonnet-20241022-v1:0"));
+        assert_eq!(
+            s.model.as_deref(),
+            Some("anthropic.claude-3-5-sonnet-20241022-v1:0")
+        );
         assert_eq!(s.region.as_deref(), Some("us-west-2"));
     }
 
@@ -315,9 +315,8 @@ mod tests {
 
     #[test]
     fn no_bedrock_when_flag_falsy() {
-        let f = write_settings(
-            r#"{"env": {"CLAUDE_CODE_USE_BEDROCK": "0", "AWS_PROFILE": "dev"}}"#,
-        );
+        let f =
+            write_settings(r#"{"env": {"CLAUDE_CODE_USE_BEDROCK": "0", "AWS_PROFILE": "dev"}}"#);
         assert!(detect_setup(f.path()).unwrap().is_none());
     }
 
@@ -341,8 +340,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_claude_json() {
-        let missing =
-            std::env::temp_dir().join("agent-container-definitely-no-settings.json");
+        let missing = std::env::temp_dir().join("agent-container-definitely-no-settings.json");
         let claude_json = write_settings(r#"{"awsAuthRefresh": "aws sso login --profile dev"}"#);
         assert_eq!(
             detect_refresh_command(&missing, claude_json.path())

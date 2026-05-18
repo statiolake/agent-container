@@ -151,8 +151,7 @@ async fn handle_aws(State(state): State<Arc<BrokerState>>) -> Response {
         tracing::warn!(
             "aws credentials requested but host has no Bedrock configuration — returning 404"
         );
-        return (StatusCode::NOT_FOUND, "Bedrock not configured on the host")
-            .into_response();
+        return (StatusCode::NOT_FOUND, "Bedrock not configured on the host").into_response();
     };
     match resolve_credentials(setup, refresh.as_deref()) {
         Ok(creds) => {
@@ -190,12 +189,7 @@ async fn handle_mcp_nested(
     forward_mcp(&name, &rest, state, req).await
 }
 
-async fn forward_mcp(
-    name: &str,
-    rest: &str,
-    state: Arc<BrokerState>,
-    req: Request,
-) -> Response {
+async fn forward_mcp(name: &str, rest: &str, state: Arc<BrokerState>, req: Request) -> Response {
     let backend_kind = state.mcp.get(name).map(|b| match b {
         McpBackend::Http(_) => BackendKind::Http,
         McpBackend::Stdio(_) => BackendKind::Stdio,
@@ -327,16 +321,12 @@ async fn forward_http(
             }
         };
         let mut builder = Response::builder().status(status);
-        *builder
-            .headers_mut()
-            .expect("response builder headers") = out_headers;
+        *builder.headers_mut().expect("response builder headers") = out_headers;
         return Ok(builder.body(Body::from(body_bytes))?);
     }
 
     let mut builder = Response::builder().status(status);
-    *builder
-        .headers_mut()
-        .expect("response builder headers") = out_headers;
+    *builder.headers_mut().expect("response builder headers") = out_headers;
     let stream = upstream.bytes_stream();
     Ok(builder.body(Body::from_stream(stream))?)
 }
@@ -699,10 +689,7 @@ async fn filter_tools_list_value(
 
     let mut kept = Vec::with_capacity(tools.len());
     for tool in tools.drain(..) {
-        let name = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .map(String::from);
+        let name = tool.get("name").and_then(Value::as_str).map(String::from);
         let read_only = tool
             .get("annotations")
             .and_then(|a| a.get("readOnlyHint"))
@@ -896,10 +883,11 @@ mod tests {
           ]}
         }"#;
         let policy = RwLock::new(McpPolicy::default());
-        let ann: Mutex<HashMap<String, HashMap<String, Option<bool>>>> =
-            Mutex::new(HashMap::new());
+        let ann: Mutex<HashMap<String, HashMap<String, Option<bool>>>> = Mutex::new(HashMap::new());
 
-        let out = filter_tools_list_body(raw, "srv", &policy, &ann).await.unwrap();
+        let out = filter_tools_list_body(raw, "srv", &policy, &ann)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         let names: Vec<_> = v["result"]["tools"]
             .as_array()
@@ -930,7 +918,9 @@ mod tests {
         let policy = RwLock::new(policy);
         let ann = Mutex::new(HashMap::new());
 
-        let out = filter_tools_list_body(raw, "srv", &policy, &ann).await.unwrap();
+        let out = filter_tools_list_body(raw, "srv", &policy, &ann)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         let names: Vec<_> = v["result"]["tools"]
             .as_array()
@@ -946,7 +936,9 @@ mod tests {
         let raw = b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"read_file\",\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"delete_file\",\"annotations\":{\"readOnlyHint\":false}}]}}\n\n";
         let policy = RwLock::new(McpPolicy::default());
         let ann = Mutex::new(HashMap::new());
-        let filtered = filter_tools_list_sse(raw, "srv", &policy, &ann).await.unwrap();
+        let filtered = filter_tools_list_sse(raw, "srv", &policy, &ann)
+            .await
+            .unwrap();
         let text = String::from_utf8(filtered).unwrap();
         // Pull the data: line back out of the re-emitted SSE and parse it.
         let data = text
@@ -971,10 +963,13 @@ mod tests {
 
     #[tokio::test]
     async fn sse_filter_preserves_non_tools_list_events() {
-        let raw = b"event: ping\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
+        let raw =
+            b"event: ping\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
         let policy = RwLock::new(McpPolicy::default());
         let ann = Mutex::new(HashMap::new());
-        let filtered = filter_tools_list_sse(raw, "srv", &policy, &ann).await.unwrap();
+        let filtered = filter_tools_list_sse(raw, "srv", &policy, &ann)
+            .await
+            .unwrap();
         let text = String::from_utf8(filtered).unwrap();
         assert!(text.contains("event: ping"));
         assert!(text.contains("notifications/progress"));
@@ -991,7 +986,9 @@ mod tests {
         policy.set_server_enabled("srv", false);
         let policy = RwLock::new(policy);
         let ann = Mutex::new(HashMap::new());
-        let out = filter_tools_list_body(raw, "srv", &policy, &ann).await.unwrap();
+        let out = filter_tools_list_body(raw, "srv", &policy, &ann)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         let arr = v["result"]["tools"].as_array().unwrap();
         assert!(arr.is_empty());

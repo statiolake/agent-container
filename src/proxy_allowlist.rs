@@ -115,9 +115,7 @@ pub fn generate(allow: &[String], dest: &PathBuf) -> Result<()> {
 pub fn cache_path_for(pid: u32) -> Result<PathBuf> {
     let dirs = ProjectDirs::from("", "", "agent-container")
         .context("failed to resolve XDG project directories")?;
-    Ok(dirs
-        .cache_dir()
-        .join(format!("proxy-allowlist.{pid}.txt")))
+    Ok(dirs.cache_dir().join(format!("proxy-allowlist.{pid}.txt")))
 }
 
 #[cfg(test)]

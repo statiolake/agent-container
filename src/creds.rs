@@ -46,8 +46,8 @@ pub fn prepare(claude_root: &Path) -> Result<CredentialFile> {
     let (shared, raw) = SharedCredFile::open(shared_path, host_sync, move || {
         read_raw_credentials_from_host(&claude_root)
     })?;
-    let parsed: Envelope = serde_json::from_str(raw.trim())
-        .context("failed to parse Claude Code credentials JSON")?;
+    let parsed: Envelope =
+        serde_json::from_str(raw.trim()).context("failed to parse Claude Code credentials JSON")?;
     Ok(CredentialFile {
         path: shared.path.clone(),
         expires_at: parsed.oauth.expires_at,

@@ -1345,8 +1345,8 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             }
             McpRow::TaskRow(name) => {
                 let command = visible_tasks.get(&name).cloned().unwrap_or_default();
-                let overlay = scope == Scope::Workspace
-                    && app.mcp.task_is_workspace_override(&name);
+                let overlay =
+                    scope == Scope::Workspace && app.mcp.task_is_workspace_override(&name);
                 ListItem::new(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(
@@ -1608,11 +1608,7 @@ fn render_task_input_modal(
     let area = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, area);
-    let title = if is_edit {
-        " Edit task "
-    } else {
-        " Add task "
-    };
+    let title = if is_edit { " Edit task " } else { " Add task " };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -1645,7 +1641,13 @@ fn render_task_input_modal(
         Span::raw("  "),
         Span::raw(command.value()),
     ]);
-    let para = Paragraph::new(vec![hint, Line::from(""), name_line, Line::from(""), cmd_line]);
+    let para = Paragraph::new(vec![
+        hint,
+        Line::from(""),
+        name_line,
+        Line::from(""),
+        cmd_line,
+    ]);
     f.render_widget(para, inner);
 
     // Field text starts 11 cells in from the modal's inner-left: 9-char
@@ -1896,13 +1898,7 @@ mod tests {
         tg.insert("a".to_string(), "echo a".to_string());
         let mut tw = BTreeMap::new();
         tw.insert("b".to_string(), "echo b".to_string());
-        let state = make_state(
-            vec![],
-            McpPolicy::default(),
-            McpPolicy::default(),
-            tg,
-            tw,
-        );
+        let state = make_state(vec![], McpPolicy::default(), McpPolicy::default(), tg, tw);
         let g = state.effective_tasks(Scope::Global);
         assert_eq!(g.len(), 1);
         assert!(g.contains_key("a"));
@@ -1920,13 +1916,7 @@ mod tests {
         tg.insert("k".to_string(), "global".to_string());
         let mut tw = BTreeMap::new();
         tw.insert("k".to_string(), "workspace".to_string());
-        let state = make_state(
-            vec![],
-            McpPolicy::default(),
-            McpPolicy::default(),
-            tg,
-            tw,
-        );
+        let state = make_state(vec![], McpPolicy::default(), McpPolicy::default(), tg, tw);
         assert_eq!(
             state.effective_tasks(Scope::Workspace).get("k").unwrap(),
             "workspace",
@@ -1978,10 +1968,7 @@ mod tests {
 
     #[test]
     fn proxy_visible_rows_global_view_shows_only_global() {
-        let p = ProxyState::new(
-            vec!["g1".into(), "g2".into()],
-            vec!["w1".into()],
-        );
+        let p = ProxyState::new(vec!["g1".into(), "g2".into()], vec!["w1".into()]);
         let rows = p.visible_rows(Scope::Global);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.origin == ProxyOrigin::Global));
@@ -2009,10 +1996,7 @@ mod tests {
 
     #[test]
     fn proxy_remove_current_workspace_view_skips_global_rows() {
-        let mut p = ProxyState::new(
-            vec!["g1".into()],
-            vec!["w1".into()],
-        );
+        let mut p = ProxyState::new(vec!["g1".into()], vec!["w1".into()]);
         // cursor on the global row (index 0): delete should be a no-op.
         p.cursor = 0;
         p.remove_current(Scope::Workspace);
@@ -2028,10 +2012,7 @@ mod tests {
 
     #[test]
     fn proxy_upsert_workspace_does_not_touch_global() {
-        let mut p = ProxyState::new(
-            vec!["g1".into()],
-            vec!["w1".into()],
-        );
+        let mut p = ProxyState::new(vec!["g1".into()], vec!["w1".into()]);
         // Edit the workspace row in workspace view.
         p.cursor = 1;
         let row = p.current_row(Scope::Workspace).unwrap();
@@ -2042,7 +2023,10 @@ mod tests {
         // Add a new workspace entry; global stays untouched.
         p.upsert(Scope::Workspace, "w2".to_string(), None);
         assert_eq!(p.global, vec!["g1".to_string()]);
-        assert_eq!(p.workspace, vec!["w1-renamed".to_string(), "w2".to_string()]);
+        assert_eq!(
+            p.workspace,
+            vec!["w1-renamed".to_string(), "w2".to_string()]
+        );
     }
 
     #[test]
@@ -2078,4 +2062,3 @@ mod tests {
         assert!(state.tool_is_workspace_override(0));
     }
 }
-

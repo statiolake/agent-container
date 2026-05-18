@@ -97,8 +97,7 @@ pub fn write_container_config(host_home: &Path, container_home: &Path) -> Result
     );
 
     let dir = container_home.join(".codex");
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let path = dir.join("config.toml");
     let header = "# Written by agent-container. The container itself is the sandbox,\n\
                   # so Codex's internal sandbox is disabled here; the other values\n\
@@ -135,8 +134,7 @@ trust_level = "trusted"
         .unwrap();
 
         write_container_config(host_home.path(), container_home.path()).unwrap();
-        let out =
-            fs::read_to_string(container_home.path().join(".codex/config.toml")).unwrap();
+        let out = fs::read_to_string(container_home.path().join(".codex/config.toml")).unwrap();
         let parsed: toml::Value = toml::from_str(&out).unwrap();
         let t = parsed.as_table().unwrap();
         assert_eq!(t["model"].as_str(), Some("gpt-5.4"));
@@ -152,8 +150,7 @@ trust_level = "trusted"
         let host_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
         write_container_config(host_home.path(), container_home.path()).unwrap();
-        let out =
-            fs::read_to_string(container_home.path().join(".codex/config.toml")).unwrap();
+        let out = fs::read_to_string(container_home.path().join(".codex/config.toml")).unwrap();
         let parsed: toml::Value = toml::from_str(&out).unwrap();
         let t = parsed.as_table().unwrap();
         assert_eq!(t["approval_policy"].as_str(), Some("never"));

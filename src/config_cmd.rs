@@ -70,7 +70,9 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
     let mut entries: Vec<ToolEntry> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     if servers.is_empty() {
-        eprintln!("[agent-container] note: no MCP servers declared in ~/.claude.json; the MCP tab will be empty.");
+        eprintln!(
+            "[agent-container] note: no MCP servers declared in ~/.claude.json; the MCP tab will be empty."
+        );
     } else {
         println!("Fetching tools from {} MCP server(s)...", servers.len());
         for server in &servers {
@@ -252,8 +254,12 @@ pub fn run_open_in_editor(scope: Scope) -> Result<()> {
 
 fn template_for(scope: Scope) -> String {
     let header = match scope {
-        Scope::Global => "# agent-container global settings\n# Applies to every workspace unless overridden locally.\n",
-        Scope::Workspace => "# agent-container workspace settings\n# Merged on top of the global settings at runtime.\n",
+        Scope::Global => {
+            "# agent-container global settings\n# Applies to every workspace unless overridden locally.\n"
+        }
+        Scope::Workspace => {
+            "# agent-container workspace settings\n# Merged on top of the global settings at runtime.\n"
+        }
     };
     format!(
         "{header}\n# Uncomment examples below.\n# [proxy]\n# allow = [\"^my-internal\\\\.example$\"]\n\n# [mcp.servers.github]\n# enabled = true\n# [mcp.servers.github.tools]\n# list_issues = true\n# create_issue = false\n"
@@ -295,7 +301,8 @@ fn minimise_policy_against_base(target: &mut McpPolicy, base: &McpPolicy, catalo
         let Some(target_state) = sp.tools.get(&entry.tool_name).copied() else {
             continue;
         };
-        let base_state = base.tool_allowed(&entry.server_name, &entry.tool_name, entry.read_only_hint);
+        let base_state =
+            base.tool_allowed(&entry.server_name, &entry.tool_name, entry.read_only_hint);
         if target_state == base_state {
             sp.tools.remove(&entry.tool_name);
         }

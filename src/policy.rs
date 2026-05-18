@@ -84,10 +84,7 @@ impl McpPolicy {
     /// "disable a whole MCP server" UI gesture, so it's retained.
     #[allow(dead_code)]
     pub fn set_server_enabled(&mut self, server: &str, enabled: bool) {
-        self.servers
-            .entry(server.to_string())
-            .or_default()
-            .enabled = enabled;
+        self.servers.entry(server.to_string()).or_default().enabled = enabled;
     }
 }
 

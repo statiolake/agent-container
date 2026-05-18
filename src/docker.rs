@@ -15,12 +15,7 @@ const PROXY_IMAGE_TAG: &str = "agent-container-proxy:dev";
 /// Build both images if they are missing.
 pub async fn ensure_images(dockerfile_dir: &Path) -> Result<()> {
     ensure_one(AGENT_IMAGE_TAG, dockerfile_dir, "Dockerfile").await?;
-    ensure_one(
-        PROXY_IMAGE_TAG,
-        &dockerfile_dir.join("proxy"),
-        "Dockerfile",
-    )
-    .await?;
+    ensure_one(PROXY_IMAGE_TAG, &dockerfile_dir.join("proxy"), "Dockerfile").await?;
     Ok(())
 }
 
@@ -44,7 +39,9 @@ async fn ensure_one(tag: &str, context_dir: &Path, dockerfile_name: &str) -> Res
             tag,
             "-f",
             dockerfile.to_str().context("non-utf8 dockerfile path")?,
-            context_dir.to_str().context("non-utf8 build context path")?,
+            context_dir
+                .to_str()
+                .context("non-utf8 build context path")?,
         ])
         .status()
         .await
@@ -78,8 +75,12 @@ pub struct RunOptions {
 /// Orchestrate the compose project: start relay, run agent, always tear down.
 pub async fn run(opts: RunOptions) -> Result<i32> {
     let host_project_dir = opts.host.host_project_dir();
-    std::fs::create_dir_all(&host_project_dir)
-        .with_context(|| format!("failed to prepare session dir {}", host_project_dir.display()))?;
+    std::fs::create_dir_all(&host_project_dir).with_context(|| {
+        format!(
+            "failed to prepare session dir {}",
+            host_project_dir.display()
+        )
+    })?;
     std::fs::create_dir_all(&opts.host.container_home).with_context(|| {
         format!(
             "failed to prepare persistent claude-home at {}",
@@ -107,26 +108,17 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         .context("failed to materialise proxy allowlist for tinyproxy")?;
 
     let mut env: HashMap<String, String> = [
-        (
-            "WORKSPACE_PATH",
-            opts.host.workspace.display().to_string(),
-        ),
+        ("WORKSPACE_PATH", opts.host.workspace.display().to_string()),
         (
             "CONTAINER_HOME_PATH",
             opts.host.container_home.display().to_string(),
         ),
-        (
-            "HOST_PROJECT_DIR",
-            host_project_dir.display().to_string(),
-        ),
+        ("HOST_PROJECT_DIR", host_project_dir.display().to_string()),
         (
             "CREDENTIALS_PATH",
             opts.credentials_path.display().to_string(),
         ),
-        (
-            "CLAUDE_MD_MOUNT_SRC",
-            claude_md_src.display().to_string(),
-        ),
+        ("CLAUDE_MD_MOUNT_SRC", claude_md_src.display().to_string()),
         (
             "CODEX_AUTH_PATH",
             opts.codex_auth_path.display().to_string(),

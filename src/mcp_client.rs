@@ -50,10 +50,7 @@ impl Tool {
     }
 }
 
-pub async fn fetch_tools(
-    server: &HttpMcpServer,
-    bearer: Option<&str>,
-) -> Result<Vec<Tool>> {
+pub async fn fetch_tools(server: &HttpMcpServer, bearer: Option<&str>) -> Result<Vec<Tool>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -86,14 +83,7 @@ pub async fn fetch_tools(
     });
     // Notifications have no response body, but some servers still answer
     // with 200 + empty body; fire-and-forget is fine.
-    let _ = post(
-        &client,
-        server,
-        &initialized,
-        session_id.as_deref(),
-        bearer,
-    )
-    .await;
+    let _ = post(&client, server, &initialized, session_id.as_deref(), bearer).await;
 
     let list_req = json!({
         "jsonrpc": "2.0",
@@ -185,7 +175,10 @@ async fn post(
 ) -> Result<RpcResponse> {
     let mut req = client
         .post(&server.url)
-        .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
         .json(payload);
     for (k, v) in &server.headers {
         req = req.header(k, v);
@@ -205,7 +198,11 @@ async fn post(
     let headers: std::collections::BTreeMap<String, String> = resp
         .headers()
         .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str().to_string(), vs.to_string())))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|vs| (k.as_str().to_string(), vs.to_string()))
+        })
         .collect();
 
     let content_type = headers

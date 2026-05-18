@@ -87,14 +87,18 @@ pub fn load_from_keychain() -> Result<HashMap<String, McpOAuthEntry>> {
     #[cfg(target_os = "macos")]
     {
         let output = std::process::Command::new("security")
-            .args(["find-generic-password", "-w", "-s", "Claude Code-credentials"])
+            .args([
+                "find-generic-password",
+                "-w",
+                "-s",
+                "Claude Code-credentials",
+            ])
             .output()
             .context("failed to invoke `security` command")?;
         if !output.status.success() {
             return Ok(HashMap::new());
         }
-        let raw = String::from_utf8(output.stdout)
-            .context("keychain entry was not valid UTF-8")?;
+        let raw = String::from_utf8(output.stdout).context("keychain entry was not valid UTF-8")?;
         parse_raw_credentials(raw.trim())
     }
     #[cfg(not(target_os = "macos"))]
@@ -144,9 +148,7 @@ fn parse_entry(keychain_key: &str, value: &Value) -> Result<McpOAuthEntry> {
         refresh_token: raw.refresh_token,
         expires_at_ms: raw.expires_at,
         client_id: raw.client_id,
-        authorization_server_url: raw
-            .discovery_state
-            .and_then(|d| d.authorization_server_url),
+        authorization_server_url: raw.discovery_state.and_then(|d| d.authorization_server_url),
         scope: raw.scope,
     })
 }
@@ -188,10 +190,7 @@ impl OAuthStore {
     }
 }
 
-async fn refresh_entry(
-    entry: &mut McpOAuthEntry,
-    http: &reqwest::Client,
-) -> Result<()> {
+async fn refresh_entry(entry: &mut McpOAuthEntry, http: &reqwest::Client) -> Result<()> {
     let refresh_token = entry
         .refresh_token
         .clone()
@@ -200,10 +199,7 @@ async fn refresh_entry(
         .authorization_server_url
         .clone()
         .context("entry has no authorizationServerUrl")?;
-    let client_id = entry
-        .client_id
-        .clone()
-        .context("entry has no clientId")?;
+    let client_id = entry.client_id.clone().context("entry has no clientId")?;
 
     let token_endpoint = discover_token_endpoint(http, &as_url).await?;
 

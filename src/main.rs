@@ -38,7 +38,10 @@ use crate::cli::{AgentKind, Cli, Commands, ConfigCommands};
 /// Override with `AGENT_CONTAINER_LOG_FILE`:
 /// - a path → append there
 /// - `-`    → opt back into stderr (handy for ad-hoc debugging)
-fn init_tracing() -> (Option<tracing_appender::non_blocking::WorkerGuard>, Option<PathBuf>) {
+fn init_tracing() -> (
+    Option<tracing_appender::non_blocking::WorkerGuard>,
+    Option<PathBuf>,
+) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agent_container=info,warn"));
 
@@ -160,8 +163,7 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
     let proxy_allow = merged_settings.proxy.allow.clone();
     let task_runner = build_task_runner(&merged_settings.task_runner.tasks, &mcp_servers);
     let oauth_store = Arc::new(oauth::OAuthStore::new(
-        oauth::load_from_keychain()
-            .context("failed to load MCP OAuth entries from Keychain")?,
+        oauth::load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
     ));
 
     if let Some(setup) = &bedrock {
@@ -194,8 +196,7 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
     // (e.g. Claude's bash tool calling `codex exec ...` or vice versa).
     let claude_is_primary = matches!(agent, AgentKind::Claude);
     let codex_is_primary = matches!(agent, AgentKind::Codex);
-    let claude_creds =
-        prepare_claude_credentials(&host, claude_is_primary, bedrock.is_some())?;
+    let claude_creds = prepare_claude_credentials(&host, claude_is_primary, bedrock.is_some())?;
     let codex_auth = prepare_codex_auth(&host, codex_is_primary)?;
 
     docker::ensure_images(&docker::default_dockerfile_dir())
@@ -282,7 +283,9 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
     // failure to a warning — if the user is dropping into a shell it's
     // usually to debug something and blocking on missing credentials
     // would be counterproductive.
-    let bedrock = aws::detect_setup(&host.claude_root.join("settings.json")).ok().flatten();
+    let bedrock = aws::detect_setup(&host.claude_root.join("settings.json"))
+        .ok()
+        .flatten();
     let refresh = aws::detect_refresh_command(
         &host.claude_root.join("settings.json"),
         &host.home.join(".claude.json"),
@@ -290,8 +293,7 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
     .ok()
     .flatten();
     let mcp_servers = mcp::load_servers(&host.home.join(".claude.json")).unwrap_or_default();
-    let merged_settings =
-        settings::Settings::load_merged(&host.workspace).unwrap_or_default();
+    let merged_settings = settings::Settings::load_merged(&host.workspace).unwrap_or_default();
     let policy = merged_settings.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
     let task_runner = build_task_runner(&merged_settings.task_runner.tasks, &mcp_servers);
@@ -433,7 +435,10 @@ fn build_task_runner(
     if tasks.is_empty() {
         return None;
     }
-    if declared_servers.iter().any(|s| s.name() == task_runner::NAME) {
+    if declared_servers
+        .iter()
+        .any(|s| s.name() == task_runner::NAME)
+    {
         eprintln!(
             "[agent-container] note: skipping built-in task-runner because ~/.claude.json already declares an MCP server named '{}'",
             task_runner::NAME
@@ -455,8 +460,8 @@ fn prepare_codex_auth(
             );
             Ok(None)
         }
-        Err(e) => Err(e).context(
-            "failed to prepare Codex auth; run `codex login` on the host first",
-        ),
+        Err(e) => {
+            Err(e).context("failed to prepare Codex auth; run `codex login` on the host first")
+        }
     }
 }

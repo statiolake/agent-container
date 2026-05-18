@@ -183,7 +183,7 @@ mod tests {
         );
     }
 
-#[test]
+    #[test]
     fn empty_when_no_mcp_servers() {
         let f = write(r#"{"hasCompletedOnboarding": true}"#);
         assert!(load_servers(f.path()).unwrap().is_empty());
