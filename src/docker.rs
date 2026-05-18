@@ -97,6 +97,18 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         PathBuf::from("/dev/null")
     };
 
+    // The workspace is intentionally writable, but its agent-container
+    // settings directory controls host-side behavior. Overlay it read-only
+    // inside the container; if the workspace has no such directory, mount
+    // an empty read-only directory so the agent cannot create one from
+    // inside the container.
+    let workspace_agent_container_dir = opts.host.workspace.join(".agent-container");
+    let workspace_agent_container_mount_src = if workspace_agent_container_dir.is_dir() {
+        workspace_agent_container_dir
+    } else {
+        empty_workspace_agent_container_dir(std::process::id())?
+    };
+
     let project = format!("agent-container-{}", std::process::id());
     let compose_file = default_compose_file();
 
@@ -114,6 +126,10 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
             opts.host.container_home.display().to_string(),
         ),
         ("HOST_PROJECT_DIR", host_project_dir.display().to_string()),
+        (
+            "WORKSPACE_AGENT_CONTAINER_MOUNT_SRC",
+            workspace_agent_container_mount_src.display().to_string(),
+        ),
         (
             "CREDENTIALS_PATH",
             opts.credentials_path.display().to_string(),
@@ -233,6 +249,13 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
 
     // `_cleanup` runs `compose down` on scope exit.
     Ok(status.code().unwrap_or(1))
+}
+
+fn empty_workspace_agent_container_dir(pid: u32) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("agent-container-empty-config-{pid}"));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to prepare empty config mount {}", dir.display()))?;
+    Ok(dir)
 }
 
 struct ComposeCtx {

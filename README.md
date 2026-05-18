@@ -108,6 +108,12 @@ and vice versa. In either mode the workspace is the current directory
 (mounted at `/workspace`), and `~/.claude/projects/<cwd-encoded>/`
 keeps the session history on the host.
 
+The workspace mount is writable, but `<workspace>/.agent-container` is
+overlaid as read-only at `/workspace/.agent-container`. If the directory
+does not exist on the host, an empty read-only directory is mounted there
+so an in-container agent cannot create workspace-local agent-container
+settings for itself.
+
 ### Configure the MCP tool allowlist
 
 ```sh

@@ -57,6 +57,7 @@ services:
       # override individual paths that must stay ephemeral or workspace-scoped.
       - "${CONTAINER_HOME_PATH}:/home/agent"
       - "${WORKSPACE_PATH}:/workspace"
+      - "${WORKSPACE_AGENT_CONTAINER_MOUNT_SRC}:/workspace/.agent-container:ro"
       - "${HOST_PROJECT_DIR}:/home/agent/.claude/projects/-workspace"
       - "${CREDENTIALS_PATH}:/home/agent/.claude/.credentials.json"
       - "${CLAUDE_MD_MOUNT_SRC}:/home/agent/.claude/CLAUDE.md:ro"
