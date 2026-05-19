@@ -115,7 +115,7 @@ impl TaskRunner {
                 json!({
                     "name": name,
                     "description": format!(
-                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. `$CONFIG_ROOT` points at the agent-container settings directory that defined this task."
+                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. `$CONFIG_ROOT` points at the host-side agent-container settings directory that defined this task."
                     ),
                     "inputSchema": {
                         "type": "object",

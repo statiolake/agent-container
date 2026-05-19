@@ -485,15 +485,36 @@ fn build_task_runner(
 fn load_task_runner_tasks(
     host: &paths::HostPaths,
 ) -> Result<std::collections::BTreeMap<String, task_runner::TaskSpec>> {
-    let mut tasks = std::collections::BTreeMap::new();
-
     let global_path = settings::global_path()?;
     let global_root = global_path
         .parent()
         .context("global settings path has no parent")?
         .to_path_buf();
     let global = settings::Settings::load_global().context("failed to load global settings")?;
-    for (name, command) in global.task_runner.tasks {
+    let workspace_path = settings::workspace_path(&host.workspace);
+    let workspace_root = workspace_path
+        .parent()
+        .context("workspace settings path has no parent")?
+        .to_path_buf();
+    let workspace = settings::Settings::load_workspace(&host.workspace)
+        .context("failed to load workspace settings")?;
+
+    Ok(task_specs_from_scopes(
+        global.task_runner.tasks,
+        global_root,
+        workspace.task_runner.tasks,
+        workspace_root,
+    ))
+}
+
+fn task_specs_from_scopes(
+    global_tasks: std::collections::BTreeMap<String, String>,
+    global_root: PathBuf,
+    workspace_tasks: std::collections::BTreeMap<String, String>,
+    workspace_root: PathBuf,
+) -> std::collections::BTreeMap<String, task_runner::TaskSpec> {
+    let mut tasks = std::collections::BTreeMap::new();
+    for (name, command) in global_tasks {
         tasks.insert(
             name,
             task_runner::TaskSpec {
@@ -502,15 +523,7 @@ fn load_task_runner_tasks(
             },
         );
     }
-
-    let workspace_path = settings::workspace_path(&host.workspace);
-    let workspace_root = workspace_path
-        .parent()
-        .context("workspace settings path has no parent")?
-        .to_path_buf();
-    let workspace = settings::Settings::load_workspace(&host.workspace)
-        .context("failed to load workspace settings")?;
-    for (name, command) in workspace.task_runner.tasks {
+    for (name, command) in workspace_tasks {
         tasks.insert(
             name,
             task_runner::TaskSpec {
@@ -519,8 +532,7 @@ fn load_task_runner_tasks(
             },
         );
     }
-
-    Ok(tasks)
+    tasks
 }
 
 fn prepare_codex_auth(
@@ -538,5 +550,43 @@ fn prepare_codex_auth(
         Err(e) => {
             Err(e).context("failed to prepare Codex auth; run `codex login` on the host first")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn task_specs_use_host_config_roots_and_workspace_overrides() {
+        let mut global = BTreeMap::new();
+        global.insert(
+            "deploy".to_string(),
+            "$CONFIG_ROOT/scripts/deploy".to_string(),
+        );
+        global.insert("global-only".to_string(), "global".to_string());
+
+        let mut workspace = BTreeMap::new();
+        workspace.insert(
+            "deploy".to_string(),
+            "$CONFIG_ROOT/scripts/deploy-workspace".to_string(),
+        );
+
+        let specs = task_specs_from_scopes(
+            global,
+            PathBuf::from("/Users/example/.config/agent-container"),
+            workspace,
+            PathBuf::from("/Users/example/repo/.agent-container"),
+        );
+
+        assert_eq!(
+            specs["deploy"].config_root,
+            PathBuf::from("/Users/example/repo/.agent-container")
+        );
+        assert_eq!(
+            specs["global-only"].config_root,
+            PathBuf::from("/Users/example/.config/agent-container")
+        );
     }
 }
