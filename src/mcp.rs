@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -82,7 +82,7 @@ pub fn load_servers(claude_json: &Path) -> Result<Vec<McpServer>> {
 
 #[derive(Deserialize)]
 struct RawEntry {
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", alias = "transport")]
     transport: Option<String>,
     #[serde(default)]
     url: Option<String>,
@@ -97,8 +97,9 @@ struct RawEntry {
 }
 
 fn parse_entry(name: &str, value: &Value) -> Result<Option<McpServer>> {
-    let entry: RawEntry =
+    let mut entry: RawEntry =
         serde_json::from_value(value.clone()).context("entry is not a valid MCP server object")?;
+    expand_entry_env(&mut entry).context("failed to expand environment variables")?;
 
     // Decide transport. Claude Code infers stdio when `command` is present
     // and no `type` is set; http/sse require a URL.
@@ -143,6 +144,69 @@ fn parse_entry(name: &str, value: &Value) -> Result<Option<McpServer>> {
     }
 }
 
+fn expand_entry_env(entry: &mut RawEntry) -> Result<()> {
+    if let Some(command) = &mut entry.command {
+        *command = expand_env_vars(command)?;
+    }
+    if let Some(url) = &mut entry.url {
+        *url = expand_env_vars(url)?;
+    }
+    for arg in &mut entry.args {
+        *arg = expand_env_vars(arg)?;
+    }
+    for value in entry.env.values_mut() {
+        *value = expand_env_vars(value)?;
+    }
+    for value in entry.headers.values_mut() {
+        *value = expand_env_vars(value)?;
+    }
+    Ok(())
+}
+
+fn expand_env_vars(input: &str) -> Result<String> {
+    expand_env_vars_with(input, |name| std::env::var(name).ok())
+}
+
+fn expand_env_vars_with<F>(input: &str, lookup: F) -> Result<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return Ok(out);
+        };
+        let expr = &after[..end];
+        let (name, default) = expr
+            .split_once(":-")
+            .map(|(name, default)| (name, Some(default)))
+            .unwrap_or((expr, None));
+        if !is_valid_env_name(name) {
+            bail!("invalid environment variable reference `${{{expr}}}`");
+        }
+        let value = lookup(name)
+            .or_else(|| default.map(str::to_string))
+            .ok_or_else(|| anyhow::anyhow!("environment variable `{name}` is not set"))?;
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +245,41 @@ mod tests {
                 ("web", "http"),
             ]
         );
+    }
+
+    #[test]
+    fn accepts_transport_alias_and_expands_env_placeholders() {
+        let f = write(
+            r#"{
+              "mcpServers": {
+                "aws-mcp": {
+                  "transport": "stdio",
+                  "command": "uvx",
+                  "args": [
+                    "mcp-proxy-for-aws@latest",
+                    "${AWS_MCP_ENDPOINT:-https://aws-mcp.us-east-1.api.aws/mcp}",
+                    "--metadata",
+                    "AWS_REGION=${AWS_REGION:-us-west-2}"
+                  ],
+                  "env": {"AWS_PROFILE": "${AWS_PROFILE:-sandbox-bedrock}"}
+                }
+              }
+            }"#,
+        );
+        let servers = load_servers(f.path()).unwrap();
+        let McpServer::Stdio(server) = &servers[0] else {
+            panic!("expected stdio server");
+        };
+        assert_eq!(server.command, "uvx");
+        assert_eq!(server.args[1], "https://aws-mcp.us-east-1.api.aws/mcp");
+        assert_eq!(server.args[3], "AWS_REGION=us-west-2");
+        assert_eq!(server.env["AWS_PROFILE"], "sandbox-bedrock");
+    }
+
+    #[test]
+    fn env_expansion_requires_value_without_default() {
+        let err = expand_env_vars_with("${MISSING}", |_| None).unwrap_err();
+        assert!(format!("{err:#}").contains("environment variable `MISSING` is not set"));
     }
 
     #[test]

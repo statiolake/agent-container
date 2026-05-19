@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use crate::mcp::{HttpMcpServer, StdioMcpServer};
 use crate::stdio_mcp;
 
-const PROTOCOL_VERSION: &str = "2025-03-26";
+const PROTOCOL_VERSION: &str = "2025-06-18";
 const CLIENT_NAME: &str = "agent-container";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -71,11 +71,24 @@ pub async fn fetch_tools(server: &HttpMcpServer, bearer: Option<&str>) -> Result
             },
         }
     });
-    let init_resp = post(&client, server, &init_req, session_id.as_deref(), bearer).await?;
+    let init_resp = post(
+        &client,
+        server,
+        &init_req,
+        session_id.as_deref(),
+        Some(PROTOCOL_VERSION),
+        bearer,
+    )
+    .await?;
     if let Some(v) = init_resp.headers.get("mcp-session-id") {
         session_id = Some(v.clone());
     }
     ensure_no_error(&init_resp.body, "initialize")?;
+    let negotiated_protocol = init_resp
+        .body
+        .pointer("/result/protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or(PROTOCOL_VERSION);
 
     let initialized = json!({
         "jsonrpc": "2.0",
@@ -83,14 +96,31 @@ pub async fn fetch_tools(server: &HttpMcpServer, bearer: Option<&str>) -> Result
     });
     // Notifications have no response body, but some servers still answer
     // with 200 + empty body; fire-and-forget is fine.
-    let _ = post(&client, server, &initialized, session_id.as_deref(), bearer).await;
+    let _ = post(
+        &client,
+        server,
+        &initialized,
+        session_id.as_deref(),
+        Some(negotiated_protocol),
+        bearer,
+    )
+    .await;
 
     let list_req = json!({
         "jsonrpc": "2.0",
         "id": next_id(),
-        "method": "tools/list"
+        "method": "tools/list",
+        "params": {}
     });
-    let list_resp = post(&client, server, &list_req, session_id.as_deref(), bearer).await?;
+    let list_resp = post(
+        &client,
+        server,
+        &list_req,
+        session_id.as_deref(),
+        Some(negotiated_protocol),
+        bearer,
+    )
+    .await?;
     ensure_no_error(&list_resp.body, "tools/list")?;
     let tools = list_resp
         .body
@@ -140,7 +170,8 @@ pub async fn fetch_tools_stdio(server: &StdioMcpServer) -> Result<Vec<Tool>> {
     let list_req = json!({
         "jsonrpc": "2.0",
         "id": next_id(),
-        "method": "tools/list"
+        "method": "tools/list",
+        "params": {}
     });
     let list_outcome = handle.submit_post(serde_json::to_vec(&list_req)?).await?;
     let rx = list_outcome
@@ -171,6 +202,7 @@ async fn post(
     server: &HttpMcpServer,
     payload: &Value,
     session_id: Option<&str>,
+    protocol_version: Option<&str>,
     bearer: Option<&str>,
 ) -> Result<RpcResponse> {
     let mut req = client
@@ -188,6 +220,9 @@ async fn post(
     }
     if let Some(id) = session_id {
         req = req.header("mcp-session-id", id);
+    }
+    if let Some(version) = protocol_version {
+        req = req.header("mcp-protocol-version", version);
     }
     let resp = req
         .send()
