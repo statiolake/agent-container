@@ -65,9 +65,10 @@ The broker also bridges host-side MCP servers into the container as
 HTTP. stdio-transport MCPs get writer/reader tasks on the host and
 expose their traffic as `POST /mcp/<name>` (client → server) and
 `GET /mcp/<name>` (text/event-stream for server-initiated requests like
-`roots/list`). Spec-defined URI fields are translated between the
-container's `/workspace` and the host's real path so the stdio server
-sees coordinates that actually exist on its side of the bridge.
+`roots/list`). The container mounts the workspace at the same absolute
+path as the host, keeping Claude Code resume keys stable; spec-defined
+URI fields still pass through the path bridge so stdio servers see
+coordinates that exist on their side of the bridge.
 
 ## Requirements
 
@@ -105,15 +106,16 @@ agent-container run --agent codex -- exec "what does this repo do?"
 
 Both agents' auth is bind-mounted regardless of which one is the
 primary, so a Claude session can call `codex exec …` as a shell tool
-and vice versa. In either mode the workspace is the current directory
-(mounted at `/workspace`), and `~/.claude/projects/<cwd-encoded>/`
-keeps the session history on the host.
+and vice versa. In either mode the workspace is the current directory,
+mounted at the same absolute path inside the container, and
+`~/.claude/projects/<cwd-encoded>/` keeps the session history on the
+host.
 
 The workspace mount is writable, but `<workspace>/.agent-container` is
-overlaid as read-only at `/workspace/.agent-container`. If the directory
-does not exist on the host, an empty read-only directory is mounted there
-so an in-container agent cannot create workspace-local agent-container
-settings for itself.
+overlaid as read-only at the same path inside the container. If the
+directory does not exist on the host, an empty read-only directory is
+mounted there so an in-container agent cannot create workspace-local
+agent-container settings for itself.
 
 ### Configure the MCP tool allowlist
 

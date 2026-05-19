@@ -230,7 +230,7 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         .context("failed to build or locate container images")?;
 
     let stdio_bridge = stdio_mcp::PathBridge {
-        container_root: "/workspace".to_string(),
+        container_root: host.container_workspace().display().to_string(),
         host_root: host.workspace.display().to_string(),
     };
     let task_runner_enabled = task_runner.is_some();
@@ -355,7 +355,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         .context("failed to build or locate container images")?;
 
     let stdio_bridge = stdio_mcp::PathBridge {
-        container_root: "/workspace".to_string(),
+        container_root: host.container_workspace().display().to_string(),
         host_root: host.workspace.display().to_string(),
     };
     let task_runner_enabled = task_runner.is_some();

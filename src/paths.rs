@@ -32,6 +32,14 @@ impl HostPaths {
             .join(encode_project_dir(&self.workspace))
     }
 
+    pub fn container_workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    pub fn container_project_dir_name(&self) -> String {
+        encode_project_dir(self.container_workspace())
+    }
+
     pub fn host_claude_md(&self) -> PathBuf {
         self.claude_root.join("CLAUDE.md")
     }
@@ -77,9 +85,16 @@ mod tests {
     }
 
     #[test]
-    fn container_workspace_encodes_to_dash_workspace() {
-        // The compose file hard-codes `-workspace` for the in-container session
-        // dir; keep this test so a mismatch fails loudly.
-        assert_eq!(encode_project_dir("/workspace"), "-workspace");
+    fn container_workspace_uses_host_path_identity() {
+        let workspace = PathBuf::from("/Users/example/repo");
+        let paths = HostPaths {
+            home: PathBuf::from("/Users/example"),
+            claude_root: PathBuf::from("/Users/example/.claude"),
+            workspace: workspace.clone(),
+            container_home: PathBuf::from("/Users/example/.local/share/agent-container/home"),
+        };
+
+        assert_eq!(paths.container_workspace(), workspace.as_path());
+        assert_eq!(paths.container_project_dir_name(), "-Users-example-repo");
     }
 }

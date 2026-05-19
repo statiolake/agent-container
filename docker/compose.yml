@@ -56,14 +56,14 @@ services:
       # ~/.claude.json survive across runs. Specific sub-mounts below
       # override individual paths that must stay ephemeral or workspace-scoped.
       - "${CONTAINER_HOME_PATH}:/home/agent"
-      - "${WORKSPACE_PATH}:/workspace"
-      - "${WORKSPACE_AGENT_CONTAINER_MOUNT_SRC}:/workspace/.agent-container:ro"
-      - "${HOST_PROJECT_DIR}:/home/agent/.claude/projects/-workspace"
+      - "${WORKSPACE_PATH}:${CONTAINER_WORKSPACE_PATH}"
+      - "${WORKSPACE_AGENT_CONTAINER_MOUNT_SRC}:${CONTAINER_WORKSPACE_PATH}/.agent-container:ro"
+      - "${HOST_PROJECT_DIR}:/home/agent/.claude/projects/${CONTAINER_PROJECT_DIR_NAME}"
       - "${CREDENTIALS_PATH}:/home/agent/.claude/.credentials.json"
       - "${CLAUDE_MD_MOUNT_SRC}:/home/agent/.claude/CLAUDE.md:ro"
       - "${CODEX_AUTH_PATH}:/home/agent/.codex/auth.json"
     user: "${HOST_UID}:${HOST_GID}"
-    working_dir: /workspace
+    working_dir: "${CONTAINER_WORKSPACE_PATH}"
     stdin_open: true
     tty: true
     init: true

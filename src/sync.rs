@@ -6,7 +6,9 @@
 //!   settings for the current workspace. MCP server definitions are stripped
 //!   (Phase 3 will reintroduce them via an in-container proxy). Other
 //!   `projects.<path>` entries are dropped so the container only sees its
-//!   own workspace, with its path rewritten to `/workspace`.
+//!   own workspace. The container uses the same absolute workspace path as
+//!   the host so Claude Code resume keys stay stable across native and
+//!   containerised runs.
 //! - `~/.claude/settings.json` — user-level settings, copied as-is.
 //! - `~/.claude/skills/`, `~/.claude/commands/`, `~/.claude/agents/` — user-
 //!   authored extensions (custom skills, slash commands, subagents).
@@ -26,8 +28,6 @@ use serde_json::Value;
 
 use crate::mcp::McpServer;
 use crate::paths::HostPaths;
-
-const CONTAINER_WORKSPACE: &str = "/workspace";
 
 /// Keys stripped from every object we copy over (top-level of `.claude.json`,
 /// per-project entries, and `settings.json`). Each of these either references
@@ -162,14 +162,17 @@ fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
     if let Some(obj) = cfg.as_object_mut() {
         strip_keys(obj);
 
-        // Keep only the current workspace's entry, rewritten to /workspace.
+        // Keep only the current workspace's entry, preserving the same
+        // absolute path inside the container so Claude Code can resume
+        // sessions created by a native host-side run.
         if let Some(Value::Object(projects)) = obj.get_mut("projects") {
             let workspace_key = host.workspace.display().to_string();
+            let container_key = host.container_workspace().display().to_string();
             let surviving = projects.remove(&workspace_key).unwrap_or(Value::Null);
             let mut filtered = serde_json::Map::new();
             if let Value::Object(mut entry) = surviving {
                 strip_keys(&mut entry);
-                filtered.insert(CONTAINER_WORKSPACE.to_string(), Value::Object(entry));
+                filtered.insert(container_key, Value::Object(entry));
             }
             *projects = filtered;
         }
@@ -501,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn filtering_drops_mcp_and_rewrites_workspace() {
+    fn filtering_drops_mcp_and_preserves_workspace_path() {
         let tmp_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
         let workspace = tmp_home.path().join("work/repo");
@@ -570,7 +573,7 @@ mod tests {
         assert_eq!(out["hasCompletedOnboarding"], serde_json::json!(true));
         let projects = out["projects"].as_object().unwrap();
         assert_eq!(projects.len(), 1, "only current workspace survives");
-        let entry = &projects["/workspace"];
+        let entry = &projects[&host.container_workspace().display().to_string()];
         for key in ["mcpServers", "env", "hooks", "permissions", "sandbox"] {
             assert!(
                 entry.get(key).is_none(),

@@ -21,13 +21,11 @@ RUN npm install -g @anthropic-ai/claude-code@latest @openai/codex \
 
 # Writable home for an arbitrary UID passed via `docker run --user`.
 # Pre-create /home/agent/.claude so that bind-mounts of its children (e.g.
-# .credentials.json, projects/-workspace, CLAUDE.md) don't leave the parent
+# .credentials.json, project history, CLAUDE.md) don't leave the parent
 # owned by root and blocking Claude Code from creating sibling dirs like
 # session-env at runtime.
 RUN mkdir -p /home/agent/.claude /home/agent/.codex \
-    && chmod -R 1777 /home/agent \
-    && mkdir -p /workspace \
-    && chmod 1777 /workspace
+    && chmod -R 1777 /home/agent
 
 ENV HOME=/home/agent
 ENV NODE_OPTIONS=--max-old-space-size=4096
@@ -41,7 +39,7 @@ ENV VISUAL=vim
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
-WORKDIR /workspace
+WORKDIR /home/agent
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["claude", "--dangerously-skip-permissions"]

@@ -141,10 +141,18 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     let mut env: HashMap<String, String> = [
         ("WORKSPACE_PATH", opts.host.workspace.display().to_string()),
         (
+            "CONTAINER_WORKSPACE_PATH",
+            opts.host.container_workspace().display().to_string(),
+        ),
+        (
             "CONTAINER_HOME_PATH",
             opts.host.container_home.display().to_string(),
         ),
         ("HOST_PROJECT_DIR", host_project_dir.display().to_string()),
+        (
+            "CONTAINER_PROJECT_DIR_NAME",
+            opts.host.container_project_dir_name(),
+        ),
         (
             "WORKSPACE_AGENT_CONTAINER_MOUNT_SRC",
             workspace_agent_container_mount_src.display().to_string(),
