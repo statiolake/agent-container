@@ -12,6 +12,7 @@ RUN apt-get update \
         procps \
         ripgrep \
         tini \
+        tmux \
         vim \
     && rm -rf /var/lib/apt/lists/*
 
