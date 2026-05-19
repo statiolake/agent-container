@@ -269,10 +269,7 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("/dev/null"));
 
     let agent_command = match agent {
-        AgentKind::Claude => vec![
-            "claude".to_string(),
-            "--dangerously-skip-permissions".to_string(),
-        ],
+        AgentKind::Claude => claude_agent_command(),
         AgentKind::Codex => vec!["codex".to_string()],
     };
 
@@ -292,6 +289,15 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
     drop(claude_creds);
     drop(codex_auth);
     std::process::exit(exit);
+}
+
+fn claude_agent_command() -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        "exec env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 tmux new-session -A -s claude-code -- claude --dangerously-skip-permissions \"$@\"".to_string(),
+        "agent-container-claude".to_string(),
+    ]
 }
 
 async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
