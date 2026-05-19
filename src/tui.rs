@@ -1409,11 +1409,7 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
 fn render_tool_row(entry: &ToolEntry, enabled: bool, mark_overlay: bool) -> ListItem<'static> {
     let cb = if enabled { "[x]" } else { "[ ]" };
     let first_line = entry.description.lines().next().unwrap_or("").trim();
-    let desc = if first_line.len() > 64 {
-        format!("{}…", &first_line[..64])
-    } else {
-        first_line.to_string()
-    };
+    let desc = ellipsize_display_width(first_line, 64);
 
     let annotation: Option<Span<'static>> = match entry.read_only_hint {
         Some(true) => Some(Span::styled(" [RO]", Style::default().fg(Color::Green))),
@@ -1440,6 +1436,35 @@ fn render_tool_row(entry: &ToolEntry, enabled: bool, mark_overlay: bool) -> List
         spans.push(Span::styled(desc, Style::default().fg(Color::DarkGray)));
     }
     ListItem::new(Line::from(spans))
+}
+
+fn ellipsize_display_width(s: &str, max_width: usize) -> String {
+    if Span::raw(s).width() <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let ellipsis = "…";
+    let ellipsis_width = Span::raw(ellipsis).width();
+    if max_width <= ellipsis_width {
+        return ellipsis.to_string();
+    }
+
+    let content_width = max_width - ellipsis_width;
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in s.chars() {
+        let ch_width = Span::raw(ch.to_string()).width();
+        if width + ch_width > content_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push_str(ellipsis);
+    out
 }
 
 fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -2060,5 +2085,18 @@ mod tests {
             BTreeMap::new(),
         );
         assert!(state.tool_is_workspace_override(0));
+    }
+
+    #[test]
+    fn ellipsize_display_width_respects_utf8_boundaries() {
+        let s = "新しい入出金を MoneyForward に登録します。amount は正=収入 / 負=支出。";
+        let out = ellipsize_display_width(s, 64);
+        assert!(out.ends_with('…'));
+        assert!(Span::raw(out.as_str()).width() <= 64);
+    }
+
+    #[test]
+    fn ellipsize_display_width_leaves_short_text_unchanged() {
+        assert_eq!(ellipsize_display_width("short", 64), "short");
     }
 }
