@@ -12,25 +12,44 @@ use crate::paths::HostPaths;
 const AGENT_IMAGE_TAG: &str = "agent-container:dev";
 const PROXY_IMAGE_TAG: &str = "agent-container-proxy:dev";
 
-/// Build both images if they are missing.
-pub async fn ensure_images(dockerfile_dir: &Path) -> Result<()> {
-    ensure_one(AGENT_IMAGE_TAG, dockerfile_dir, "Dockerfile").await?;
-    ensure_one(PROXY_IMAGE_TAG, &dockerfile_dir.join("proxy"), "Dockerfile").await?;
+/// Build required images. The agent image can be force-built on demand;
+/// the proxy image is still only built when missing.
+pub async fn ensure_images(dockerfile_dir: &Path, rebuild_agent: bool) -> Result<()> {
+    ensure_one(AGENT_IMAGE_TAG, dockerfile_dir, "Dockerfile", rebuild_agent).await?;
+    ensure_one(
+        PROXY_IMAGE_TAG,
+        &dockerfile_dir.join("proxy"),
+        "Dockerfile",
+        false,
+    )
+    .await?;
     Ok(())
 }
 
-async fn ensure_one(tag: &str, context_dir: &Path, dockerfile_name: &str) -> Result<()> {
-    let status = Command::new("docker")
-        .args(["image", "inspect", tag])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .context("failed to invoke docker")?;
-    if status.success() {
-        return Ok(());
+async fn ensure_one(
+    tag: &str,
+    context_dir: &Path,
+    dockerfile_name: &str,
+    force_build: bool,
+) -> Result<()> {
+    if !force_build {
+        let status = Command::new("docker")
+            .args(["image", "inspect", tag])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .context("failed to invoke docker")?;
+        if status.success() {
+            return Ok(());
+        }
     }
-    eprintln!("[agent-container] building image {tag} (first run only)...");
+    let reason = if force_build {
+        "requested rebuild"
+    } else {
+        "image missing"
+    };
+    eprintln!("[agent-container] building image {tag} ({reason})...");
     let dockerfile = context_dir.join(dockerfile_name);
     let status = Command::new("docker")
         .args([

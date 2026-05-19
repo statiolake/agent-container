@@ -23,6 +23,11 @@ pub enum Commands {
         /// one from inside.
         #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
         agent: AgentKind,
+        /// Rebuild the agent container image before starting, even if it
+        /// already exists locally. The proxy image is still built only if
+        /// missing.
+        #[arg(long)]
+        rebuild_image: bool,
         /// Extra arguments forwarded to the chosen agent inside the container.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         passthrough: Vec<String>,
@@ -33,6 +38,10 @@ pub enum Commands {
     /// binary so you can poke at the filesystem, curl endpoints, etc.
     #[command(long_about = SHELL_HELP)]
     Shell {
+        /// Rebuild the agent container image before starting the shell,
+        /// even if it already exists locally.
+        #[arg(long)]
+        rebuild_image: bool,
         /// Optional command to exec inside bash instead of dropping to a
         /// prompt (e.g. `agent-container shell -- cat /etc/resolv.conf`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -97,6 +106,7 @@ edit proxy allow rules, MCP tool policy, and host task-runner commands."#;
 
 const TOP_LEVEL_EXAMPLES: &str = r#"Examples:
   agent-container run
+  agent-container run --rebuild-image
   agent-container run --agent codex
   agent-container shell
   agent-container config

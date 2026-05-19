@@ -99,6 +99,7 @@ The container images (`agent-container:dev` and
 ```sh
 agent-container run                         # Claude Code
 agent-container run --agent codex           # Codex
+agent-container run --rebuild-image         # rebuild agent-container:dev first
 agent-container run --agent codex -- exec "what does this repo do?"
 ```
 

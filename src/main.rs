@@ -117,8 +117,15 @@ async fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Run { agent, passthrough } => run_cmd(agent, passthrough).await,
-        Commands::Shell { passthrough } => shell_cmd(passthrough).await,
+        Commands::Run {
+            agent,
+            rebuild_image,
+            passthrough,
+        } => run_cmd(agent, rebuild_image, passthrough).await,
+        Commands::Shell {
+            rebuild_image,
+            passthrough,
+        } => shell_cmd(rebuild_image, passthrough).await,
         Commands::Config {
             command,
             global,
@@ -161,7 +168,7 @@ fn should_explain_config_instead_of_tui(cli: &Cli) -> bool {
     )
 }
 
-async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
+async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>) -> Result<()> {
     let host = paths::HostPaths::detect()?;
 
     // Host-side discovery — always performed so broker/sync can populate
@@ -217,7 +224,7 @@ async fn run_cmd(agent: AgentKind, passthrough: Vec<String>) -> Result<()> {
     let claude_creds = prepare_claude_credentials(&host, claude_is_primary, bedrock.is_some())?;
     let codex_auth = prepare_codex_auth(&host, codex_is_primary)?;
 
-    docker::ensure_images(&docker::default_dockerfile_dir())
+    docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
         .await
         .context("failed to build or locate container images")?;
 
@@ -301,7 +308,7 @@ fn claude_agent_command() -> Vec<String> {
     ]
 }
 
-async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
+async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> {
     let host = paths::HostPaths::detect()?;
 
     // Discovery is the same as `run`, except we downgrade every auth
@@ -341,7 +348,7 @@ async fn shell_cmd(passthrough: Vec<String>) -> Result<()> {
         }
     };
 
-    docker::ensure_images(&docker::default_dockerfile_dir())
+    docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
         .await
         .context("failed to build or locate container images")?;
 
