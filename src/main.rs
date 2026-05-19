@@ -295,7 +295,8 @@ fn claude_agent_command() -> Vec<String> {
     vec![
         "sh".to_string(),
         "-lc".to_string(),
-        "exec env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 tmux new-session -A -s claude-code -- claude --dangerously-skip-permissions \"$@\"".to_string(),
+        "exec tmux new-session -A -s claude-code -- claude --dangerously-skip-permissions \"$@\""
+            .to_string(),
         "agent-container-claude".to_string(),
     ]
 }

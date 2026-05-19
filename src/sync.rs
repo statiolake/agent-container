@@ -187,6 +187,7 @@ fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
         // Always strip the older awsAuthRefresh key we used to inject in
         // case a stale persistent home still has it.
         obj.remove("awsAuthRefresh");
+        inject_agent_teams_env(obj);
 
         if !opts.mcp_servers.is_empty() || opts.task_runner_enabled {
             obj.insert(
@@ -303,6 +304,7 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
             obj.remove("awsCredentialExport");
         }
         obj.remove("awsAuthRefresh");
+        inject_agent_teams_env(obj);
     }
     let dest_dir = host.container_home.join(".claude");
     fs::create_dir_all(&dest_dir)?;
@@ -338,6 +340,20 @@ fn strip_keys(obj: &mut serde_json::Map<String, Value>) {
     for key in COMMON_STRIP {
         obj.remove(*key);
     }
+}
+
+fn inject_agent_teams_env(obj: &mut serde_json::Map<String, Value>) {
+    let env = obj
+        .entry("env".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !env.is_object() {
+        *env = Value::Object(serde_json::Map::new());
+    }
+    let env = env.as_object_mut().expect("env must be an object");
+    env.insert(
+        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS".to_string(),
+        Value::String("1".to_string()),
+    );
 }
 
 fn sync_claude_extensions(host: &HostPaths) -> Result<()> {
@@ -539,9 +555,18 @@ mod tests {
             &fs::read_to_string(container_home.path().join(".claude.json")).unwrap(),
         )
         .unwrap();
-        for key in ["mcpServers", "env", "hooks", "permissions", "sandbox"] {
+        for key in ["mcpServers", "hooks", "permissions", "sandbox"] {
             assert!(out.get(key).is_none(), "top-level {key} must be removed");
         }
+        let env = out["env"].as_object().expect("agent env injected");
+        assert_eq!(
+            env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"].as_str(),
+            Some("1")
+        );
+        assert!(
+            env.get("HOST_ONLY").is_none(),
+            "host env values must not survive"
+        );
         assert_eq!(out["hasCompletedOnboarding"], serde_json::json!(true));
         let projects = out["projects"].as_object().unwrap();
         assert_eq!(projects.len(), 1, "only current workspace survives");
@@ -756,9 +781,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["theme"], serde_json::json!("dark"));
-        for key in ["env", "hooks", "permissions", "mcpServers"] {
+        for key in ["hooks", "permissions", "mcpServers"] {
             assert!(out.get(key).is_none(), "{key} should be stripped");
         }
+        let env = out["env"].as_object().expect("agent env injected");
+        assert_eq!(
+            env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"].as_str(),
+            Some("1")
+        );
+        assert!(env.get("FOO").is_none(), "host env values must not survive");
         // The host's `{"mode": "strict"}` must not survive; the container
         // gets an explicit `enabled: false` injection instead.
         assert_eq!(
@@ -806,6 +837,10 @@ mod tests {
         assert!(export.contains("-x http://proxy:8888"));
         // env is rebuilt for Claude Code that reads it from settings.json
         let env = out["env"].as_object().expect("env object injected");
+        assert_eq!(
+            env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"].as_str(),
+            Some("1")
+        );
         assert_eq!(env["CLAUDE_CODE_USE_BEDROCK"].as_str(), Some("1"));
         assert_eq!(
             env["ANTHROPIC_MODEL"].as_str(),
