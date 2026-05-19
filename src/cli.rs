@@ -157,13 +157,15 @@ Supported TOML shape:
 
   [task_runner.tasks]
   build_image = "docker build -t my-app ."
-  deploy = "scripts/deploy \"$env\""
+  deploy = "\"$CONFIG_ROOT/scripts/deploy\" \"$env\""
 
 `proxy.allow` entries are tinyproxy extended regex patterns. MCP server and
 tool entries control which host MCP tools are exposed through the broker.
 Each task-runner entry becomes an MCP tool that runs on the host; MCP
 arguments are passed as environment variables, so a task command can refer to
-`$env`, `$value`, and similar names."#;
+`$env`, `$value`, and similar names. `$CONFIG_ROOT` points at the
+agent-container settings directory that defined the task, so global and
+workspace task scripts can use the same command shape."#;
 
 const CONFIG_EXAMPLES: &str = r#"Examples:
   agent-container config

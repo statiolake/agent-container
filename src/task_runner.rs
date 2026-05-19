@@ -19,6 +19,7 @@
 //!   lands in a single JSON-RPC response.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -33,11 +34,17 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskRunner {
-    pub tasks: BTreeMap<String, String>,
+    pub tasks: BTreeMap<String, TaskSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSpec {
+    pub command: String,
+    pub config_root: PathBuf,
 }
 
 impl TaskRunner {
-    pub fn new(tasks: BTreeMap<String, String>) -> Self {
+    pub fn new(tasks: BTreeMap<String, TaskSpec>) -> Self {
         Self { tasks }
     }
 
@@ -103,11 +110,12 @@ impl TaskRunner {
         let tools: Vec<Value> = self
             .tasks
             .iter()
-            .map(|(name, cmd)| {
+            .map(|(name, task)| {
+                let cmd = &task.command;
                 json!({
                     "name": name,
                     "description": format!(
-                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`."
+                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. `$CONFIG_ROOT` points at the agent-container settings directory that defined this task."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -144,7 +152,7 @@ impl TaskRunner {
             Ok(invocation) => invocation,
             Err(msg) => return invalid_params(id, &msg),
         };
-        let Some(command) = self.tasks.get(&name) else {
+        let Some(task) = self.tasks.get(&name) else {
             return tool_error(
                 id,
                 format!(
@@ -154,8 +162,8 @@ impl TaskRunner {
         };
 
         let env_keys: Vec<_> = invocation.env.keys().cloned().collect();
-        tracing::info!(task = %name, command = %command, env_keys = ?env_keys, "task-runner dispatching");
-        match run_command(command, &invocation).await {
+        tracing::info!(task = %name, command = %task.command, config_root = %task.config_root.display(), env_keys = ?env_keys, "task-runner dispatching");
+        match run_command(task, &invocation).await {
             Ok(output) => {
                 let text = format_output(&output);
                 success(
@@ -221,12 +229,13 @@ fn is_valid_env_key(key: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-async fn run_command(command: &str, invocation: &CmdInvocation) -> Result<CmdOutput> {
+async fn run_command(task: &TaskSpec, invocation: &CmdInvocation) -> Result<CmdOutput> {
     // Wrap the user's command line in `sh -c` so pipes, quoting, and env
     // expansions behave the way the operator expects when they typed it.
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command);
+    cmd.arg("-c").arg(&task.command);
     cmd.envs(&invocation.env);
+    cmd.env("CONFIG_ROOT", &task.config_root);
     let out = cmd.output().await.context("failed to spawn command")?;
     Ok(CmdOutput {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -311,11 +320,18 @@ fn tool_error(id: Value, msg: String) -> Value {
 mod tests {
     use super::*;
 
+    fn task(command: impl Into<String>, config_root: impl Into<PathBuf>) -> TaskSpec {
+        TaskSpec {
+            command: command.into(),
+            config_root: config_root.into(),
+        }
+    }
+
     fn build() -> TaskRunner {
         let mut tasks = BTreeMap::new();
-        tasks.insert("echo".into(), "echo hi".into());
-        tasks.insert("succeed".into(), "true".into());
-        tasks.insert("fail".into(), "false".into());
+        tasks.insert("echo".into(), task("echo hi", "/tmp/agent-container-test"));
+        tasks.insert("succeed".into(), task("true", "/tmp/agent-container-test"));
+        tasks.insert("fail".into(), task("false", "/tmp/agent-container-test"));
         TaskRunner::new(tasks)
     }
 
@@ -382,7 +398,10 @@ mod tests {
         let mut tasks = BTreeMap::new();
         tasks.insert(
             "expand".into(),
-            "printf '%s/%s/%s\\n' \"$value\" \"$count\" \"$enabled\"".into(),
+            task(
+                "printf '%s/%s/%s\\n' \"$value\" \"$count\" \"$enabled\"",
+                "/tmp/agent-container-test",
+            ),
         );
         let r = TaskRunner::new(tasks);
         let req = br#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"expand","arguments":{"value":"hello world","count":42,"enabled":true}}}"#;
@@ -390,6 +409,22 @@ mod tests {
         assert_eq!(resp["result"]["isError"], false);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("hello world/42/true"));
+    }
+
+    #[tokio::test]
+    async fn config_root_points_at_task_settings_root() {
+        let mut tasks = BTreeMap::new();
+        tasks.insert(
+            "root".into(),
+            task("printf '%s\\n' \"$CONFIG_ROOT\"", "/tmp/task-root"),
+        );
+        let r = TaskRunner::new(tasks);
+        let req = br#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"root","arguments":{"CONFIG_ROOT":"tool-argument-must-not-win"}}}"#;
+        let resp = r.handle(req).await.unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("/tmp/task-root"));
+        assert!(!text.contains("tool-argument-must-not-win"));
     }
 
     #[tokio::test]

@@ -186,7 +186,8 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         .context("failed to load agent-container settings (global + workspace)")?;
     let policy = merged_settings.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
-    let task_runner = build_task_runner(&merged_settings.task_runner.tasks, &mcp_servers);
+    let task_runner_tasks = load_task_runner_tasks(&host)?;
+    let task_runner = build_task_runner(&task_runner_tasks, &mcp_servers);
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
     ));
@@ -328,7 +329,8 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     let merged_settings = settings::Settings::load_merged(&host.workspace).unwrap_or_default();
     let policy = merged_settings.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
-    let task_runner = build_task_runner(&merged_settings.task_runner.tasks, &mcp_servers);
+    let task_runner_tasks = load_task_runner_tasks(&host).unwrap_or_default();
+    let task_runner = build_task_runner(&task_runner_tasks, &mcp_servers);
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().unwrap_or_default(),
     ));
@@ -461,7 +463,7 @@ fn prepare_claude_credentials(
 /// `~/.claude.json` (we'd clobber their setup otherwise). Empty task
 /// tables resolve to None so the broker doesn't register an empty MCP.
 fn build_task_runner(
-    tasks: &std::collections::BTreeMap<String, String>,
+    tasks: &std::collections::BTreeMap<String, task_runner::TaskSpec>,
     declared_servers: &[mcp::McpServer],
 ) -> Option<task_runner::TaskRunner> {
     if tasks.is_empty() {
@@ -478,6 +480,47 @@ fn build_task_runner(
         return None;
     }
     Some(task_runner::TaskRunner::new(tasks.clone()))
+}
+
+fn load_task_runner_tasks(
+    host: &paths::HostPaths,
+) -> Result<std::collections::BTreeMap<String, task_runner::TaskSpec>> {
+    let mut tasks = std::collections::BTreeMap::new();
+
+    let global_path = settings::global_path()?;
+    let global_root = global_path
+        .parent()
+        .context("global settings path has no parent")?
+        .to_path_buf();
+    let global = settings::Settings::load_global().context("failed to load global settings")?;
+    for (name, command) in global.task_runner.tasks {
+        tasks.insert(
+            name,
+            task_runner::TaskSpec {
+                command,
+                config_root: global_root.clone(),
+            },
+        );
+    }
+
+    let workspace_path = settings::workspace_path(&host.workspace);
+    let workspace_root = workspace_path
+        .parent()
+        .context("workspace settings path has no parent")?
+        .to_path_buf();
+    let workspace = settings::Settings::load_workspace(&host.workspace)
+        .context("failed to load workspace settings")?;
+    for (name, command) in workspace.task_runner.tasks {
+        tasks.insert(
+            name,
+            task_runner::TaskSpec {
+                command,
+                config_root: workspace_root.clone(),
+            },
+        );
+    }
+
+    Ok(tasks)
 }
 
 fn prepare_codex_auth(

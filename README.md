@@ -258,6 +258,10 @@ inside the container.
 Task tool arguments are passed to the host command as environment variables.
 For example, a task command containing `$value` can be called with a MCP
 argument named `value`, and the shell will expand it before execution.
+Each task also gets `CONFIG_ROOT`, pointing at the `.agent-container`
+directory or global config directory that defined that task. Use it for
+commands such as `"$CONFIG_ROOT/scripts/foo.sh"` when global and
+workspace tasks share the same layout.
 
 ## Known limitations
 
