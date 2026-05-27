@@ -389,7 +389,9 @@ async fn forward_http(
         return Ok(blocked);
     }
 
-    let is_tools_list = parse_method(&body_bytes).as_deref() == Some("tools/list");
+    let method_name = parse_method(&body_bytes);
+    let is_tools_list = method_name.as_deref() == Some("tools/list");
+    let is_initialize = method_name.as_deref() == Some("initialize");
 
     let upstream = state
         .http_client
@@ -444,6 +446,27 @@ async fn forward_http(
             }
             Err(e) => {
                 tracing::warn!(server = %server_name, error = %e, "tools/list filter failed; passing through");
+                raw.to_vec()
+            }
+        };
+        let mut builder = Response::builder().status(status);
+        *builder.headers_mut().expect("response builder headers") = out_headers;
+        return Ok(builder.body(Body::from(body_bytes))?);
+    }
+
+    if is_initialize && is_json && status.is_success() {
+        let raw = upstream
+            .bytes()
+            .await
+            .context("failed to buffer initialize response body")?;
+        let body_bytes = match force_tools_list_changed_body(&raw) {
+            Ok(bytes) => {
+                // Content-Length now reflects the rewritten body.
+                out_headers.remove(reqwest::header::CONTENT_LENGTH.as_str());
+                bytes
+            }
+            Err(e) => {
+                tracing::warn!(server = %server_name, error = %e, "initialize capability rewrite failed; passing through");
                 raw.to_vec()
             }
         };
@@ -550,10 +573,12 @@ async fn forward_stdio_post(
         return Ok(blocked);
     }
 
-    let is_tools_list = parse_method(&body_bytes).as_deref() == Some("tools/list");
+    let method_name = parse_method(&body_bytes);
+    let is_tools_list = method_name.as_deref() == Some("tools/list");
+    let is_initialize = method_name.as_deref() == Some("initialize");
     tracing::debug!(
         server = %server_name,
-        method = parse_method(&body_bytes).as_deref().unwrap_or("<unparsed>"),
+        method = method_name.as_deref().unwrap_or("<unparsed>"),
         body_len = body_bytes.len(),
         "forwarding POST to stdio MCP",
     );
@@ -593,6 +618,14 @@ async fn forward_stdio_post(
             Ok(filtered) => filtered,
             Err(e) => {
                 tracing::warn!(server = %server_name, error = %e, "tools/list filter failed; passing stdio response through");
+                response_bytes
+            }
+        }
+    } else if is_initialize {
+        match force_tools_list_changed_body(&response_bytes) {
+            Ok(rewritten) => rewritten,
+            Err(e) => {
+                tracing::warn!(server = %server_name, error = %e, "initialize capability rewrite failed; passing stdio response through");
                 response_bytes
             }
         }
@@ -695,6 +728,34 @@ fn sse_notification_frame(
             None
         }
     }
+}
+
+fn force_tools_list_changed_body(raw: &[u8]) -> Result<Vec<u8>> {
+    let mut parsed: Value =
+        serde_json::from_slice(raw).context("parsing initialize response as JSON")?;
+    let Some(result) = parsed.get_mut("result") else {
+        return serde_json::to_vec(&parsed).context("re-serialising initialize response");
+    };
+    if !result.is_object() {
+        return serde_json::to_vec(&parsed).context("re-serialising initialize response");
+    }
+
+    let result = result.as_object_mut().expect("checked object");
+    let capabilities = result.entry("capabilities").or_insert_with(|| json!({}));
+    if !capabilities.is_object() {
+        *capabilities = json!({});
+    }
+    let capabilities = capabilities.as_object_mut().expect("checked object");
+    let tools = capabilities.entry("tools").or_insert_with(|| json!({}));
+    if !tools.is_object() {
+        *tools = json!({});
+    }
+    tools
+        .as_object_mut()
+        .expect("checked object")
+        .insert("listChanged".to_string(), Value::Bool(true));
+
+    serde_json::to_vec(&parsed).context("re-serialising initialize response")
 }
 
 /// Run the tool-call allowlist gate. Returns a pre-built JSON-RPC error
@@ -1172,6 +1233,23 @@ mod tests {
         assert!(text.starts_with("data: "));
         assert!(text.contains("notifications/tools/list_changed"));
         assert!(text.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn initialize_rewrite_advertises_tools_list_changed() {
+        let raw = br#"{
+          "jsonrpc":"2.0",
+          "id":1,
+          "result":{
+            "protocolVersion":"2025-06-18",
+            "capabilities":{"tools":{}},
+            "serverInfo":{"name":"upstream","version":"1.0.0"}
+          }
+        }"#;
+        let out = force_tools_list_changed_body(raw).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["result"]["capabilities"]["tools"]["listChanged"], true);
+        assert_eq!(v["result"]["serverInfo"]["name"], "upstream");
     }
 
     #[tokio::test]
