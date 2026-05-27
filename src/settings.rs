@@ -20,6 +20,9 @@
 //! lint = "cargo check"
 //! build = "cargo build --release"
 //!
+//! [host_fs]
+//! allow = ["/Users/me/project-notes/**", "!/Users/me/project-notes/secrets/**"]
+//!
 //! [claude]
 //! tmux_prefix = "C-b"
 //! ```
@@ -42,6 +45,8 @@ pub struct Settings {
     pub mcp: McpPolicy,
     #[serde(default, skip_serializing_if = "TaskRunnerPolicy::is_empty")]
     pub task_runner: TaskRunnerPolicy,
+    #[serde(default, skip_serializing_if = "HostFsPolicy::is_empty")]
+    pub host_fs: HostFsPolicy,
     #[serde(default, skip_serializing_if = "ClaudePolicy::is_empty")]
     pub claude: ClaudePolicy,
 }
@@ -74,6 +79,22 @@ pub struct TaskRunnerPolicy {
 impl TaskRunnerPolicy {
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
+    }
+}
+
+/// Host filesystem access exposed through the built-in `host-fs` MCP
+/// server. Patterns use an allowlist form of gitignore-like glob rules:
+/// unprefixed patterns allow access, `!pattern` denies access, and the
+/// initial state is denied (as if `!*` had already matched).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostFsPolicy {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+}
+
+impl HostFsPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty()
     }
 }
 
@@ -148,6 +169,7 @@ impl Settings {
             },
             mcp: McpPolicy::default(),
             task_runner: TaskRunnerPolicy::default(),
+            host_fs: HostFsPolicy::default(),
             claude: ClaudePolicy::default(),
         }
     }
@@ -201,6 +223,8 @@ impl Settings {
     ///   overlay keep their base definition.
     /// - `task_runner.tasks.<name>`: same as MCP — overlay's same-named
     ///   task replaces the base's, others pass through.
+    /// - `host_fs.allow`: overlay entries are appended to the base list,
+    ///   preserving order and removing exact duplicates.
     pub fn merge_in_place(&mut self, overlay: Self) {
         for pat in overlay.proxy.allow {
             if !self.proxy.allow.contains(&pat) {
@@ -212,6 +236,11 @@ impl Settings {
         }
         for (name, cmd) in overlay.task_runner.tasks {
             self.task_runner.tasks.insert(name, cmd);
+        }
+        for pat in overlay.host_fs.allow {
+            if !self.host_fs.allow.contains(&pat) {
+                self.host_fs.allow.push(pat);
+            }
         }
         if overlay.claude.tmux_prefix.is_some() {
             self.claude.tmux_prefix = overlay.claude.tmux_prefix;

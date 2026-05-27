@@ -4,6 +4,7 @@ mod codex;
 mod config_cmd;
 mod creds;
 mod docker;
+mod host_fs;
 mod host_kind;
 mod mcp;
 mod mcp_client;
@@ -188,6 +189,7 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
     let proxy_allow = merged_settings.proxy.allow.clone();
     let task_runner_tasks = load_task_runner_tasks(&host)?;
     let task_runner = build_task_runner(&task_runner_tasks, &mcp_servers);
+    let host_fs = build_host_fs(&host.workspace, &mcp_servers);
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
     ));
@@ -234,10 +236,12 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         host_root: host.workspace.display().to_string(),
     };
     let task_runner_enabled = task_runner.is_some();
+    let host_fs_enabled = host_fs.is_some();
     let broker = server::spawn(
         bedrock.clone().map(|b| (b, refresh.clone())),
         mcp_servers.clone(),
         task_runner,
+        host_fs,
         policy,
         oauth_store.clone(),
         Some(stdio_bridge),
@@ -264,6 +268,7 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
             broker_url_from_container: &broker_url_from_container,
             mcp_servers: &mcp_servers,
             task_runner_enabled,
+            host_fs_enabled,
         },
     )
     .context("failed to sync host Claude Code state into container")?;
@@ -356,6 +361,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     let proxy_allow = merged_settings.proxy.allow.clone();
     let task_runner_tasks = load_task_runner_tasks(&host).unwrap_or_default();
     let task_runner = build_task_runner(&task_runner_tasks, &mcp_servers);
+    let host_fs = build_host_fs(&host.workspace, &mcp_servers);
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().unwrap_or_default(),
     ));
@@ -384,10 +390,12 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         host_root: host.workspace.display().to_string(),
     };
     let task_runner_enabled = task_runner.is_some();
+    let host_fs_enabled = host_fs.is_some();
     let broker = server::spawn(
         bedrock.clone().map(|b| (b, refresh.clone())),
         mcp_servers.clone(),
         task_runner,
+        host_fs,
         policy,
         oauth_store,
         Some(stdio_bridge),
@@ -412,6 +420,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
             broker_url_from_container: &broker_url_from_container,
             mcp_servers: &mcp_servers,
             task_runner_enabled,
+            host_fs_enabled,
         },
     )
     .context("failed to sync host Claude Code state into container")?;
@@ -507,6 +516,20 @@ fn build_task_runner(
         return None;
     }
     Some(task_runner::TaskRunner::new(tasks.clone()))
+}
+
+fn build_host_fs(
+    workspace: &std::path::Path,
+    declared_servers: &[mcp::McpServer],
+) -> Option<host_fs::HostFs> {
+    if declared_servers.iter().any(|s| s.name() == host_fs::NAME) {
+        eprintln!(
+            "[agent-container] note: skipping built-in host-fs because ~/.claude.json already declares an MCP server named '{}'",
+            host_fs::NAME
+        );
+        return None;
+    }
+    Some(host_fs::HostFs::new(workspace.to_path_buf()))
 }
 
 fn load_task_runner_tasks(

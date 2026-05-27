@@ -31,6 +31,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::aws::{BedrockCredentials, BedrockSetup, resolve_credentials};
+use crate::host_fs::{self, HostFs};
 use crate::mcp::{HttpMcpServer, McpServer};
 use crate::oauth::OAuthStore;
 use crate::policy::McpPolicy;
@@ -41,6 +42,7 @@ enum McpBackend {
     Http(HttpMcpServer),
     Stdio(StdioHandle),
     TaskRunner(Arc<TaskRunner>),
+    HostFs(Arc<HostFs>),
 }
 
 impl Clone for McpBackend {
@@ -49,6 +51,7 @@ impl Clone for McpBackend {
             Self::Http(h) => Self::Http(h.clone()),
             Self::Stdio(h) => Self::Stdio(h.clone()),
             Self::TaskRunner(r) => Self::TaskRunner(r.clone()),
+            Self::HostFs(h) => Self::HostFs(h.clone()),
         }
     }
 }
@@ -79,6 +82,7 @@ pub async fn spawn(
     bedrock: Option<(BedrockSetup, Option<String>)>,
     mcp_servers: Vec<McpServer>,
     task_runner: Option<TaskRunner>,
+    host_fs: Option<HostFs>,
     policy: McpPolicy,
     oauth: Arc<OAuthStore>,
     stdio_bridge: Option<PathBridge>,
@@ -138,6 +142,20 @@ pub async fn spawn(
             mcp.insert(
                 task_runner::NAME.to_string(),
                 McpBackend::TaskRunner(Arc::new(runner)),
+            );
+        }
+    }
+    if let Some(host_fs) = host_fs {
+        if mcp.contains_key(host_fs::NAME) {
+            eprintln!(
+                "[agent-container] note: a user-declared MCP server named '{}' already exists — skipping the built-in host-fs",
+                host_fs::NAME
+            );
+        } else {
+            notifications.insert(host_fs::NAME.to_string(), new_notification_channel());
+            mcp.insert(
+                host_fs::NAME.to_string(),
+                McpBackend::HostFs(Arc::new(host_fs)),
             );
         }
     }
@@ -317,6 +335,7 @@ async fn forward_mcp(name: &str, rest: &str, state: Arc<BrokerState>, req: Reque
         McpBackend::Http(_) => BackendKind::Http,
         McpBackend::Stdio(_) => BackendKind::Stdio,
         McpBackend::TaskRunner(_) => BackendKind::TaskRunner,
+        McpBackend::HostFs(_) => BackendKind::HostFs,
     });
     let Some(kind) = backend_kind else {
         return (
@@ -330,6 +349,7 @@ async fn forward_mcp(name: &str, rest: &str, state: Arc<BrokerState>, req: Reque
         BackendKind::Http => forward_http(state, name, rest, req).await,
         BackendKind::Stdio => forward_stdio(state, name, req).await,
         BackendKind::TaskRunner => forward_task_runner(state, name, req).await,
+        BackendKind::HostFs => forward_host_fs(state, name, req).await,
     };
     match result {
         Ok(resp) => resp,
@@ -344,6 +364,7 @@ enum BackendKind {
     Http,
     Stdio,
     TaskRunner,
+    HostFs,
 }
 
 async fn forward_http(
@@ -519,6 +540,46 @@ async fn forward_task_runner(
     match runner.handle(&body_bytes).await {
         Some(value) => {
             let bytes = serde_json::to_vec(&value).context("encoding task-runner response")?;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(bytes))?)
+        }
+        None => Ok(Response::builder()
+            .status(StatusCode::ACCEPTED)
+            .body(Body::empty())?),
+    }
+}
+
+async fn forward_host_fs(
+    state: Arc<BrokerState>,
+    server_name: &str,
+    req: Request,
+) -> Result<Response> {
+    let host_fs = match state.mcp.read().await.get(server_name) {
+        Some(McpBackend::HostFs(h)) => h.clone(),
+        _ => bail!("internal: expected HostFs backend for '{server_name}'"),
+    };
+
+    if req.method() == axum::http::Method::GET {
+        return forward_local_notifications_get(state, server_name).await;
+    }
+
+    if req.method() != axum::http::Method::POST {
+        return Ok(Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(axum::http::header::ALLOW, "POST")
+            .body(Body::from("host-fs accepts POST only"))?);
+    }
+
+    let (_parts, body) = req.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .context("failed to buffer request body")?;
+
+    match host_fs.handle(&body_bytes).await {
+        Some(value) => {
+            let bytes = serde_json::to_vec(&value).context("encoding host-fs response")?;
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(axum::http::header::CONTENT_TYPE, "application/json")

@@ -120,6 +120,8 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
         initial_scope,
         proxy_allow_global: global_settings.proxy.allow.clone(),
         proxy_allow_workspace: workspace_settings.proxy.allow.clone(),
+        host_fs_allow_global: global_settings.host_fs.allow.clone(),
+        host_fs_allow_workspace: workspace_settings.host_fs.allow.clone(),
         tool_catalog: entries,
         mcp_global: global_settings.mcp.clone(),
         mcp_workspace: workspace_settings.mcp.clone(),
@@ -148,6 +150,10 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
             target.proxy.allow = match saved_scope {
                 Scope::Global => out.proxy_allow_global,
                 Scope::Workspace => out.proxy_allow_workspace,
+            };
+            target.host_fs.allow = match saved_scope {
+                Scope::Global => out.host_fs_allow_global,
+                Scope::Workspace => out.host_fs_allow_workspace,
             };
             target.mcp = match saved_scope {
                 Scope::Global => out.mcp_global,
@@ -267,7 +273,7 @@ fn template_for(scope: Scope) -> String {
         }
     };
     format!(
-        "{header}\n# Uncomment examples below.\n# [proxy]\n# allow = [\"^my-internal\\\\.example$\"]\n\n# [mcp.servers.github]\n# enabled = true\n# [mcp.servers.github.tools]\n# list_issues = true\n# create_issue = false\n\n# [claude]\n# tmux_prefix = \"C-b\"\n"
+        "{header}\n# Uncomment examples below.\n# [proxy]\n# allow = [\"^my-internal\\\\.example$\"]\n\n# [host_fs]\n# allow = [\"/Users/me/project-notes/**\", \"!/Users/me/project-notes/secrets/**\"]\n\n# [mcp.servers.github]\n# enabled = true\n# [mcp.servers.github.tools]\n# list_issues = true\n# create_issue = false\n\n# [claude]\n# tmux_prefix = \"C-b\"\n"
     )
 }
 

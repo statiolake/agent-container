@@ -225,6 +225,8 @@ pub struct TuiInput {
     /// the TUI.
     pub proxy_allow_global: Vec<String>,
     pub proxy_allow_workspace: Vec<String>,
+    pub host_fs_allow_global: Vec<String>,
+    pub host_fs_allow_workspace: Vec<String>,
     /// Static catalog of every (server, tool) the merged settings know
     /// about — used to render the MCP tab regardless of scope.
     pub tool_catalog: Vec<ToolEntry>,
@@ -246,6 +248,8 @@ pub struct TuiOutput {
     pub saved_scope: Scope,
     pub proxy_allow_global: Vec<String>,
     pub proxy_allow_workspace: Vec<String>,
+    pub host_fs_allow_global: Vec<String>,
+    pub host_fs_allow_workspace: Vec<String>,
     pub mcp_global: McpPolicy,
     pub mcp_workspace: McpPolicy,
     pub tasks_global: BTreeMap<String, String>,
@@ -260,33 +264,47 @@ pub enum Outcome {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TopTab {
     Proxy,
+    HostFs,
     Mcp,
 }
 
 impl TopTab {
     fn next(self) -> Self {
         match self {
-            TopTab::Proxy => TopTab::Mcp,
+            TopTab::Proxy => TopTab::HostFs,
+            TopTab::HostFs => TopTab::Mcp,
             TopTab::Mcp => TopTab::Proxy,
         }
     }
     fn prev(self) -> Self {
-        self.next()
+        match self {
+            TopTab::Proxy => TopTab::Mcp,
+            TopTab::HostFs => TopTab::Proxy,
+            TopTab::Mcp => TopTab::HostFs,
+        }
     }
-    fn titles() -> [&'static str; 2] {
-        ["Proxy", "MCP"]
+    fn titles() -> [&'static str; 3] {
+        ["Proxy", "Host FS", "MCP"]
     }
     fn index(self) -> usize {
         match self {
             TopTab::Proxy => 0,
-            TopTab::Mcp => 1,
+            TopTab::HostFs => 1,
+            TopTab::Mcp => 2,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatternTarget {
+    Proxy,
+    HostFs,
 }
 
 enum Mode {
     Normal,
     ProxyInput {
+        target: PatternTarget,
         buffer: TextField,
         /// `Some(row)` when editing an existing entry; `None` for adds.
         /// The row carries the origin scope so the commit knows whether
@@ -799,6 +817,8 @@ enum RowAction {
 struct Snapshot {
     proxy_global: Vec<String>,
     proxy_workspace: Vec<String>,
+    host_fs_global: Vec<String>,
+    host_fs_workspace: Vec<String>,
     mcp_global: McpPolicy,
     mcp_workspace: McpPolicy,
     tasks_global: BTreeMap<String, String>,
@@ -811,6 +831,7 @@ struct App {
     /// Holds both scopes' allow lists; the visible rows are derived
     /// from `scope`. Cursor is on the rendered (merged) view.
     proxy: ProxyState,
+    host_fs: ProxyState,
     mcp: McpState,
     mode: Mode,
     list_state: ListState,
@@ -824,6 +845,8 @@ impl App {
         let initial = Snapshot {
             proxy_global: input.proxy_allow_global.clone(),
             proxy_workspace: input.proxy_allow_workspace.clone(),
+            host_fs_global: input.host_fs_allow_global.clone(),
+            host_fs_workspace: input.host_fs_allow_workspace.clone(),
             mcp_global: input.mcp_global.clone(),
             mcp_workspace: input.mcp_workspace.clone(),
             tasks_global: input.tasks_global.clone(),
@@ -833,6 +856,7 @@ impl App {
             scope: input.initial_scope,
             tab: TopTab::Proxy,
             proxy: ProxyState::new(input.proxy_allow_global, input.proxy_allow_workspace),
+            host_fs: ProxyState::new(input.host_fs_allow_global, input.host_fs_allow_workspace),
             mcp: McpState::new(
                 input.tool_catalog,
                 input.mcp_global,
@@ -849,6 +873,8 @@ impl App {
     fn has_unsaved_changes(&self) -> bool {
         self.proxy.global != self.initial.proxy_global
             || self.proxy.workspace != self.initial.proxy_workspace
+            || self.host_fs.global != self.initial.host_fs_global
+            || self.host_fs.workspace != self.initial.host_fs_workspace
             || self.mcp.mcp_global != self.initial.mcp_global
             || self.mcp.mcp_workspace != self.initial.mcp_workspace
             || self.mcp.tasks_global != self.initial.tasks_global
@@ -864,10 +890,10 @@ impl App {
         // panel happens to be active. The MCP cursor is naturally bounded
         // by visible_rows(); for the proxy panel we re-clamp here so an
         // out-of-range cursor doesn't render off-list.
-        if self.tab == TopTab::Proxy {
-            let len = self.proxy.visible_rows(self.scope).len();
-            if self.proxy.cursor >= len {
-                self.proxy.cursor = len.saturating_sub(1);
+        if matches!(self.tab, TopTab::Proxy | TopTab::HostFs) {
+            let len = self.active_patterns().visible_rows(self.scope).len();
+            if self.active_patterns().cursor >= len {
+                self.active_patterns_mut().cursor = len.saturating_sub(1);
             }
         }
     }
@@ -875,9 +901,26 @@ impl App {
     fn sync_list_state(&mut self) {
         let cur = match self.tab {
             TopTab::Proxy => self.proxy.cursor,
+            TopTab::HostFs => self.host_fs.cursor,
             TopTab::Mcp => self.mcp.cursor,
         };
         self.list_state.select(Some(cur));
+    }
+
+    fn active_patterns(&self) -> &ProxyState {
+        match self.tab {
+            TopTab::Proxy => &self.proxy,
+            TopTab::HostFs => &self.host_fs,
+            TopTab::Mcp => &self.proxy,
+        }
+    }
+
+    fn active_patterns_mut(&mut self) -> &mut ProxyState {
+        match self.tab {
+            TopTab::Proxy => &mut self.proxy,
+            TopTab::HostFs => &mut self.host_fs,
+            TopTab::Mcp => &mut self.proxy,
+        }
     }
 
     fn into_output(self) -> TuiOutput {
@@ -885,6 +928,8 @@ impl App {
             saved_scope: self.scope,
             proxy_allow_global: self.proxy.global,
             proxy_allow_workspace: self.proxy.workspace,
+            host_fs_allow_global: self.host_fs.global,
+            host_fs_allow_workspace: self.host_fs.workspace,
             mcp_global: self.mcp.mcp_global,
             mcp_workspace: self.mcp.mcp_workspace,
             tasks_global: self.mcp.tasks_global,
@@ -897,6 +942,7 @@ fn handle_proxy_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
     // Pull the current input buffer out first so we can mutate `app.mode`
     // (to Normal on commit/cancel) without aliasing the same borrow.
     let Mode::ProxyInput {
+        target,
         mut buffer,
         editing,
     } = std::mem::replace(&mut app.mode, Mode::Normal)
@@ -909,7 +955,10 @@ fn handle_proxy_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         KeyCode::Esc => return,
         KeyCode::Char('c') if ctrl => return,
         KeyCode::Enter => {
-            app.proxy.upsert(app.scope, buffer.value(), editing);
+            match target {
+                PatternTarget::Proxy => app.proxy.upsert(app.scope, buffer.value(), editing),
+                PatternTarget::HostFs => app.host_fs.upsert(app.scope, buffer.value(), editing),
+            }
             return;
         }
         _ => {
@@ -917,7 +966,11 @@ fn handle_proxy_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
     }
 
-    app.mode = Mode::ProxyInput { buffer, editing };
+    app.mode = Mode::ProxyInput {
+        target,
+        buffer,
+        editing,
+    };
 }
 
 fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -1089,18 +1142,22 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             KeyCode::Char('t') => app.toggle_scope(),
             KeyCode::Up | KeyCode::Char('k') => match app.tab {
                 TopTab::Proxy => app.proxy.move_up(),
+                TopTab::HostFs => app.host_fs.move_up(),
                 TopTab::Mcp => app.mcp.move_up(),
             },
             KeyCode::Down | KeyCode::Char('j') => match app.tab {
                 TopTab::Proxy => app.proxy.move_down(app.scope),
+                TopTab::HostFs => app.host_fs.move_down(app.scope),
                 TopTab::Mcp => app.mcp.move_down(app.scope),
             },
             KeyCode::Home | KeyCode::Char('g') => match app.tab {
                 TopTab::Proxy => app.proxy.jump_home(),
+                TopTab::HostFs => app.host_fs.jump_home(),
                 TopTab::Mcp => app.mcp.jump_home(),
             },
             KeyCode::End | KeyCode::Char('G') => match app.tab {
                 TopTab::Proxy => app.proxy.jump_end(app.scope),
+                TopTab::HostFs => app.host_fs.jump_end(app.scope),
                 TopTab::Mcp => app.mcp.jump_end(app.scope),
             },
             KeyCode::Char(' ') | KeyCode::Enter => match app.tab {
@@ -1111,6 +1168,18 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                         // first.
                         if row.origin == ProxyOrigin::from_scope(app.scope) {
                             app.mode = Mode::ProxyInput {
+                                target: PatternTarget::Proxy,
+                                buffer: TextField::from_str(&row.pattern),
+                                editing: Some(row),
+                            };
+                        }
+                    }
+                }
+                TopTab::HostFs => {
+                    if let Some(row) = app.host_fs.current_row(app.scope) {
+                        if row.origin == ProxyOrigin::from_scope(app.scope) {
+                            app.mode = Mode::ProxyInput {
+                                target: PatternTarget::HostFs,
                                 buffer: TextField::from_str(&row.pattern),
                                 editing: Some(row),
                             };
@@ -1125,6 +1194,14 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             },
             KeyCode::Char('i') | KeyCode::Char('+') if app.tab == TopTab::Proxy => {
                 app.mode = Mode::ProxyInput {
+                    target: PatternTarget::Proxy,
+                    buffer: TextField::default(),
+                    editing: None,
+                };
+            }
+            KeyCode::Char('i') | KeyCode::Char('+') if app.tab == TopTab::HostFs => {
+                app.mode = Mode::ProxyInput {
+                    target: PatternTarget::HostFs,
                     buffer: TextField::default(),
                     editing: None,
                 };
@@ -1136,6 +1213,18 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 if let Some(row) = app.proxy.current_row(app.scope) {
                     if row.origin == ProxyOrigin::from_scope(app.scope) {
                         app.mode = Mode::ProxyInput {
+                            target: PatternTarget::Proxy,
+                            buffer: TextField::from_str(&row.pattern),
+                            editing: Some(row),
+                        };
+                    }
+                }
+            }
+            KeyCode::Char('e') if app.tab == TopTab::HostFs => {
+                if let Some(row) = app.host_fs.current_row(app.scope) {
+                    if row.origin == ProxyOrigin::from_scope(app.scope) {
+                        app.mode = Mode::ProxyInput {
+                            target: PatternTarget::HostFs,
                             buffer: TextField::from_str(&row.pattern),
                             editing: Some(row),
                         };
@@ -1149,6 +1238,9 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             }
             KeyCode::Char('d') if app.tab == TopTab::Proxy => {
                 app.proxy.remove_current(app.scope);
+            }
+            KeyCode::Char('d') if app.tab == TopTab::HostFs => {
+                app.host_fs.remove_current(app.scope);
             }
             KeyCode::Char('d') if app.tab == TopTab::Mcp => {
                 app.mcp.delete_task_at_cursor(app.scope);
@@ -1184,6 +1276,7 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     render_tabs(f, chunks[1], app);
     match app.tab {
         TopTab::Proxy => render_proxy(f, chunks[2], app),
+        TopTab::HostFs => render_host_fs(f, chunks[2], app),
         TopTab::Mcp => render_mcp(f, chunks[2], app),
     }
     render_footer(f, chunks[3], app);
@@ -1200,11 +1293,12 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
 
     // Overlay modal for proxy input.
     if let Mode::ProxyInput {
+        target,
         ref buffer,
         ref editing,
     } = app.mode
     {
-        render_proxy_input_modal(f, area, buffer, editing.is_some());
+        render_proxy_input_modal(f, area, target, buffer, editing.is_some());
     }
 
     if matches!(app.mode, Mode::ConfirmQuit) {
@@ -1265,8 +1359,21 @@ fn render_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_proxy(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
-    let scope = app.scope;
-    let rows = app.proxy.visible_rows(scope);
+    render_pattern_list(f, area, app.scope, &app.proxy, &mut app.list_state);
+}
+
+fn render_host_fs(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+    render_pattern_list(f, area, app.scope, &app.host_fs, &mut app.list_state);
+}
+
+fn render_pattern_list(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    scope: Scope,
+    state: &ProxyState,
+    list_state: &mut ListState,
+) {
+    let rows = state.visible_rows(scope);
     let active = ProxyOrigin::from_scope(scope);
     let items: Vec<ListItem> = if rows.is_empty() {
         let hint = match scope {
@@ -1309,7 +1416,7 @@ fn render_proxy(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶ ");
-    f.render_stateful_widget(list, area, &mut app.list_state);
+    f.render_stateful_widget(list, area, list_state);
 }
 
 fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
@@ -1452,7 +1559,7 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
 
     let help = match app.tab {
-        TopTab::Proxy => Line::from(vec![
+        TopTab::Proxy | TopTab::HostFs => Line::from(vec![
             key("h/l", Color::Cyan),
             Span::raw(" tabs · "),
             key("j/k", Color::Cyan),
@@ -1499,6 +1606,14 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             ),
             Style::default().fg(Color::DarkGray),
         )]),
+        TopTab::HostFs => Line::from(vec![Span::styled(
+            format!(
+                "Global: {} · Workspace: {} host-fs allow pattern(s) · default deny",
+                app.host_fs.global.len(),
+                app.host_fs.workspace.len(),
+            ),
+            Style::default().fg(Color::DarkGray),
+        )]),
         TopTab::Mcp => {
             let total = app.mcp.catalog.len();
             let enabled = (0..total)
@@ -1522,6 +1637,7 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn render_proxy_input_modal(
     f: &mut ratatui::Frame<'_>,
     parent: Rect,
+    target: PatternTarget,
     buffer: &TextField,
     is_edit: bool,
 ) {
@@ -1533,10 +1649,11 @@ fn render_proxy_input_modal(
     let area = Rect::new(x, y, w, h);
 
     f.render_widget(Clear, area);
-    let title = if is_edit {
-        " Edit proxy allow pattern "
-    } else {
-        " Add proxy allow pattern "
+    let title = match (target, is_edit) {
+        (PatternTarget::Proxy, true) => " Edit proxy allow pattern ",
+        (PatternTarget::Proxy, false) => " Add proxy allow pattern ",
+        (PatternTarget::HostFs, true) => " Edit host-fs allow pattern ",
+        (PatternTarget::HostFs, false) => " Add host-fs allow pattern ",
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1929,6 +2046,8 @@ mod tests {
             initial_scope: Scope::Workspace,
             proxy_allow_global: vec!["g".into()],
             proxy_allow_workspace: vec!["w".into()],
+            host_fs_allow_global: vec!["/tmp/shared/**".into()],
+            host_fs_allow_workspace: vec!["!/tmp/shared/secrets/**".into()],
             tool_catalog: vec![entry("s", "t", Some(true))],
             mcp_global: McpPolicy::default(),
             mcp_workspace: McpPolicy::default(),
