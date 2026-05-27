@@ -117,6 +117,11 @@ directory does not exist on the host, an empty read-only directory is
 mounted there so an in-container agent cannot create workspace-local
 agent-container settings for itself.
 
+Claude Code runs inside tmux so agent teams can attach panes. tmux mouse
+support is enabled automatically. The tmux prefix defaults to `C-b`; set
+`[claude] tmux_prefix = "C-q"` in agent-container settings if you want a
+different prefix.
+
 ### Configure the MCP tool allowlist
 
 ```sh

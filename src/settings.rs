@@ -19,6 +19,9 @@
 //! [task_runner.tasks]
 //! lint = "cargo check"
 //! build = "cargo build --release"
+//!
+//! [claude]
+//! tmux_prefix = "C-b"
 //! ```
 
 use std::collections::BTreeMap;
@@ -39,6 +42,8 @@ pub struct Settings {
     pub mcp: McpPolicy,
     #[serde(default, skip_serializing_if = "TaskRunnerPolicy::is_empty")]
     pub task_runner: TaskRunnerPolicy,
+    #[serde(default, skip_serializing_if = "ClaudePolicy::is_empty")]
+    pub claude: ClaudePolicy,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +74,27 @@ pub struct TaskRunnerPolicy {
 impl TaskRunnerPolicy {
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
+    }
+}
+
+/// Claude Code runtime options controlled by agent-container.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_prefix: Option<String>,
+}
+
+impl ClaudePolicy {
+    pub const DEFAULT_TMUX_PREFIX: &'static str = "C-b";
+
+    pub fn is_empty(&self) -> bool {
+        self.tmux_prefix.is_none()
+    }
+
+    pub fn tmux_prefix(&self) -> &str {
+        self.tmux_prefix
+            .as_deref()
+            .unwrap_or(Self::DEFAULT_TMUX_PREFIX)
     }
 }
 
@@ -122,6 +148,7 @@ impl Settings {
             },
             mcp: McpPolicy::default(),
             task_runner: TaskRunnerPolicy::default(),
+            claude: ClaudePolicy::default(),
         }
     }
 
@@ -185,6 +212,9 @@ impl Settings {
         }
         for (name, cmd) in overlay.task_runner.tasks {
             self.task_runner.tasks.insert(name, cmd);
+        }
+        if overlay.claude.tmux_prefix.is_some() {
+            self.claude.tmux_prefix = overlay.claude.tmux_prefix;
         }
     }
 }
@@ -354,6 +384,34 @@ mod tests {
         assert!(raw.contains("lint"));
         let read = Settings::load_from(&path).unwrap();
         assert_eq!(read, written);
+    }
+
+    #[test]
+    fn claude_tmux_prefix_defaults_and_roundtrips() {
+        assert_eq!(ClaudePolicy::default().tmux_prefix(), "C-b");
+
+        let raw = r#"
+          [claude]
+          tmux_prefix = "C-q"
+        "#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(settings.claude.tmux_prefix(), "C-q");
+
+        let serialized = toml::to_string_pretty(&settings).unwrap();
+        assert!(serialized.contains("[claude]"));
+        assert!(serialized.contains("tmux_prefix = \"C-q\""));
+    }
+
+    #[test]
+    fn workspace_claude_tmux_prefix_overrides_global() {
+        let mut base = Settings::default();
+        base.claude.tmux_prefix = Some("C-b".into());
+
+        let mut overlay = Settings::default();
+        overlay.claude.tmux_prefix = Some("C-q".into());
+
+        base.merge_in_place(overlay);
+        assert_eq!(base.claude.tmux_prefix(), "C-q");
     }
 
     #[test]

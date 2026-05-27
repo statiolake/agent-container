@@ -161,13 +161,21 @@ Supported TOML shape:
   build_image = "docker build -t my-app ."
   deploy = "\"$CONFIG_ROOT/scripts/deploy\" \"$env\""
 
+  [claude]
+  tmux_prefix = "C-b"
+
 `proxy.allow` entries are tinyproxy extended regex patterns. MCP server and
 tool entries control which host MCP tools are exposed through the broker.
 Each task-runner entry becomes an MCP tool that runs on the host; MCP
 arguments are passed as environment variables, so a task command can refer to
 `$env`, `$value`, and similar names. `$CONFIG_ROOT` points at the host-side
 agent-container settings directory that defined the task, so global and
-workspace task scripts can use the same command shape."#;
+workspace task scripts can use the same command shape.
+
+Claude Code runs inside tmux so agent teams can attach panes. tmux mouse
+support is enabled automatically. `claude.tmux_prefix` controls tmux's prefix
+key; omit it to keep tmux's default `C-b`, or set it to a tmux key name such
+as `C-q`."#;
 
 const CONFIG_EXAMPLES: &str = r#"Examples:
   agent-container config

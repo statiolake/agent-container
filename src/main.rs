@@ -277,7 +277,7 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         .unwrap_or_else(|| PathBuf::from("/dev/null"));
 
     let agent_command = match agent {
-        AgentKind::Claude => claude_agent_command(),
+        AgentKind::Claude => claude_agent_command(merged_settings.claude.tmux_prefix())?,
         AgentKind::Codex => vec!["codex".to_string()],
     };
 
@@ -299,21 +299,35 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
     std::process::exit(exit);
 }
 
-fn claude_agent_command() -> Vec<String> {
-    vec![
+fn claude_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
+    validate_tmux_key(tmux_prefix)?;
+    Ok(vec![
         "sh".to_string(),
         "-lc".to_string(),
         [
             "exec tmux",
             "start-server \\;",
             "set-option -g mouse on \\;",
-            "set-option -g prefix C-q \\;",
-            "bind-key C-q send-prefix \\;",
+            &format!("set-option -g prefix {tmux_prefix} \\;"),
+            &format!("bind-key {tmux_prefix} send-prefix \\;"),
             "new-session -A -s claude-code -- claude --dangerously-skip-permissions \"$@\"",
         ]
         .join(" "),
         "agent-container-claude".to_string(),
-    ]
+    ])
+}
+
+fn validate_tmux_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        anyhow::bail!(
+            "invalid claude.tmux_prefix `{key}`; use a tmux key name such as `C-b` or `C-q`"
+        );
+    }
+    Ok(())
 }
 
 async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> {
@@ -598,13 +612,19 @@ mod tests {
     }
 
     #[test]
-    fn claude_runs_in_tmux_with_mouse_and_custom_prefix() {
-        let command = claude_agent_command();
+    fn claude_runs_in_tmux_with_mouse_and_configured_prefix() {
+        let command = claude_agent_command("C-q").unwrap();
         let script = &command[2];
 
         assert!(script.contains("set-option -g mouse on"));
         assert!(script.contains("set-option -g prefix C-q"));
         assert!(script.contains("bind-key C-q send-prefix"));
         assert!(script.contains("new-session -A -s claude-code"));
+    }
+
+    #[test]
+    fn claude_tmux_prefix_rejects_shell_metacharacters() {
+        let err = claude_agent_command("C-q;touch").unwrap_err();
+        assert!(format!("{err:#}").contains("invalid claude.tmux_prefix"));
     }
 }
