@@ -303,8 +303,15 @@ fn claude_agent_command() -> Vec<String> {
     vec![
         "sh".to_string(),
         "-lc".to_string(),
-        "exec tmux new-session -A -s claude-code -- claude --dangerously-skip-permissions \"$@\""
-            .to_string(),
+        [
+            "exec tmux",
+            "start-server \\;",
+            "set-option -g mouse on \\;",
+            "set-option -g prefix C-q \\;",
+            "bind-key C-q send-prefix \\;",
+            "new-session -A -s claude-code -- claude --dangerously-skip-permissions \"$@\"",
+        ]
+        .join(" "),
         "agent-container-claude".to_string(),
     ]
 }
@@ -588,5 +595,16 @@ mod tests {
             specs["global-only"].config_root,
             PathBuf::from("/Users/example/.config/agent-container")
         );
+    }
+
+    #[test]
+    fn claude_runs_in_tmux_with_mouse_and_custom_prefix() {
+        let command = claude_agent_command();
+        let script = &command[2];
+
+        assert!(script.contains("set-option -g mouse on"));
+        assert!(script.contains("set-option -g prefix C-q"));
+        assert!(script.contains("bind-key C-q send-prefix"));
+        assert!(script.contains("new-session -A -s claude-code"));
     }
 }
