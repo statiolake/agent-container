@@ -236,6 +236,15 @@ pub fn workspace_path(workspace: &Path) -> PathBuf {
     workspace.join(".agent-container").join("settings.toml")
 }
 
+/// Content fingerprint for the settings files that affect a running
+/// session. Missing/unreadable files are represented explicitly so create,
+/// delete, and edit operations all become observable by simple comparison.
+pub fn watched_file_fingerprint(workspace: &Path) -> Vec<Option<Vec<u8>>> {
+    let global = global_path().ok().and_then(|path| std::fs::read(path).ok());
+    let workspace = std::fs::read(workspace_path(workspace)).ok();
+    vec![global, workspace]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

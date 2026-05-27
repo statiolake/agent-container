@@ -179,11 +179,11 @@ fn new_notification_channel() -> broadcast::Sender<Value> {
 }
 
 async fn watch_mcp_settings(state: Arc<BrokerState>, config: McpReloadConfig) {
-    let mut last = settings_fingerprint(&config.workspace);
+    let mut last = crate::settings::watched_file_fingerprint(&config.workspace);
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
-        let current = settings_fingerprint(&config.workspace);
+        let current = crate::settings::watched_file_fingerprint(&config.workspace);
         if current == last {
             continue;
         }
@@ -192,14 +192,6 @@ async fn watch_mcp_settings(state: Arc<BrokerState>, config: McpReloadConfig) {
             tracing::warn!(error = %e, "failed to reload MCP settings");
         }
     }
-}
-
-fn settings_fingerprint(workspace: &Path) -> Vec<Option<Vec<u8>>> {
-    let global = crate::settings::global_path()
-        .ok()
-        .and_then(|path| std::fs::read(path).ok());
-    let workspace = std::fs::read(crate::settings::workspace_path(workspace)).ok();
-    vec![global, workspace]
 }
 
 async fn reload_mcp_settings(state: &BrokerState, config: &McpReloadConfig) -> Result<()> {

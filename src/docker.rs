@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
@@ -258,6 +259,12 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     if !status.success() {
         bail!("`docker compose up -d proxy` failed");
     }
+    let proxy_reload = tokio::spawn(watch_proxy_settings(
+        ctx.clone(),
+        opts.host.workspace.clone(),
+        allowlist_path.clone(),
+        crate::proxy_allowlist::render(&opts.proxy_allow),
+    ));
 
     // 2) Run the agent in the foreground, inheriting stdio for the TUI.
     let mut cmd = ctx.compose(&["run", "--rm", "--name", &format!("{project}-agent")]);
@@ -272,10 +279,70 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     let status = cmd
         .status()
         .await
-        .context("failed to spawn docker compose run")?;
+        .context("failed to spawn docker compose run");
+    proxy_reload.abort();
+    let status = status?;
 
     // `_cleanup` runs `compose down` on scope exit.
     Ok(status.code().unwrap_or(1))
+}
+
+async fn watch_proxy_settings(
+    ctx: ComposeCtx,
+    workspace: PathBuf,
+    allowlist_path: PathBuf,
+    mut last_allowlist: String,
+) {
+    let mut last_settings = crate::settings::watched_file_fingerprint(&workspace);
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let current = crate::settings::watched_file_fingerprint(&workspace);
+        if current == last_settings {
+            continue;
+        }
+        last_settings = current;
+
+        match reload_proxy_settings(&ctx, &workspace, &allowlist_path, &last_allowlist).await {
+            Ok(Some(next_allowlist)) => {
+                last_allowlist = next_allowlist;
+                eprintln!("[agent-container] proxy allowlist reloaded");
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("[agent-container] warning: failed to reload proxy allowlist: {e:#}")
+            }
+        }
+    }
+}
+
+async fn reload_proxy_settings(
+    ctx: &ComposeCtx,
+    workspace: &Path,
+    allowlist_path: &PathBuf,
+    last_allowlist: &str,
+) -> Result<Option<String>> {
+    let merged = crate::settings::Settings::load_merged(workspace)
+        .context("failed to reload merged settings")?;
+    let next_allowlist = crate::proxy_allowlist::render(&merged.proxy.allow);
+    if next_allowlist == last_allowlist {
+        return Ok(None);
+    }
+
+    crate::proxy_allowlist::generate(&merged.proxy.allow, allowlist_path)
+        .context("failed to materialise updated proxy allowlist for tinyproxy")?;
+
+    let mut cmd = ctx.compose(&["restart", "proxy"]);
+    let status = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .context("failed to spawn docker compose restart proxy")?;
+    if !status.success() {
+        bail!("`docker compose restart proxy` failed with status {status}");
+    }
+    Ok(Some(next_allowlist))
 }
 
 fn empty_workspace_agent_container_dir(pid: u32) -> Result<PathBuf> {
@@ -285,6 +352,7 @@ fn empty_workspace_agent_container_dir(pid: u32) -> Result<PathBuf> {
     Ok(dir)
 }
 
+#[derive(Clone)]
 struct ComposeCtx {
     project: String,
     compose_file: PathBuf,
