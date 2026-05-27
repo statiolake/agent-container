@@ -241,6 +241,10 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         policy,
         oauth_store.clone(),
         Some(stdio_bridge),
+        Some(server::McpReloadConfig {
+            workspace: host.workspace.clone(),
+            task_runner_enabled,
+        }),
     )
     .await?;
     tracing::info!(addr = %broker.addr, "host broker listening");
@@ -387,6 +391,10 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         policy,
         oauth_store,
         Some(stdio_bridge),
+        Some(server::McpReloadConfig {
+            workspace: host.workspace.clone(),
+            task_runner_enabled,
+        }),
     )
     .await?;
     let host_kind = host_kind::HostKind::detect()
@@ -482,14 +490,12 @@ fn prepare_claude_credentials(
 /// Build the optional task-runner backend, skipping it if the user
 /// already has an MCP server by the same name declared in
 /// `~/.claude.json` (we'd clobber their setup otherwise). Empty task
-/// tables resolve to None so the broker doesn't register an empty MCP.
+/// tables still register an empty MCP server so a running session can
+/// discover tasks added later via settings reload.
 fn build_task_runner(
     tasks: &std::collections::BTreeMap<String, task_runner::TaskSpec>,
     declared_servers: &[mcp::McpServer],
 ) -> Option<task_runner::TaskRunner> {
-    if tasks.is_empty() {
-        return None;
-    }
     if declared_servers
         .iter()
         .any(|s| s.name() == task_runner::NAME)

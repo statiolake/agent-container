@@ -48,10 +48,6 @@ impl TaskRunner {
         Self { tasks }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.tasks.is_empty()
-    }
-
     /// Dispatch a JSON-RPC request body. Returns `None` for notifications
     /// (the caller should answer with 202 and an empty body).
     pub async fn handle(&self, body: &[u8]) -> Option<Value> {
@@ -96,7 +92,7 @@ impl TaskRunner {
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {
-                    "tools": { "listChanged": false }
+                    "tools": { "listChanged": true }
                 },
                 "serverInfo": {
                     "name": NAME,
@@ -341,7 +337,7 @@ mod tests {
         let req = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
         let resp = r.handle(req).await.unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], NAME);
-        assert!(resp["result"]["capabilities"]["tools"].is_object());
+        assert_eq!(resp["result"]["capabilities"]["tools"]["listChanged"], true);
     }
 
     #[tokio::test]

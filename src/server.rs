@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::aws::{BedrockCredentials, BedrockSetup, resolve_credentials};
 use crate::mcp::{HttpMcpServer, McpServer};
@@ -42,10 +43,21 @@ enum McpBackend {
     TaskRunner(Arc<TaskRunner>),
 }
 
+impl Clone for McpBackend {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Http(h) => Self::Http(h.clone()),
+            Self::Stdio(h) => Self::Stdio(h.clone()),
+            Self::TaskRunner(r) => Self::TaskRunner(r.clone()),
+        }
+    }
+}
+
 struct BrokerState {
     bedrock: Option<(BedrockSetup, Option<String>)>,
     last_error: Mutex<Option<String>>,
-    mcp: HashMap<String, McpBackend>,
+    mcp: RwLock<HashMap<String, McpBackend>>,
+    notifications: RwLock<HashMap<String, broadcast::Sender<Value>>>,
     policy: RwLock<McpPolicy>,
     annotations: Mutex<HashMap<String, HashMap<String, Option<bool>>>>,
     oauth: Arc<OAuthStore>,
@@ -57,6 +69,12 @@ pub struct RunningServer {
     pub handle: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Clone)]
+pub struct McpReloadConfig {
+    pub workspace: PathBuf,
+    pub task_runner_enabled: bool,
+}
+
 pub async fn spawn(
     bedrock: Option<(BedrockSetup, Option<String>)>,
     mcp_servers: Vec<McpServer>,
@@ -64,6 +82,7 @@ pub async fn spawn(
     policy: McpPolicy,
     oauth: Arc<OAuthStore>,
     stdio_bridge: Option<PathBridge>,
+    reload: Option<McpReloadConfig>,
 ) -> Result<RunningServer> {
     // Loopback bind is load-bearing for the security model: this broker
     // hands out fresh AWS Bedrock credentials and proxies authenticated
@@ -86,14 +105,17 @@ pub async fn spawn(
         .context("failed to build reqwest client")?;
 
     let mut mcp: HashMap<String, McpBackend> = HashMap::new();
+    let mut notifications: HashMap<String, broadcast::Sender<Value>> = HashMap::new();
     for server in mcp_servers {
         let name = server.name().to_string();
         match server {
             McpServer::Http(h) => {
+                notifications.insert(name.clone(), new_notification_channel());
                 mcp.insert(name, McpBackend::Http(h));
             }
             McpServer::Stdio(s) => match stdio_mcp::spawn_worker(s.clone(), stdio_bridge.clone()) {
                 Ok(handle) => {
+                    notifications.insert(name.clone(), new_notification_channel());
                     mcp.insert(name, McpBackend::Stdio(handle));
                 }
                 Err(e) => {
@@ -111,7 +133,8 @@ pub async fn spawn(
                 "[agent-container] note: a user-declared MCP server named '{}' already exists — skipping the built-in task-runner",
                 task_runner::NAME
             );
-        } else if !runner.is_empty() {
+        } else {
+            notifications.insert(task_runner::NAME.to_string(), new_notification_channel());
             mcp.insert(
                 task_runner::NAME.to_string(),
                 McpBackend::TaskRunner(Arc::new(runner)),
@@ -122,12 +145,17 @@ pub async fn spawn(
     let state = Arc::new(BrokerState {
         bedrock,
         last_error: Mutex::new(None),
-        mcp,
+        mcp: RwLock::new(mcp),
+        notifications: RwLock::new(notifications),
         policy: RwLock::new(policy),
         annotations: Mutex::new(HashMap::new()),
         oauth,
         http_client,
     });
+
+    if let Some(config) = reload {
+        tokio::spawn(watch_mcp_settings(state.clone(), config));
+    }
 
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -143,6 +171,108 @@ pub async fn spawn(
     });
 
     Ok(RunningServer { addr, handle })
+}
+
+fn new_notification_channel() -> broadcast::Sender<Value> {
+    let (tx, _) = broadcast::channel(128);
+    tx
+}
+
+async fn watch_mcp_settings(state: Arc<BrokerState>, config: McpReloadConfig) {
+    let mut last = settings_fingerprint(&config.workspace);
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let current = settings_fingerprint(&config.workspace);
+        if current == last {
+            continue;
+        }
+        last = current;
+        if let Err(e) = reload_mcp_settings(&state, &config).await {
+            tracing::warn!(error = %e, "failed to reload MCP settings");
+        }
+    }
+}
+
+fn settings_fingerprint(workspace: &Path) -> Vec<Option<Vec<u8>>> {
+    let global = crate::settings::global_path()
+        .ok()
+        .and_then(|path| std::fs::read(path).ok());
+    let workspace = std::fs::read(crate::settings::workspace_path(workspace)).ok();
+    vec![global, workspace]
+}
+
+async fn reload_mcp_settings(state: &BrokerState, config: &McpReloadConfig) -> Result<()> {
+    let merged = crate::settings::Settings::load_merged(&config.workspace)
+        .context("failed to reload merged settings")?;
+    {
+        let mut policy = state.policy.write().await;
+        *policy = merged.mcp;
+    }
+
+    if config.task_runner_enabled {
+        let tasks = load_task_runner_tasks_for_reload(&config.workspace)?;
+        let mut mcp = state.mcp.write().await;
+        mcp.insert(
+            task_runner::NAME.to_string(),
+            McpBackend::TaskRunner(Arc::new(TaskRunner::new(tasks))),
+        );
+    }
+
+    broadcast_tools_list_changed(state).await;
+    Ok(())
+}
+
+fn load_task_runner_tasks_for_reload(
+    workspace: &Path,
+) -> Result<BTreeMap<String, task_runner::TaskSpec>> {
+    let global_path = crate::settings::global_path()?;
+    let global_root = global_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let workspace_path = crate::settings::workspace_path(workspace);
+    let workspace_root = workspace_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| workspace.to_path_buf());
+
+    let global =
+        crate::settings::Settings::load_global().context("failed to load global settings")?;
+    let workspace_settings = crate::settings::Settings::load_workspace(workspace)
+        .context("failed to load workspace settings")?;
+
+    let mut tasks = BTreeMap::new();
+    for (name, command) in global.task_runner.tasks {
+        tasks.insert(
+            name,
+            task_runner::TaskSpec {
+                command,
+                config_root: global_root.clone(),
+            },
+        );
+    }
+    for (name, command) in workspace_settings.task_runner.tasks {
+        tasks.insert(
+            name,
+            task_runner::TaskSpec {
+                command,
+                config_root: workspace_root.clone(),
+            },
+        );
+    }
+    Ok(tasks)
+}
+
+async fn broadcast_tools_list_changed(state: &BrokerState) {
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed"
+    });
+    let senders: Vec<_> = state.notifications.read().await.values().cloned().collect();
+    for sender in senders {
+        let _ = sender.send(notification.clone());
+    }
 }
 
 async fn handle_aws(State(state): State<Arc<BrokerState>>) -> Response {
@@ -190,7 +320,8 @@ async fn handle_mcp_nested(
 }
 
 async fn forward_mcp(name: &str, rest: &str, state: Arc<BrokerState>, req: Request) -> Response {
-    let backend_kind = state.mcp.get(name).map(|b| match b {
+    let backend = state.mcp.read().await.get(name).cloned();
+    let backend_kind = backend.as_ref().map(|b| match b {
         McpBackend::Http(_) => BackendKind::Http,
         McpBackend::Stdio(_) => BackendKind::Stdio,
         McpBackend::TaskRunner(_) => BackendKind::TaskRunner,
@@ -229,7 +360,11 @@ async fn forward_http(
     rest_path: &str,
     req: Request,
 ) -> Result<Response> {
-    let server = match state.mcp.get(server_name) {
+    if req.method() == axum::http::Method::GET && rest_path.is_empty() {
+        return forward_local_notifications_get(state, server_name).await;
+    }
+
+    let server = match state.mcp.read().await.get(server_name) {
         Some(McpBackend::Http(s)) => s.clone(),
         _ => bail!("internal: expected HTTP backend for '{server_name}'"),
     };
@@ -336,14 +471,18 @@ async fn forward_task_runner(
     server_name: &str,
     req: Request,
 ) -> Result<Response> {
-    let runner = match state.mcp.get(server_name) {
+    let runner = match state.mcp.read().await.get(server_name) {
         Some(McpBackend::TaskRunner(r)) => r.clone(),
         _ => bail!("internal: expected TaskRunner backend for '{server_name}'"),
     };
 
-    // Only POST has meaning for the task-runner — everything else would
-    // just be Claude Code probing for SSE / optional protocol bits that
-    // we don't need. Answer the common ones cleanly.
+    if req.method() == axum::http::Method::GET {
+        return forward_local_notifications_get(state, server_name).await;
+    }
+
+    // Only POST has meaning for task execution — everything else would
+    // just be Claude Code probing for optional protocol bits that we
+    // don't need. Answer the common ones cleanly.
     if req.method() != axum::http::Method::POST {
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -381,7 +520,7 @@ async fn forward_stdio(
     server_name: &str,
     req: Request,
 ) -> Result<Response> {
-    let handle = match state.mcp.get(server_name) {
+    let handle = match state.mcp.read().await.get(server_name) {
         Some(McpBackend::Stdio(h)) => h.clone(),
         _ => bail!("internal: expected stdio backend for '{server_name}'"),
     };
@@ -389,7 +528,7 @@ async fn forward_stdio(
     let method = req.method().clone();
     match method.as_str() {
         "POST" => forward_stdio_post(state, server_name, handle, req).await,
-        "GET" => forward_stdio_get(server_name, handle).await,
+        "GET" => forward_stdio_get(state, server_name, handle).await,
         _ => {
             tracing::debug!(
                 server = %server_name,
@@ -475,7 +614,11 @@ async fn forward_stdio_post(
         .body(Body::from(body_bytes))?)
 }
 
-async fn forward_stdio_get(server_name: &str, handle: StdioHandle) -> Result<Response> {
+async fn forward_stdio_get(
+    state: Arc<BrokerState>,
+    server_name: &str,
+    handle: StdioHandle,
+) -> Result<Response> {
     use tokio_stream::StreamExt;
     use tokio_stream::wrappers::BroadcastStream;
 
@@ -484,28 +627,14 @@ async fn forward_stdio_get(server_name: &str, handle: StdioHandle) -> Result<Res
         "opening SSE channel for server-initiated messages",
     );
 
-    let rx = handle.subscribe();
+    let upstream_rx = handle.subscribe();
+    let local_rx = local_notification_receiver(&state, server_name).await?;
     let sn = server_name.to_string();
-    let stream = BroadcastStream::new(rx).filter_map(move |item| match item {
-        Ok(value) => {
-            tracing::debug!(
-                server = %sn,
-                message = %serde_json::to_string(&value).unwrap_or_default(),
-                "→ SSE (server → client)",
-            );
-            let payload = serde_json::to_string(&value).unwrap_or_default();
-            let frame = format!("data: {payload}\n\n");
-            Some(Ok::<_, std::io::Error>(Bytes::from(frame)))
-        }
-        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-            tracing::warn!(
-                server = %sn,
-                skipped = n,
-                "SSE subscriber lagged; some server-initiated messages were dropped",
-            );
-            None
-        }
-    });
+    let stream = futures::stream::select(
+        BroadcastStream::new(upstream_rx),
+        BroadcastStream::new(local_rx),
+    )
+    .filter_map(move |item| sse_notification_frame(item, &sn));
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -513,6 +642,67 @@ async fn forward_stdio_get(server_name: &str, handle: StdioHandle) -> Result<Res
         .header(axum::http::header::CACHE_CONTROL, "no-cache")
         .header("X-Accel-Buffering", "no")
         .body(Body::from_stream(stream))?)
+}
+
+async fn forward_local_notifications_get(
+    state: Arc<BrokerState>,
+    server_name: &str,
+) -> Result<Response> {
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    tracing::debug!(
+        server = %server_name,
+        "opening local MCP notification SSE channel",
+    );
+
+    let rx = local_notification_receiver(&state, server_name).await?;
+    let sn = server_name.to_string();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| sse_notification_frame(item, &sn));
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(stream))?)
+}
+
+async fn local_notification_receiver(
+    state: &BrokerState,
+    server_name: &str,
+) -> Result<broadcast::Receiver<Value>> {
+    let notifications = state.notifications.read().await;
+    let Some(tx) = notifications.get(server_name) else {
+        bail!("internal: missing notification channel for '{server_name}'");
+    };
+    Ok(tx.subscribe())
+}
+
+fn sse_notification_frame(
+    item: Result<Value, tokio_stream::wrappers::errors::BroadcastStreamRecvError>,
+    server_name: &str,
+) -> Option<Result<Bytes, std::io::Error>> {
+    match item {
+        Ok(value) => {
+            tracing::debug!(
+                server = %server_name,
+                message = %serde_json::to_string(&value).unwrap_or_default(),
+                "→ SSE (server → client)",
+            );
+            let payload = serde_json::to_string(&value).unwrap_or_default();
+            let frame = format!("data: {payload}\n\n");
+            Some(Ok(Bytes::from(frame)))
+        }
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+            tracing::warn!(
+                server = %server_name,
+                skipped = n,
+                "SSE subscriber lagged; some server-initiated messages were dropped",
+            );
+            None
+        }
+    }
 }
 
 /// Run the tool-call allowlist gate. Returns a pre-built JSON-RPC error
@@ -973,6 +1163,23 @@ mod tests {
         let text = String::from_utf8(filtered).unwrap();
         assert!(text.contains("event: ping"));
         assert!(text.contains("notifications/progress"));
+    }
+
+    #[test]
+    fn sse_notification_frame_serializes_jsonrpc_notification() {
+        let frame = sse_notification_frame(
+            Ok(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed"
+            })),
+            "srv",
+        )
+        .unwrap()
+        .unwrap();
+        let text = String::from_utf8(frame.to_vec()).unwrap();
+        assert!(text.starts_with("data: "));
+        assert!(text.contains("notifications/tools/list_changed"));
+        assert!(text.ends_with("\n\n"));
     }
 
     #[tokio::test]
