@@ -390,6 +390,18 @@ fn sensitive_path_denied(path: &str) -> bool {
         .any(|pattern| glob_match_path(pattern, path))
 }
 
+pub fn path_denied_by_rules(path: &Path, patterns: &[String]) -> bool {
+    let path = path_to_match_string(path);
+    sensitive_path_denied(&path)
+        || patterns.iter().any(|pattern| {
+            let pattern = pattern.trim();
+            let Some(body) = pattern.strip_prefix('!') else {
+                return false;
+            };
+            !body.is_empty() && glob_match_path(body, &path)
+        })
+}
+
 fn path_to_match_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -514,6 +526,23 @@ mod tests {
             assert!(!path_allowed(Path::new(path), &rules), "{path}");
         }
         assert!(path_allowed(Path::new("/tmp/project/README.md"), &rules));
+    }
+
+    #[test]
+    fn explicit_denies_are_reported_for_mount_shadowing() {
+        let rules = vec![
+            "/tmp/project/**".to_string(),
+            "!/tmp/project/private/**".to_string(),
+        ];
+        assert!(path_denied_by_rules(
+            Path::new("/tmp/project/private/token.txt"),
+            &rules
+        ));
+        assert!(path_denied_by_rules(Path::new("/tmp/project/.env"), &rules));
+        assert!(!path_denied_by_rules(
+            Path::new("/tmp/project/public/readme.txt"),
+            &rules
+        ));
     }
 
     #[test]

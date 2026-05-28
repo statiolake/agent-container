@@ -90,6 +90,10 @@ pub struct RunOptions {
     /// and workspace settings. Appended to the bundled base allowlist and
     /// mounted into tinyproxy.
     pub proxy_allow: Vec<String>,
+    /// Merged `[host_fs].allow` patterns. Explicit deny rules and the
+    /// built-in sensitive-file denies are shadow-mounted for files that
+    /// already exist in the workspace at container creation time.
+    pub host_fs_allow: Vec<String>,
 }
 
 /// Orchestrate the compose project: start relay, run agent, always tear down.
@@ -128,9 +132,17 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     } else {
         empty_workspace_agent_container_dir(std::process::id())?
     };
+    let secret_shadows = prepare_secret_shadow_mounts(
+        &opts.host.workspace,
+        &opts.host.container_workspace(),
+        std::process::id(),
+        &opts.host_fs_allow,
+    )?;
 
     let project = format!("agent-container-{}", std::process::id());
     let compose_file = default_compose_file();
+    let shadow_compose_file =
+        write_secret_shadow_compose_override(std::process::id(), &secret_shadows)?;
 
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
@@ -226,7 +238,13 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
 
     let ctx = ComposeCtx {
         project: project.clone(),
-        compose_file: compose_file.clone(),
+        compose_files: shadow_compose_file.into_iter().fold(
+            vec![compose_file.clone()],
+            |mut files, file| {
+                files.push(file);
+                files
+            },
+        ),
         env: env.clone(),
     };
 
@@ -236,8 +254,8 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         fn drop(&mut self) {
             let ctx = self.0;
             let status = std::process::Command::new("docker")
-                .args(["compose", "-p", &ctx.project, "-f"])
-                .arg(&ctx.compose_file)
+                .args(["compose", "-p", &ctx.project])
+                .args(ctx.compose_file_args())
                 .args(["down", "--remove-orphans", "--timeout", "5"])
                 .envs(&ctx.env)
                 .stdout(Stdio::null())
@@ -285,6 +303,118 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
 
     // `_cleanup` runs `compose down` on scope exit.
     Ok(status.code().unwrap_or(1))
+}
+
+#[derive(Debug, Clone)]
+struct SecretShadowMount {
+    source: PathBuf,
+    target: PathBuf,
+}
+
+fn prepare_secret_shadow_mounts(
+    workspace: &Path,
+    container_workspace: &Path,
+    pid: u32,
+    host_fs_allow: &[String],
+) -> Result<Vec<SecretShadowMount>> {
+    let workspace = std::fs::canonicalize(workspace)
+        .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?;
+    let shadow_root = std::env::temp_dir().join(format!("agent-container-secret-shadows-{pid}"));
+    std::fs::create_dir_all(&shadow_root)
+        .with_context(|| format!("failed to prepare {}", shadow_root.display()))?;
+
+    let mut mounts = Vec::new();
+    collect_secret_shadow_mounts(
+        &workspace,
+        &workspace,
+        container_workspace,
+        &shadow_root,
+        host_fs_allow,
+        &mut mounts,
+    )?;
+    Ok(mounts)
+}
+
+fn collect_secret_shadow_mounts(
+    root: &Path,
+    path: &Path,
+    container_root: &Path,
+    shadow_root: &Path,
+    host_fs_allow: &[String],
+    mounts: &mut Vec<SecretShadowMount>,
+) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    if meta.is_dir() {
+        for entry in
+            std::fs::read_dir(path).with_context(|| format!("failed to list {}", path.display()))?
+        {
+            let entry = entry?;
+            collect_secret_shadow_mounts(
+                root,
+                &entry.path(),
+                container_root,
+                shadow_root,
+                host_fs_allow,
+                mounts,
+            )?;
+        }
+        return Ok(());
+    }
+    if !meta.is_file() || !crate::host_fs::path_denied_by_rules(path, host_fs_allow) {
+        return Ok(());
+    }
+
+    let relative = path
+        .strip_prefix(root)
+        .with_context(|| format!("{} is not under {}", path.display(), root.display()))?;
+    let source = shadow_root.join(relative);
+    if let Some(parent) = source.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&source, b"")
+        .with_context(|| format!("failed to write secret shadow {}", source.display()))?;
+    mounts.push(SecretShadowMount {
+        source,
+        target: container_root.join(relative),
+    });
+    Ok(())
+}
+
+fn write_secret_shadow_compose_override(
+    pid: u32,
+    mounts: &[SecretShadowMount],
+) -> Result<Option<PathBuf>> {
+    if mounts.is_empty() {
+        return Ok(None);
+    }
+
+    let path = std::env::temp_dir().join(format!("agent-container-secret-shadows-{pid}.yml"));
+    let mut out = String::from("services:\n  agent:\n    volumes:\n");
+    for mount in mounts {
+        out.push_str("      - type: bind\n");
+        out.push_str(&format!(
+            "        source: '{}'\n",
+            yaml_single_quote(&mount.source.display().to_string())
+        ));
+        out.push_str(&format!(
+            "        target: '{}'\n",
+            yaml_single_quote(&mount.target.display().to_string())
+        ));
+        out.push_str("        read_only: true\n");
+    }
+    std::fs::write(&path, out)
+        .with_context(|| format!("failed to write compose override {}", path.display()))?;
+    eprintln!(
+        "[agent-container] shadowing {} existing denied workspace file(s)",
+        mounts.len()
+    );
+    Ok(Some(path))
+}
+
+fn yaml_single_quote(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 async fn watch_proxy_settings(
@@ -355,18 +485,25 @@ fn empty_workspace_agent_container_dir(pid: u32) -> Result<PathBuf> {
 #[derive(Clone)]
 struct ComposeCtx {
     project: String,
-    compose_file: PathBuf,
+    compose_files: Vec<PathBuf>,
     env: HashMap<String, String>,
 }
 
 impl ComposeCtx {
     fn compose(&self, tail: &[&str]) -> Command {
         let mut cmd = Command::new("docker");
-        cmd.args(["compose", "-p", &self.project, "-f"])
-            .arg(&self.compose_file)
+        cmd.args(["compose", "-p", &self.project])
+            .args(self.compose_file_args())
             .args(tail)
             .envs(&self.env);
         cmd
+    }
+
+    fn compose_file_args(&self) -> Vec<String> {
+        self.compose_files
+            .iter()
+            .flat_map(|path| ["-f".to_string(), path.display().to_string()])
+            .collect()
     }
 }
 
@@ -386,4 +523,47 @@ fn default_compose_file() -> PathBuf {
         return PathBuf::from(path);
     }
     default_dockerfile_dir().join("compose.yml")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_shadow_mounts_include_sensitive_and_explicit_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        std::fs::create_dir_all(workspace.join("private")).unwrap();
+        std::fs::write(workspace.join(".env"), "secret").unwrap();
+        std::fs::write(workspace.join("private/token.txt"), "secret").unwrap();
+        std::fs::write(workspace.join("README.md"), "ok").unwrap();
+
+        let canonical_workspace = std::fs::canonicalize(&workspace).unwrap();
+        let rules = vec![
+            format!("{}/**", canonical_workspace.display()),
+            format!("!{}/private/**", canonical_workspace.display()),
+        ];
+        let mounts =
+            prepare_secret_shadow_mounts(&workspace, Path::new("/workspace"), 42, &rules).unwrap();
+        let targets: Vec<_> = mounts
+            .iter()
+            .map(|mount| mount.target.display().to_string())
+            .collect();
+        assert!(targets.contains(&"/workspace/.env".to_string()));
+        assert!(targets.contains(&"/workspace/private/token.txt".to_string()));
+        assert!(!targets.contains(&"/workspace/README.md".to_string()));
+    }
+
+    #[test]
+    fn compose_file_args_include_every_compose_file() {
+        let ctx = ComposeCtx {
+            project: "p".into(),
+            compose_files: vec![PathBuf::from("base.yml"), PathBuf::from("shadow.yml")],
+            env: HashMap::new(),
+        };
+        assert_eq!(
+            ctx.compose_file_args(),
+            vec!["-f", "base.yml", "-f", "shadow.yml"]
+        );
+    }
 }

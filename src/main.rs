@@ -299,6 +299,7 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         agent_command,
         extra_args: passthrough,
         proxy_allow,
+        host_fs_allow: merged_settings.host_fs.allow,
     })
     .await?;
 
@@ -455,6 +456,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         agent_command,
         extra_args: Vec::new(),
         proxy_allow,
+        host_fs_allow: merged_settings.host_fs.allow,
     })
     .await?;
 

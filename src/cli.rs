@@ -180,8 +180,10 @@ of absolute host-path globs: normal patterns allow access, `!pattern` denies
 access, and the default is deny-all as if `!*` had already matched. The
 broker also hard-denies common secret file names such as `.env`, `.env.*`,
 private key files, `.npmrc`, `.pypirc`, and `.netrc`, even inside an allowed
-directory. It reloads this list on every host-fs tool call, so saved settings
-take effect without restarting the running agent session.
+directory. Existing workspace files denied by these rules are shadow-mounted
+as empty read-only files inside the container at startup. The host-fs MCP
+reloads this list on every tool call, so saved settings take effect there
+without restarting the running agent session.
 
 Claude Code runs inside tmux so agent teams can attach panes. tmux mouse
 support is enabled automatically. `claude.tmux_prefix` controls tmux's prefix
