@@ -1,13 +1,13 @@
 //! Built-in MCP server for controlled host filesystem access.
 //!
-//! This is intentionally host-side: the container does not gain extra
-//! mounts. Every tool call reloads the merged agent-container settings
-//! and checks the current `[host_fs].allow` list before touching the
-//! requested path.
+//! This is intentionally mediated on the host side. Every tool call
+//! reloads the merged agent-container settings and checks the current
+//! `[filesystem]` policy before touching the requested path.
 
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use regex::Regex;
 use serde_json::{Value, json};
 
 pub const NAME: &str = "host-fs";
@@ -17,23 +17,6 @@ const MAX_READ_BYTES: u64 = 1024 * 1024;
 const MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
 const DEFAULT_SEARCH_RESULTS: usize = 100;
 const MAX_SEARCH_RESULTS: usize = 1000;
-const SENSITIVE_DENY_PATTERNS: &[&str] = &[
-    "**/.env",
-    "**/.env.*",
-    "**/*.env",
-    "**/*.env.*",
-    "**/*.pem",
-    "**/*.key",
-    "**/*.p12",
-    "**/*.pfx",
-    "**/id_rsa",
-    "**/id_ecdsa",
-    "**/id_ed25519",
-    "**/.npmrc",
-    "**/.pypirc",
-    "**/.netrc",
-    "**/credentials",
-];
 
 #[derive(Debug, Clone)]
 pub struct HostFs {
@@ -93,7 +76,7 @@ impl HostFs {
                 "tools": [
                     {
                         "name": "HostRead",
-                        "description": "Read a UTF-8 text file from the host filesystem when its absolute path is allowed by the current [host_fs].allow settings.",
+                        "description": "Read a UTF-8 text file from a mounted host filesystem root when the current [filesystem] filters do not hide it.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -106,7 +89,7 @@ impl HostFs {
                     },
                     {
                         "name": "HostList",
-                        "description": "List one host directory when its absolute path is allowed by the current [host_fs].allow settings.",
+                        "description": "List one host directory from a mounted host filesystem root, omitting paths hidden by the current [filesystem] filters.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -119,7 +102,7 @@ impl HostFs {
                     },
                     {
                         "name": "HostWrite",
-                        "description": "Write UTF-8 text to a host file when its absolute path is allowed by the current [host_fs].allow settings.",
+                        "description": "Write UTF-8 text to a host file when its absolute path is under a mounted host filesystem root and not hidden or readonly by the current [filesystem] filters.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -189,7 +172,7 @@ impl HostFs {
     fn host_read(&self, arguments: Option<&Value>) -> Result<String> {
         let path = required_string(arguments, "path")?;
         let path = resolve_existing_path(path)?;
-        self.ensure_allowed(&path)?;
+        self.ensure_readable(&path)?;
         let meta = std::fs::metadata(&path)
             .with_context(|| format!("failed to stat {}", path.display()))?;
         if !meta.is_file() {
@@ -210,8 +193,8 @@ impl HostFs {
     fn host_list(&self, arguments: Option<&Value>) -> Result<String> {
         let path = required_string(arguments, "path")?;
         let path = resolve_existing_path(path)?;
-        let patterns = self.latest_patterns()?;
-        ensure_allowed_by(&path, &patterns)?;
+        let policy = self.latest_policy()?;
+        ensure_readable_by(&self.workspace, &path, &policy)?;
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(&path)
             .with_context(|| format!("failed to list {}", path.display()))?
@@ -220,7 +203,10 @@ impl HostFs {
             let entry_path = entry.path();
             let allowed_path =
                 std::fs::canonicalize(&entry_path).unwrap_or_else(|_| entry_path.clone());
-            if !path_allowed(&allowed_path, &patterns) {
+            if matches!(
+                classify_path(&self.workspace, &policy, &allowed_path)?,
+                FilesystemAccess::Hidden
+            ) {
                 continue;
             }
             let meta = entry.metadata()?;
@@ -240,7 +226,7 @@ impl HostFs {
         let content = required_string(arguments, "content")?;
         let create_parents = optional_bool(arguments, "createParents").unwrap_or(false);
         let path = resolve_write_path(path)?;
-        self.ensure_allowed(&path)?;
+        self.ensure_writable(&path)?;
         if create_parents {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
@@ -266,34 +252,57 @@ impl HostFs {
             .unwrap_or(DEFAULT_SEARCH_RESULTS)
             .clamp(1, MAX_SEARCH_RESULTS);
         let path = resolve_existing_path(path)?;
-        let patterns = self.latest_patterns()?;
-        ensure_allowed_by(&path, &patterns)?;
+        let policy = self.latest_policy()?;
+        ensure_readable_by(&self.workspace, &path, &policy)?;
         let mut results = Vec::new();
-        search_recursive(&path, query, max_results, &patterns, &mut results)?;
+        search_recursive(
+            &self.workspace,
+            &path,
+            query,
+            max_results,
+            &policy,
+            &mut results,
+        )?;
         serde_json::to_string_pretty(&results).context("failed to encode search results")
     }
 
-    fn ensure_allowed(&self, path: &Path) -> Result<()> {
-        let patterns = self.latest_patterns()?;
-        ensure_allowed_by(path, &patterns)
+    fn ensure_readable(&self, path: &Path) -> Result<()> {
+        let policy = self.latest_policy()?;
+        ensure_readable_by(&self.workspace, path, &policy)
     }
 
-    fn latest_patterns(&self) -> Result<Vec<String>> {
+    fn ensure_writable(&self, path: &Path) -> Result<()> {
+        let policy = self.latest_policy()?;
+        match classify_path(&self.workspace, &policy, path)? {
+            FilesystemAccess::Readwrite => Ok(()),
+            FilesystemAccess::Readonly => {
+                bail!("{} is readonly by [filesystem].readonly", path.display())
+            }
+            FilesystemAccess::Hidden => bail!(
+                "{} is hidden by [filesystem].hide or outside mounted roots",
+                path.display()
+            ),
+        }
+    }
+
+    fn latest_policy(&self) -> Result<crate::settings::FilesystemPolicy> {
         let settings = crate::settings::Settings::load_merged(&self.workspace)
-            .context("failed to load latest host-fs allowlist")?;
-        Ok(settings.host_fs.allow)
+            .context("failed to load latest filesystem policy")?;
+        Ok(settings.filesystem)
     }
 }
 
-fn ensure_allowed_by(path: &Path, patterns: &[String]) -> Result<()> {
-    if path_allowed(path, patterns) {
-        Ok(())
-    } else {
-        bail!(
-            "{} is not allowed by [host_fs].allow; add an absolute glob such as \"{}\"",
-            path.display(),
+fn ensure_readable_by(
+    workspace: &Path,
+    path: &Path,
+    policy: &crate::settings::FilesystemPolicy,
+) -> Result<()> {
+    match classify_path(workspace, policy, path)? {
+        FilesystemAccess::Readwrite | FilesystemAccess::Readonly => Ok(()),
+        FilesystemAccess::Hidden => bail!(
+            "{} is hidden by [filesystem].hide or outside mounted roots",
             path.display()
-        )
+        ),
     }
 }
 
@@ -365,94 +374,111 @@ fn normalize_absolute(path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-fn path_allowed(path: &Path, patterns: &[String]) -> bool {
-    let path = path_to_match_string(path);
-    let mut allowed = false;
-    for pattern in patterns {
-        let pattern = pattern.trim();
-        if pattern.is_empty() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemAccess {
+    Hidden,
+    Readonly,
+    Readwrite,
+}
+
+pub fn mounted_roots(
+    workspace: &Path,
+    policy: &crate::settings::FilesystemPolicy,
+) -> Result<Vec<PathBuf>> {
+    let mut roots = vec![
+        std::fs::canonicalize(workspace)
+            .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?,
+    ];
+    for mount in &policy.mounts {
+        if mount.trim().is_empty() {
             continue;
         }
-        let (deny, body) = pattern
-            .strip_prefix('!')
-            .map(|p| (true, p))
-            .unwrap_or((false, pattern));
-        if glob_match_path(body, &path) {
-            allowed = !deny;
+        let path = normalize_absolute(Path::new(mount))?;
+        let path = std::fs::canonicalize(&path)
+            .with_context(|| format!("failed to resolve filesystem mount {}", path.display()))?;
+        if !roots.contains(&path) {
+            roots.push(path);
         }
     }
-    allowed && !sensitive_path_denied(&path)
+    Ok(roots)
 }
 
-fn sensitive_path_denied(path: &str) -> bool {
-    SENSITIVE_DENY_PATTERNS
-        .iter()
-        .any(|pattern| glob_match_path(pattern, path))
+pub fn classify_path(
+    workspace: &Path,
+    policy: &crate::settings::FilesystemPolicy,
+    path: &Path,
+) -> Result<FilesystemAccess> {
+    let path = if path.exists() {
+        std::fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve {}", path.display()))?
+    } else {
+        normalize_absolute(path)?
+    };
+    for root in mounted_roots(workspace, policy)? {
+        if !path.starts_with(&root) {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(Path::new(""))
+            .to_string_lossy()
+            .replace('\\', "/");
+        if matches_any_regex(&policy.hide, &rel)? {
+            return Ok(FilesystemAccess::Hidden);
+        }
+        if matches_any_regex(&policy.readonly, &rel)? {
+            return Ok(FilesystemAccess::Readonly);
+        }
+        return Ok(FilesystemAccess::Readwrite);
+    }
+    Ok(FilesystemAccess::Hidden)
 }
 
-pub fn path_denied_by_rules(path: &Path, patterns: &[String]) -> bool {
-    let path = path_to_match_string(path);
-    sensitive_path_denied(&path)
-        || patterns.iter().any(|pattern| {
-            let pattern = pattern.trim();
-            let Some(body) = pattern.strip_prefix('!') else {
-                return false;
-            };
-            !body.is_empty() && glob_match_path(body, &path)
-        })
-}
-
-fn path_to_match_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-fn glob_match_path(pattern: &str, path: &str) -> bool {
-    let pattern = pattern.trim_end_matches('/');
-    if let Some(base) = pattern.strip_suffix("/**") {
-        if path == base {
-            return true;
+fn matches_any_regex(patterns: &[String], value: &str) -> Result<bool> {
+    let value = if value.is_empty() { "." } else { value };
+    for pattern in patterns {
+        if pattern.trim().is_empty() {
+            continue;
+        }
+        let re = Regex::new(pattern)
+            .with_context(|| format!("invalid filesystem filter regex `{pattern}`"))?;
+        if re.is_match(value) {
+            return Ok(true);
         }
     }
-    glob_match(pattern, path)
-}
-
-fn glob_match(pattern: &str, text: &str) -> bool {
-    fn rec(p: &[char], t: &[char]) -> bool {
-        if p.is_empty() {
-            return t.is_empty();
-        }
-        match p[0] {
-            '*' if p.get(1) == Some(&'*') => rec(&p[2..], t) || (!t.is_empty() && rec(p, &t[1..])),
-            '*' => rec(&p[1..], t) || (!t.is_empty() && t[0] != '/' && rec(p, &t[1..])),
-            '?' => !t.is_empty() && t[0] != '/' && rec(&p[1..], &t[1..]),
-            c => !t.is_empty() && c == t[0] && rec(&p[1..], &t[1..]),
-        }
-    }
-    rec(
-        &pattern.chars().collect::<Vec<_>>(),
-        &text.chars().collect::<Vec<_>>(),
-    )
+    Ok(false)
 }
 
 fn search_recursive(
+    workspace: &Path,
     path: &Path,
     query: &str,
     max_results: usize,
-    patterns: &[String],
+    policy: &crate::settings::FilesystemPolicy,
     results: &mut Vec<Value>,
 ) -> Result<()> {
     if results.len() >= max_results {
         return Ok(());
     }
     let allowed_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !path_allowed(&allowed_path, patterns) {
+    if matches!(
+        classify_path(workspace, policy, &allowed_path)?,
+        FilesystemAccess::Hidden
+    ) {
         return Ok(());
     }
     let meta = std::fs::metadata(path)?;
     if meta.is_dir() {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
-            search_recursive(&entry.path(), query, max_results, patterns, results)?;
+            search_recursive(
+                workspace,
+                &entry.path(),
+                query,
+                max_results,
+                policy,
+                results,
+            )?;
             if results.len() >= max_results {
                 break;
             }
@@ -501,54 +527,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_defaults_to_denied_and_later_patterns_win() {
-        let rules = vec![
-            "/tmp/project/**".to_string(),
-            "!/tmp/project/secrets/**".to_string(),
-        ];
-        assert!(path_allowed(Path::new("/tmp/project/README.md"), &rules));
-        assert!(path_allowed(Path::new("/tmp/project"), &rules));
-        assert!(!path_allowed(Path::new("/tmp/project/secrets/key"), &rules));
-        assert!(!path_allowed(Path::new("/tmp/other"), &rules));
-    }
+    fn filesystem_policy_classifies_workspace_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        std::fs::create_dir_all(workspace.join(".claude")).unwrap();
+        std::fs::write(workspace.join(".env"), "secret").unwrap();
+        std::fs::write(workspace.join("README.md"), "ok").unwrap();
+        let policy = crate::settings::FilesystemPolicy {
+            mounts: Vec::new(),
+            hide: crate::settings::default_filesystem_hide(),
+            readonly: crate::settings::default_filesystem_readonly(),
+        };
 
-    #[test]
-    fn sensitive_files_stay_denied_even_inside_allowed_tree() {
-        let rules = vec!["/tmp/project/**".to_string()];
-        for path in [
-            "/tmp/project/.env",
-            "/tmp/project/.env.local",
-            "/tmp/project/app.env",
-            "/tmp/project/id_ed25519",
-            "/tmp/project/token.pem",
-            "/tmp/project/.npmrc",
-        ] {
-            assert!(!path_allowed(Path::new(path), &rules), "{path}");
-        }
-        assert!(path_allowed(Path::new("/tmp/project/README.md"), &rules));
-    }
-
-    #[test]
-    fn explicit_denies_are_reported_for_mount_shadowing() {
-        let rules = vec![
-            "/tmp/project/**".to_string(),
-            "!/tmp/project/private/**".to_string(),
-        ];
-        assert!(path_denied_by_rules(
-            Path::new("/tmp/project/private/token.txt"),
-            &rules
-        ));
-        assert!(path_denied_by_rules(Path::new("/tmp/project/.env"), &rules));
-        assert!(!path_denied_by_rules(
-            Path::new("/tmp/project/public/readme.txt"),
-            &rules
-        ));
-    }
-
-    #[test]
-    fn glob_star_does_not_cross_path_separator() {
-        assert!(glob_match("/tmp/*", "/tmp/a"));
-        assert!(!glob_match("/tmp/*", "/tmp/a/b"));
-        assert!(glob_match("/tmp/**", "/tmp/a/b"));
+        assert_eq!(
+            classify_path(&workspace, &policy, &workspace.join(".env")).unwrap(),
+            FilesystemAccess::Hidden
+        );
+        assert_eq!(
+            classify_path(&workspace, &policy, &workspace.join(".claude")).unwrap(),
+            FilesystemAccess::Readonly
+        );
+        assert_eq!(
+            classify_path(&workspace, &policy, &workspace.join("README.md")).unwrap(),
+            FilesystemAccess::Readwrite
+        );
+        assert_eq!(
+            classify_path(&workspace, &policy, dir.path()).unwrap(),
+            FilesystemAccess::Hidden
+        );
     }
 }

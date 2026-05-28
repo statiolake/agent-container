@@ -90,10 +90,10 @@ pub struct RunOptions {
     /// and workspace settings. Appended to the bundled base allowlist and
     /// mounted into tinyproxy.
     pub proxy_allow: Vec<String>,
-    /// Merged `[host_fs].allow` patterns. Explicit deny rules and the
-    /// built-in sensitive-file denies are shadow-mounted for files that
-    /// already exist in the workspace at container creation time.
-    pub host_fs_allow: Vec<String>,
+    /// Merged filesystem policy. Additional mount roots are bind-mounted,
+    /// and hidden / readonly filters are overlaid for paths that already
+    /// exist at container creation time.
+    pub filesystem: crate::settings::FilesystemPolicy,
 }
 
 /// Orchestrate the compose project: start relay, run agent, always tear down.
@@ -136,7 +136,7 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         &opts.host.workspace,
         &opts.host.container_workspace(),
         std::process::id(),
-        &opts.host_fs_allow,
+        &opts.filesystem,
     )?;
 
     let project = format!("agent-container-{}", std::process::id());
@@ -309,55 +309,87 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
 struct SecretShadowMount {
     source: PathBuf,
     target: PathBuf,
+    read_only: bool,
 }
 
 fn prepare_secret_shadow_mounts(
     workspace: &Path,
     container_workspace: &Path,
     pid: u32,
-    host_fs_allow: &[String],
+    filesystem: &crate::settings::FilesystemPolicy,
 ) -> Result<Vec<SecretShadowMount>> {
-    let workspace = std::fs::canonicalize(workspace)
-        .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?;
     let shadow_root = std::env::temp_dir().join(format!("agent-container-secret-shadows-{pid}"));
     std::fs::create_dir_all(&shadow_root)
         .with_context(|| format!("failed to prepare {}", shadow_root.display()))?;
 
     let mut mounts = Vec::new();
-    collect_secret_shadow_mounts(
-        &workspace,
-        &workspace,
-        container_workspace,
-        &shadow_root,
-        host_fs_allow,
-        &mut mounts,
-    )?;
+    let canonical_workspace = std::fs::canonicalize(workspace)?;
+    for root in crate::host_fs::mounted_roots(workspace, filesystem)? {
+        let is_workspace_root = root == canonical_workspace;
+        let target_root = if is_workspace_root {
+            container_workspace.to_path_buf()
+        } else {
+            root.clone()
+        };
+        if !is_workspace_root {
+            mounts.push(SecretShadowMount {
+                source: root.clone(),
+                target: target_root.clone(),
+                read_only: false,
+            });
+        }
+        collect_secret_shadow_mounts(
+            workspace,
+            &root,
+            &root,
+            &target_root,
+            &shadow_root,
+            filesystem,
+            &mut mounts,
+        )?;
+    }
     Ok(mounts)
 }
 
 fn collect_secret_shadow_mounts(
+    workspace: &Path,
     root: &Path,
     path: &Path,
     container_root: &Path,
     empty_dir: &Path,
-    host_fs_allow: &[String],
+    filesystem: &crate::settings::FilesystemPolicy,
     mounts: &mut Vec<SecretShadowMount>,
 ) -> Result<()> {
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to stat {}", path.display()))?;
-    if crate::host_fs::path_denied_by_rules(path, host_fs_allow) {
-        let relative = path
-            .strip_prefix(root)
-            .with_context(|| format!("{} is not under {}", path.display(), root.display()))?;
-        mounts.push(SecretShadowMount {
-            source: if meta.is_dir() {
-                empty_dir.to_path_buf()
-            } else {
-                PathBuf::from("/dev/null")
-            },
-            target: container_root.join(relative),
-        });
-        return Ok(());
+    match crate::host_fs::classify_path(workspace, filesystem, path)? {
+        crate::host_fs::FilesystemAccess::Hidden => {
+            let relative = path
+                .strip_prefix(root)
+                .with_context(|| format!("{} is not under {}", path.display(), root.display()))?;
+            mounts.push(SecretShadowMount {
+                source: if meta.is_dir() {
+                    empty_dir.to_path_buf()
+                } else {
+                    PathBuf::from("/dev/null")
+                },
+                target: container_root.join(relative),
+                read_only: true,
+            });
+            return Ok(());
+        }
+        crate::host_fs::FilesystemAccess::Readonly => {
+            let relative = path
+                .strip_prefix(root)
+                .with_context(|| format!("{} is not under {}", path.display(), root.display()))?;
+            mounts.push(SecretShadowMount {
+                source: path.to_path_buf(),
+                target: container_root.join(relative),
+                read_only: true,
+            });
+            return Ok(());
+        }
+        crate::host_fs::FilesystemAccess::Readwrite => {}
     }
 
     if meta.is_dir() {
@@ -366,11 +398,12 @@ fn collect_secret_shadow_mounts(
         {
             let entry = entry?;
             collect_secret_shadow_mounts(
+                workspace,
                 root,
                 &entry.path(),
                 container_root,
                 empty_dir,
-                host_fs_allow,
+                filesystem,
                 mounts,
             )?;
         }
@@ -398,7 +431,9 @@ fn write_secret_shadow_compose_override(
             "        target: '{}'\n",
             yaml_single_quote(&mount.target.display().to_string())
         ));
-        out.push_str("        read_only: true\n");
+        if mount.read_only {
+            out.push_str("        read_only: true\n");
+        }
     }
     std::fs::write(&path, out)
         .with_context(|| format!("failed to write compose override {}", path.display()))?;
@@ -526,23 +561,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secret_shadow_mounts_include_sensitive_and_explicit_denies() {
+    fn secret_shadow_mounts_include_sensitive_and_explicit_filters() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("work");
         std::fs::create_dir_all(workspace.join("private")).unwrap();
         std::fs::create_dir_all(workspace.join("blocked-dir")).unwrap();
+        std::fs::create_dir_all(workspace.join(".claude")).unwrap();
         std::fs::write(workspace.join(".env"), "secret").unwrap();
         std::fs::write(workspace.join("private/token.txt"), "secret").unwrap();
+        std::fs::write(workspace.join(".claude/settings.json"), "{}").unwrap();
         std::fs::write(workspace.join("README.md"), "ok").unwrap();
 
-        let canonical_workspace = std::fs::canonicalize(&workspace).unwrap();
-        let rules = vec![
-            format!("{}/**", canonical_workspace.display()),
-            format!("!{}/private/**", canonical_workspace.display()),
-            format!("!{}/blocked-dir", canonical_workspace.display()),
-        ];
+        let policy = crate::settings::FilesystemPolicy {
+            mounts: Vec::new(),
+            hide: vec![
+                r"(^|/)\.env(\..*)?$".to_string(),
+                r"^private(/|$)".to_string(),
+                r"^blocked-dir$".to_string(),
+            ],
+            readonly: vec![r"(^|/)\.claude(/|$)".to_string()],
+        };
         let mounts =
-            prepare_secret_shadow_mounts(&workspace, Path::new("/workspace"), 42, &rules).unwrap();
+            prepare_secret_shadow_mounts(&workspace, Path::new("/workspace"), 42, &policy).unwrap();
         let targets: Vec<_> = mounts
             .iter()
             .map(|mount| mount.target.display().to_string())
@@ -550,6 +590,7 @@ mod tests {
         assert!(targets.contains(&"/workspace/.env".to_string()));
         assert!(targets.contains(&"/workspace/private".to_string()));
         assert!(targets.contains(&"/workspace/blocked-dir".to_string()));
+        assert!(targets.contains(&"/workspace/.claude".to_string()));
         assert!(!targets.contains(&"/workspace/README.md".to_string()));
         let file_mount = mounts
             .iter()
@@ -561,6 +602,14 @@ mod tests {
             .find(|mount| mount.target == Path::new("/workspace/blocked-dir"))
             .unwrap();
         assert_ne!(dir_mount.source, PathBuf::from("/dev/null"));
+        let readonly_mount = mounts
+            .iter()
+            .find(|mount| mount.target == Path::new("/workspace/.claude"))
+            .unwrap();
+        assert_eq!(
+            readonly_mount.source,
+            std::fs::canonicalize(workspace.join(".claude")).unwrap()
+        );
     }
 
     #[test]

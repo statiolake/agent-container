@@ -161,8 +161,10 @@ Supported TOML shape:
   build_image = "docker build -t my-app ."
   deploy = "\"$CONFIG_ROOT/scripts/deploy\" \"$env\""
 
-  [host_fs]
-  allow = ["/Users/me/project-notes/**", "!/Users/me/project-notes/secrets/**"]
+  [filesystem]
+  mounts = ["/Users/me/project-notes"]
+  hide = ["(^|/)\\.env(\\..*)?$"]
+  readonly = ["(^|/)\\.claude(/|$)"]
 
   [claude]
   tmux_prefix = "C-b"
@@ -175,15 +177,16 @@ arguments are passed as environment variables, so a task command can refer to
 agent-container settings directory that defined the task, so global and
 workspace task scripts can use the same command shape.
 
-`host_fs.allow` controls the built-in host-fs MCP server. It is an allowlist
-of absolute host-path globs: normal patterns allow access, `!pattern` denies
-access, and the default is deny-all as if `!*` had already matched. The
-broker also hard-denies common secret file names such as `.env`, `.env.*`,
-private key files, `.npmrc`, `.pypirc`, and `.netrc`, even inside an allowed
-directory. Existing workspace files denied by these rules are shadow-mounted
-as empty read-only files inside the container at startup. The host-fs MCP
-reloads this list on every tool call, so saved settings take effect there
-without restarting the running agent session.
+`filesystem` controls both container bind mounts and the built-in host-fs MCP
+server. The current workspace is always mounted. `filesystem.mounts` adds more
+absolute host directories. `filesystem.hide` and `filesystem.readonly` are
+regular expressions matched against paths relative to each mounted root:
+hidden paths are shadowed so the agent cannot see them, while readonly paths
+are visible but overlaid as read-only. Global defaults hide common secret file
+names such as `.env`, `.env.*`, private key files, `.npmrc`, `.pypirc`, and
+`.netrc`, and make `.claude` / `.codex` readonly. Existing matched files are
+shadow-mounted at container startup. The host-fs MCP reloads the policy on
+every tool call, so saved settings take effect there without restarting.
 
 Claude Code runs inside tmux so agent teams can attach panes. tmux mouse
 support is enabled automatically. `claude.tmux_prefix` controls tmux's prefix

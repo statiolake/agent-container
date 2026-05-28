@@ -20,8 +20,10 @@
 //! lint = "cargo check"
 //! build = "cargo build --release"
 //!
-//! [host_fs]
-//! allow = ["/Users/me/project-notes/**", "!/Users/me/project-notes/secrets/**"]
+//! [filesystem]
+//! mounts = ["/Users/me/project-notes"]
+//! hide = ["(^|/)\\.env(\\..*)?$"]
+//! readonly = ["(^|/)\\.claude(/|$)"]
 //!
 //! [claude]
 //! tmux_prefix = "C-b"
@@ -45,8 +47,8 @@ pub struct Settings {
     pub mcp: McpPolicy,
     #[serde(default, skip_serializing_if = "TaskRunnerPolicy::is_empty")]
     pub task_runner: TaskRunnerPolicy,
-    #[serde(default, skip_serializing_if = "HostFsPolicy::is_empty")]
-    pub host_fs: HostFsPolicy,
+    #[serde(default, skip_serializing_if = "FilesystemPolicy::is_empty")]
+    pub filesystem: FilesystemPolicy,
     #[serde(default, skip_serializing_if = "ClaudePolicy::is_empty")]
     pub claude: ClaudePolicy,
 }
@@ -82,22 +84,53 @@ impl TaskRunnerPolicy {
     }
 }
 
-/// Host filesystem access exposed through the built-in `host-fs` MCP
-/// server. Patterns use an allowlist form of gitignore-like glob rules:
-/// unprefixed patterns allow access, `!pattern` denies access, and the
-/// initial state is denied (as if `!*` had already matched). The broker
-/// also applies hard-coded denies for common secret file names after
-/// user rules.
+/// Host filesystem roots and filters shared by bind mounts and the
+/// built-in `host-fs` MCP server. The current workspace is always a
+/// mounted root; `mounts` adds more absolute host directories. `hide`
+/// and `readonly` are regular expressions matched against paths
+/// relative to each root.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostFsPolicy {
+pub struct FilesystemPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow: Vec<String>,
+    pub mounts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hide: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readonly: Vec<String>,
 }
 
-impl HostFsPolicy {
+impl FilesystemPolicy {
     pub fn is_empty(&self) -> bool {
-        self.allow.is_empty()
+        self.mounts.is_empty() && self.hide.is_empty() && self.readonly.is_empty()
     }
+}
+
+pub fn default_filesystem_hide() -> Vec<String> {
+    [
+        r"(^|/)\.env(\..*)?$",
+        r"(^|/).*\.env(\..*)?$",
+        r"(^|/).*\.pem$",
+        r"(^|/).*\.key$",
+        r"(^|/).*\.p12$",
+        r"(^|/).*\.pfx$",
+        r"(^|/)id_rsa$",
+        r"(^|/)id_ecdsa$",
+        r"(^|/)id_ed25519$",
+        r"(^|/)\.npmrc$",
+        r"(^|/)\.pypirc$",
+        r"(^|/)\.netrc$",
+        r"(^|/)credentials$",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn default_filesystem_readonly() -> Vec<String> {
+    [r"(^|/)\.claude(/|$)", r"(^|/)\.codex(/|$)"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Claude Code runtime options controlled by agent-container.
@@ -171,17 +204,28 @@ impl Settings {
             },
             mcp: McpPolicy::default(),
             task_runner: TaskRunnerPolicy::default(),
-            host_fs: HostFsPolicy::default(),
+            filesystem: FilesystemPolicy {
+                mounts: Vec::new(),
+                hide: default_filesystem_hide(),
+                readonly: default_filesystem_readonly(),
+            },
             claude: ClaudePolicy::default(),
         }
     }
 
     /// Load the global settings — or materialise [`Self::default_global`]
-    /// when the file does not yet exist. Once the user saves anything,
-    /// the file is authoritative and the bundled defaults are no longer
-    /// consulted.
+    /// when the file does not yet exist. Security-oriented filesystem
+    /// defaults are always appended so older settings files do not
+    /// accidentally expose secrets after upgrading.
     pub fn load_global() -> Result<Self> {
-        Self::load_from_or(&global_path()?, Self::default_global)
+        let path = global_path()?;
+        let mut settings = Self::load_from_or(&path, Self::default_global)?;
+        append_unique(&mut settings.filesystem.hide, default_filesystem_hide());
+        append_unique(
+            &mut settings.filesystem.readonly,
+            default_filesystem_readonly(),
+        );
+        Ok(settings)
     }
 
     pub fn load_workspace(workspace: &Path) -> Result<Self> {
@@ -225,8 +269,9 @@ impl Settings {
     ///   overlay keep their base definition.
     /// - `task_runner.tasks.<name>`: same as MCP — overlay's same-named
     ///   task replaces the base's, others pass through.
-    /// - `host_fs.allow`: overlay entries are appended to the base list,
-    ///   preserving order and removing exact duplicates.
+    /// - `filesystem.mounts`, `filesystem.hide`, `filesystem.readonly`:
+    ///   overlay entries are appended to the base list, preserving order
+    ///   and removing exact duplicates.
     pub fn merge_in_place(&mut self, overlay: Self) {
         for pat in overlay.proxy.allow {
             if !self.proxy.allow.contains(&pat) {
@@ -239,13 +284,19 @@ impl Settings {
         for (name, cmd) in overlay.task_runner.tasks {
             self.task_runner.tasks.insert(name, cmd);
         }
-        for pat in overlay.host_fs.allow {
-            if !self.host_fs.allow.contains(&pat) {
-                self.host_fs.allow.push(pat);
-            }
-        }
+        append_unique(&mut self.filesystem.mounts, overlay.filesystem.mounts);
+        append_unique(&mut self.filesystem.hide, overlay.filesystem.hide);
+        append_unique(&mut self.filesystem.readonly, overlay.filesystem.readonly);
         if overlay.claude.tmux_prefix.is_some() {
             self.claude.tmux_prefix = overlay.claude.tmux_prefix;
+        }
+    }
+}
+
+fn append_unique(target: &mut Vec<String>, overlay: Vec<String>) {
+    for value in overlay {
+        if !target.contains(&value) {
+            target.push(value);
         }
     }
 }

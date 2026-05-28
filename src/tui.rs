@@ -44,7 +44,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs};
 
 use crate::policy::McpPolicy;
-use crate::settings::Scope;
+use crate::settings::{FilesystemPolicy, Scope};
 
 /// Single-line text buffer with readline-style editing primitives.
 ///
@@ -225,8 +225,8 @@ pub struct TuiInput {
     /// the TUI.
     pub proxy_allow_global: Vec<String>,
     pub proxy_allow_workspace: Vec<String>,
-    pub host_fs_allow_global: Vec<String>,
-    pub host_fs_allow_workspace: Vec<String>,
+    pub filesystem_global: FilesystemPolicy,
+    pub filesystem_workspace: FilesystemPolicy,
     /// Static catalog of every (server, tool) the merged settings know
     /// about — used to render the MCP tab regardless of scope.
     pub tool_catalog: Vec<ToolEntry>,
@@ -248,8 +248,8 @@ pub struct TuiOutput {
     pub saved_scope: Scope,
     pub proxy_allow_global: Vec<String>,
     pub proxy_allow_workspace: Vec<String>,
-    pub host_fs_allow_global: Vec<String>,
-    pub host_fs_allow_workspace: Vec<String>,
+    pub filesystem_global: FilesystemPolicy,
+    pub filesystem_workspace: FilesystemPolicy,
     pub mcp_global: McpPolicy,
     pub mcp_workspace: McpPolicy,
     pub tasks_global: BTreeMap<String, String>,
@@ -284,7 +284,7 @@ impl TopTab {
         }
     }
     fn titles() -> [&'static str; 3] {
-        ["Proxy", "Host FS", "MCP"]
+        ["Proxy", "Filesystem", "MCP"]
     }
     fn index(self) -> usize {
         match self {
@@ -298,7 +298,23 @@ impl TopTab {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PatternTarget {
     Proxy,
-    HostFs,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FilesystemField {
+    Mount,
+    Hide,
+    Readonly,
+}
+
+impl FilesystemField {
+    fn label(self) -> &'static str {
+        match self {
+            FilesystemField::Mount => "mount",
+            FilesystemField::Hide => "hide",
+            FilesystemField::Readonly => "readonly",
+        }
+    }
 }
 
 enum Mode {
@@ -310,6 +326,11 @@ enum Mode {
         /// The row carries the origin scope so the commit knows whether
         /// to update or refuse the write.
         editing: Option<ProxyRow>,
+    },
+    FilesystemInput {
+        field: FilesystemField,
+        buffer: TextField,
+        editing: Option<FilesystemRow>,
     },
     TaskInput {
         name: TextField,
@@ -495,6 +516,157 @@ impl ProxyState {
                 let len = self.visible_rows(scope).len();
                 self.cursor = len.saturating_sub(1);
             }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FilesystemRow {
+    origin: ProxyOrigin,
+    field: FilesystemField,
+    value: String,
+    idx_within_scope: usize,
+}
+
+struct FilesystemState {
+    global: FilesystemPolicy,
+    workspace: FilesystemPolicy,
+    cursor: usize,
+}
+
+impl FilesystemState {
+    fn new(global: FilesystemPolicy, workspace: FilesystemPolicy) -> Self {
+        Self {
+            global,
+            workspace,
+            cursor: 0,
+        }
+    }
+
+    fn list(policy: &FilesystemPolicy, field: FilesystemField) -> &Vec<String> {
+        match field {
+            FilesystemField::Mount => &policy.mounts,
+            FilesystemField::Hide => &policy.hide,
+            FilesystemField::Readonly => &policy.readonly,
+        }
+    }
+
+    fn list_mut(policy: &mut FilesystemPolicy, field: FilesystemField) -> &mut Vec<String> {
+        match field {
+            FilesystemField::Mount => &mut policy.mounts,
+            FilesystemField::Hide => &mut policy.hide,
+            FilesystemField::Readonly => &mut policy.readonly,
+        }
+    }
+
+    fn policy_mut(&mut self, origin: ProxyOrigin) -> &mut FilesystemPolicy {
+        match origin {
+            ProxyOrigin::Global => &mut self.global,
+            ProxyOrigin::Workspace => &mut self.workspace,
+        }
+    }
+
+    fn rows_for(policy: &FilesystemPolicy, origin: ProxyOrigin) -> Vec<FilesystemRow> {
+        let mut rows = Vec::new();
+        for field in [
+            FilesystemField::Mount,
+            FilesystemField::Hide,
+            FilesystemField::Readonly,
+        ] {
+            for (i, value) in Self::list(policy, field).iter().enumerate() {
+                rows.push(FilesystemRow {
+                    origin,
+                    field,
+                    value: value.clone(),
+                    idx_within_scope: i,
+                });
+            }
+        }
+        rows
+    }
+
+    fn visible_rows(&self, scope: Scope) -> Vec<FilesystemRow> {
+        let mut rows = Self::rows_for(&self.global, ProxyOrigin::Global);
+        if scope == Scope::Workspace {
+            rows.extend(Self::rows_for(&self.workspace, ProxyOrigin::Workspace));
+        }
+        rows
+    }
+
+    fn move_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_down(&mut self, scope: Scope) {
+        let len = self.visible_rows(scope).len();
+        if self.cursor + 1 < len {
+            self.cursor += 1;
+        }
+    }
+
+    fn jump_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn jump_end(&mut self, scope: Scope) {
+        let len = self.visible_rows(scope).len();
+        self.cursor = len.saturating_sub(1);
+    }
+
+    fn current_row(&self, scope: Scope) -> Option<FilesystemRow> {
+        self.visible_rows(scope).into_iter().nth(self.cursor)
+    }
+
+    fn upsert(
+        &mut self,
+        scope: Scope,
+        field: FilesystemField,
+        value: String,
+        editing: Option<FilesystemRow>,
+    ) {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let active = ProxyOrigin::from_scope(scope);
+        let v = trimmed.to_string();
+        match editing {
+            Some(row) if row.origin == active => {
+                let policy = self.policy_mut(active);
+                let list = Self::list_mut(policy, row.field);
+                if row.idx_within_scope < list.len() {
+                    list[row.idx_within_scope] = v;
+                }
+            }
+            Some(_) => {}
+            None => {
+                let policy = self.policy_mut(active);
+                let list = Self::list_mut(policy, field);
+                if !list.contains(&v) {
+                    list.push(v);
+                }
+                let len = self.visible_rows(scope).len();
+                self.cursor = len.saturating_sub(1);
+            }
+        }
+    }
+
+    fn remove_current(&mut self, scope: Scope) {
+        let Some(row) = self.current_row(scope) else {
+            return;
+        };
+        let active = ProxyOrigin::from_scope(scope);
+        if row.origin != active {
+            return;
+        }
+        let policy = self.policy_mut(active);
+        let list = Self::list_mut(policy, row.field);
+        if row.idx_within_scope < list.len() {
+            list.remove(row.idx_within_scope);
+        }
+        let len = self.visible_rows(scope).len();
+        if self.cursor >= len {
+            self.cursor = len.saturating_sub(1);
         }
     }
 }
@@ -817,8 +989,8 @@ enum RowAction {
 struct Snapshot {
     proxy_global: Vec<String>,
     proxy_workspace: Vec<String>,
-    host_fs_global: Vec<String>,
-    host_fs_workspace: Vec<String>,
+    filesystem_global: FilesystemPolicy,
+    filesystem_workspace: FilesystemPolicy,
     mcp_global: McpPolicy,
     mcp_workspace: McpPolicy,
     tasks_global: BTreeMap<String, String>,
@@ -831,7 +1003,7 @@ struct App {
     /// Holds both scopes' allow lists; the visible rows are derived
     /// from `scope`. Cursor is on the rendered (merged) view.
     proxy: ProxyState,
-    host_fs: ProxyState,
+    filesystem: FilesystemState,
     mcp: McpState,
     mode: Mode,
     list_state: ListState,
@@ -845,8 +1017,8 @@ impl App {
         let initial = Snapshot {
             proxy_global: input.proxy_allow_global.clone(),
             proxy_workspace: input.proxy_allow_workspace.clone(),
-            host_fs_global: input.host_fs_allow_global.clone(),
-            host_fs_workspace: input.host_fs_allow_workspace.clone(),
+            filesystem_global: input.filesystem_global.clone(),
+            filesystem_workspace: input.filesystem_workspace.clone(),
             mcp_global: input.mcp_global.clone(),
             mcp_workspace: input.mcp_workspace.clone(),
             tasks_global: input.tasks_global.clone(),
@@ -856,7 +1028,7 @@ impl App {
             scope: input.initial_scope,
             tab: TopTab::Proxy,
             proxy: ProxyState::new(input.proxy_allow_global, input.proxy_allow_workspace),
-            host_fs: ProxyState::new(input.host_fs_allow_global, input.host_fs_allow_workspace),
+            filesystem: FilesystemState::new(input.filesystem_global, input.filesystem_workspace),
             mcp: McpState::new(
                 input.tool_catalog,
                 input.mcp_global,
@@ -873,8 +1045,8 @@ impl App {
     fn has_unsaved_changes(&self) -> bool {
         self.proxy.global != self.initial.proxy_global
             || self.proxy.workspace != self.initial.proxy_workspace
-            || self.host_fs.global != self.initial.host_fs_global
-            || self.host_fs.workspace != self.initial.host_fs_workspace
+            || self.filesystem.global != self.initial.filesystem_global
+            || self.filesystem.workspace != self.initial.filesystem_workspace
             || self.mcp.mcp_global != self.initial.mcp_global
             || self.mcp.mcp_workspace != self.initial.mcp_workspace
             || self.mcp.tasks_global != self.initial.tasks_global
@@ -890,10 +1062,15 @@ impl App {
         // panel happens to be active. The MCP cursor is naturally bounded
         // by visible_rows(); for the proxy panel we re-clamp here so an
         // out-of-range cursor doesn't render off-list.
-        if matches!(self.tab, TopTab::Proxy | TopTab::HostFs) {
-            let len = self.active_patterns().visible_rows(self.scope).len();
-            if self.active_patterns().cursor >= len {
-                self.active_patterns_mut().cursor = len.saturating_sub(1);
+        if self.tab == TopTab::Proxy {
+            let len = self.proxy.visible_rows(self.scope).len();
+            if self.proxy.cursor >= len {
+                self.proxy.cursor = len.saturating_sub(1);
+            }
+        } else if self.tab == TopTab::HostFs {
+            let len = self.filesystem.visible_rows(self.scope).len();
+            if self.filesystem.cursor >= len {
+                self.filesystem.cursor = len.saturating_sub(1);
             }
         }
     }
@@ -901,26 +1078,10 @@ impl App {
     fn sync_list_state(&mut self) {
         let cur = match self.tab {
             TopTab::Proxy => self.proxy.cursor,
-            TopTab::HostFs => self.host_fs.cursor,
+            TopTab::HostFs => self.filesystem.cursor,
             TopTab::Mcp => self.mcp.cursor,
         };
         self.list_state.select(Some(cur));
-    }
-
-    fn active_patterns(&self) -> &ProxyState {
-        match self.tab {
-            TopTab::Proxy => &self.proxy,
-            TopTab::HostFs => &self.host_fs,
-            TopTab::Mcp => &self.proxy,
-        }
-    }
-
-    fn active_patterns_mut(&mut self) -> &mut ProxyState {
-        match self.tab {
-            TopTab::Proxy => &mut self.proxy,
-            TopTab::HostFs => &mut self.host_fs,
-            TopTab::Mcp => &mut self.proxy,
-        }
     }
 
     fn into_output(self) -> TuiOutput {
@@ -928,8 +1089,8 @@ impl App {
             saved_scope: self.scope,
             proxy_allow_global: self.proxy.global,
             proxy_allow_workspace: self.proxy.workspace,
-            host_fs_allow_global: self.host_fs.global,
-            host_fs_allow_workspace: self.host_fs.workspace,
+            filesystem_global: self.filesystem.global,
+            filesystem_workspace: self.filesystem.workspace,
             mcp_global: self.mcp.mcp_global,
             mcp_workspace: self.mcp.mcp_workspace,
             tasks_global: self.mcp.tasks_global,
@@ -957,7 +1118,6 @@ fn handle_proxy_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         KeyCode::Enter => {
             match target {
                 PatternTarget::Proxy => app.proxy.upsert(app.scope, buffer.value(), editing),
-                PatternTarget::HostFs => app.host_fs.upsert(app.scope, buffer.value(), editing),
             }
             return;
         }
@@ -968,6 +1128,37 @@ fn handle_proxy_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
 
     app.mode = Mode::ProxyInput {
         target,
+        buffer,
+        editing,
+    };
+}
+
+fn handle_filesystem_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    let Mode::FilesystemInput {
+        field,
+        mut buffer,
+        editing,
+    } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
+        return;
+    };
+
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    match code {
+        KeyCode::Esc => return,
+        KeyCode::Char('c') if ctrl => return,
+        KeyCode::Enter => {
+            app.filesystem
+                .upsert(app.scope, field, buffer.value(), editing);
+            return;
+        }
+        _ => {
+            apply_editing_key(&mut buffer, code, modifiers);
+        }
+    }
+
+    app.mode = Mode::FilesystemInput {
+        field,
         buffer,
         editing,
     };
@@ -1098,6 +1289,10 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             handle_proxy_input_key(&mut app, key.code, key.modifiers);
             continue;
         }
+        if matches!(app.mode, Mode::FilesystemInput { .. }) {
+            handle_filesystem_input_key(&mut app, key.code, key.modifiers);
+            continue;
+        }
         if matches!(app.mode, Mode::TaskInput { .. }) {
             handle_task_input_key(&mut app, key.code, key.modifiers);
             continue;
@@ -1142,22 +1337,22 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             KeyCode::Char('t') => app.toggle_scope(),
             KeyCode::Up | KeyCode::Char('k') => match app.tab {
                 TopTab::Proxy => app.proxy.move_up(),
-                TopTab::HostFs => app.host_fs.move_up(),
+                TopTab::HostFs => app.filesystem.move_up(),
                 TopTab::Mcp => app.mcp.move_up(),
             },
             KeyCode::Down | KeyCode::Char('j') => match app.tab {
                 TopTab::Proxy => app.proxy.move_down(app.scope),
-                TopTab::HostFs => app.host_fs.move_down(app.scope),
+                TopTab::HostFs => app.filesystem.move_down(app.scope),
                 TopTab::Mcp => app.mcp.move_down(app.scope),
             },
             KeyCode::Home | KeyCode::Char('g') => match app.tab {
                 TopTab::Proxy => app.proxy.jump_home(),
-                TopTab::HostFs => app.host_fs.jump_home(),
+                TopTab::HostFs => app.filesystem.jump_home(),
                 TopTab::Mcp => app.mcp.jump_home(),
             },
             KeyCode::End | KeyCode::Char('G') => match app.tab {
                 TopTab::Proxy => app.proxy.jump_end(app.scope),
-                TopTab::HostFs => app.host_fs.jump_end(app.scope),
+                TopTab::HostFs => app.filesystem.jump_end(app.scope),
                 TopTab::Mcp => app.mcp.jump_end(app.scope),
             },
             KeyCode::Char(' ') | KeyCode::Enter => match app.tab {
@@ -1176,11 +1371,11 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                     }
                 }
                 TopTab::HostFs => {
-                    if let Some(row) = app.host_fs.current_row(app.scope) {
+                    if let Some(row) = app.filesystem.current_row(app.scope) {
                         if row.origin == ProxyOrigin::from_scope(app.scope) {
-                            app.mode = Mode::ProxyInput {
-                                target: PatternTarget::HostFs,
-                                buffer: TextField::from_str(&row.pattern),
+                            app.mode = Mode::FilesystemInput {
+                                field: row.field,
+                                buffer: TextField::from_str(&row.value),
                                 editing: Some(row),
                             };
                         }
@@ -1200,8 +1395,29 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 };
             }
             KeyCode::Char('i') | KeyCode::Char('+') if app.tab == TopTab::HostFs => {
-                app.mode = Mode::ProxyInput {
-                    target: PatternTarget::HostFs,
+                app.mode = Mode::FilesystemInput {
+                    field: FilesystemField::Mount,
+                    buffer: TextField::default(),
+                    editing: None,
+                };
+            }
+            KeyCode::Char('m') if app.tab == TopTab::HostFs => {
+                app.mode = Mode::FilesystemInput {
+                    field: FilesystemField::Mount,
+                    buffer: TextField::default(),
+                    editing: None,
+                };
+            }
+            KeyCode::Char('x') if app.tab == TopTab::HostFs => {
+                app.mode = Mode::FilesystemInput {
+                    field: FilesystemField::Hide,
+                    buffer: TextField::default(),
+                    editing: None,
+                };
+            }
+            KeyCode::Char('r') if app.tab == TopTab::HostFs => {
+                app.mode = Mode::FilesystemInput {
+                    field: FilesystemField::Readonly,
                     buffer: TextField::default(),
                     editing: None,
                 };
@@ -1221,11 +1437,11 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 }
             }
             KeyCode::Char('e') if app.tab == TopTab::HostFs => {
-                if let Some(row) = app.host_fs.current_row(app.scope) {
+                if let Some(row) = app.filesystem.current_row(app.scope) {
                     if row.origin == ProxyOrigin::from_scope(app.scope) {
-                        app.mode = Mode::ProxyInput {
-                            target: PatternTarget::HostFs,
-                            buffer: TextField::from_str(&row.pattern),
+                        app.mode = Mode::FilesystemInput {
+                            field: row.field,
+                            buffer: TextField::from_str(&row.value),
                             editing: Some(row),
                         };
                     }
@@ -1240,7 +1456,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 app.proxy.remove_current(app.scope);
             }
             KeyCode::Char('d') if app.tab == TopTab::HostFs => {
-                app.host_fs.remove_current(app.scope);
+                app.filesystem.remove_current(app.scope);
             }
             KeyCode::Char('d') if app.tab == TopTab::Mcp => {
                 app.mcp.delete_task_at_cursor(app.scope);
@@ -1299,6 +1515,15 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     } = app.mode
     {
         render_proxy_input_modal(f, area, target, buffer, editing.is_some());
+    }
+
+    if let Mode::FilesystemInput {
+        field,
+        ref buffer,
+        ref editing,
+    } = app.mode
+    {
+        render_filesystem_input_modal(f, area, field, buffer, editing.is_some());
     }
 
     if matches!(app.mode, Mode::ConfirmQuit) {
@@ -1363,7 +1588,7 @@ fn render_proxy(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn render_host_fs(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
-    render_pattern_list(f, area, app.scope, &app.host_fs, &mut app.list_state);
+    render_filesystem(f, area, app);
 }
 
 fn render_pattern_list(
@@ -1417,6 +1642,52 @@ fn render_pattern_list(
         )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, area, list_state);
+}
+
+fn render_filesystem(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+    let rows = app.filesystem.visible_rows(app.scope);
+    let active = ProxyOrigin::from_scope(app.scope);
+    let items: Vec<ListItem> = if rows.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  (workspace is mounted by default; press `i`/`m` to add another mount)",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        rows.iter()
+            .map(|row| {
+                let is_inherited = row.origin != active;
+                let style = if is_inherited {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                let overlay = app.scope == Scope::Workspace && row.origin == ProxyOrigin::Workspace;
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if overlay { "* " } else { "  " }.to_string(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("{:<8}", row.field.label()),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(row.value.clone(), style),
+                ]))
+            })
+            .collect()
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::NONE))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
 fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
@@ -1559,7 +1830,7 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
 
     let help = match app.tab {
-        TopTab::Proxy | TopTab::HostFs => Line::from(vec![
+        TopTab::Proxy => Line::from(vec![
             key("h/l", Color::Cyan),
             Span::raw(" tabs · "),
             key("j/k", Color::Cyan),
@@ -1576,6 +1847,24 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Span::raw(" save · "),
             key("q", Color::Red),
             Span::raw(" cancel"),
+        ]),
+        TopTab::HostFs => Line::from(vec![
+            key("h/l", Color::Cyan),
+            Span::raw(" tabs · "),
+            key("j/k", Color::Cyan),
+            Span::raw(" move · "),
+            key("m/i", Color::Cyan),
+            Span::raw(" mount · "),
+            key("x", Color::Cyan),
+            Span::raw(" hide regex · "),
+            key("r", Color::Cyan),
+            Span::raw(" readonly regex · "),
+            key("e/d", Color::Cyan),
+            Span::raw(" edit/delete · "),
+            key("t", Color::Yellow),
+            Span::raw(" scope · "),
+            key("s", Color::Green),
+            Span::raw(" save"),
         ]),
         TopTab::Mcp => Line::from(vec![
             key("h/l", Color::Cyan),
@@ -1608,9 +1897,13 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         )]),
         TopTab::HostFs => Line::from(vec![Span::styled(
             format!(
-                "Global: {} · Workspace: {} host-fs allow pattern(s) · default deny",
-                app.host_fs.global.len(),
-                app.host_fs.workspace.len(),
+                "Global: {} mount, {} hide, {} readonly · Workspace: {} mount, {} hide, {} readonly",
+                app.filesystem.global.mounts.len(),
+                app.filesystem.global.hide.len(),
+                app.filesystem.global.readonly.len(),
+                app.filesystem.workspace.mounts.len(),
+                app.filesystem.workspace.hide.len(),
+                app.filesystem.workspace.readonly.len(),
             ),
             Style::default().fg(Color::DarkGray),
         )]),
@@ -1652,8 +1945,6 @@ fn render_proxy_input_modal(
     let title = match (target, is_edit) {
         (PatternTarget::Proxy, true) => " Edit proxy allow pattern ",
         (PatternTarget::Proxy, false) => " Add proxy allow pattern ",
-        (PatternTarget::HostFs, true) => " Edit host-fs allow pattern ",
-        (PatternTarget::HostFs, false) => " Add host-fs allow pattern ",
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1672,6 +1963,53 @@ fn render_proxy_input_modal(
 
     // Place the terminal caret after the "> " prefix plus whatever the
     // buffer has already consumed up to the logical cursor.
+    let cursor_x = inner.x + 2 + buffer.prefix_width();
+    let cursor_y = inner.y + 2;
+    f.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+fn render_filesystem_input_modal(
+    f: &mut ratatui::Frame<'_>,
+    parent: Rect,
+    field: FilesystemField,
+    buffer: &TextField,
+    is_edit: bool,
+) {
+    let w = parent.width.min(84).max(46);
+    let h: u16 = 5;
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    let y = parent.y + (parent.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, area);
+    let action = if is_edit { "Edit" } else { "Add" };
+    let title = format!(" {action} filesystem {} ", field.label());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let hint_text = match field {
+        FilesystemField::Mount => {
+            "Absolute host directory path. The current workspace is always mounted."
+        }
+        FilesystemField::Hide => {
+            "Regex matched against paths relative to each mounted root; matching paths are hidden."
+        }
+        FilesystemField::Readonly => {
+            "Regex matched against paths relative to each mounted root; matching paths are mounted read-only."
+        }
+    };
+    let hint = Line::from(vec![Span::styled(
+        hint_text,
+        Style::default().fg(Color::DarkGray),
+    )]);
+    let body = Line::from(vec![Span::raw("> "), Span::raw(buffer.value())]);
+    let para = Paragraph::new(vec![hint, Line::from(""), body]);
+    f.render_widget(para, inner);
+
     let cursor_x = inner.x + 2 + buffer.prefix_width();
     let cursor_y = inner.y + 2;
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
@@ -2046,8 +2384,16 @@ mod tests {
             initial_scope: Scope::Workspace,
             proxy_allow_global: vec!["g".into()],
             proxy_allow_workspace: vec!["w".into()],
-            host_fs_allow_global: vec!["/tmp/shared/**".into()],
-            host_fs_allow_workspace: vec!["!/tmp/shared/secrets/**".into()],
+            filesystem_global: FilesystemPolicy {
+                mounts: vec!["/tmp/shared".into()],
+                hide: vec![r"(^|/)\.env$".into()],
+                readonly: vec![r"(^|/)\.claude(/|$)".into()],
+            },
+            filesystem_workspace: FilesystemPolicy {
+                mounts: Vec::new(),
+                hide: vec![r"^secrets(/|$)".into()],
+                readonly: Vec::new(),
+            },
             tool_catalog: vec![entry("s", "t", Some(true))],
             mcp_global: McpPolicy::default(),
             mcp_workspace: McpPolicy::default(),
@@ -2066,6 +2412,13 @@ mod tests {
     fn has_unsaved_changes_detects_proxy_edit() {
         let mut app = App::new(fresh_input());
         app.proxy.workspace.push("w2".into());
+        assert!(app.has_unsaved_changes());
+    }
+
+    #[test]
+    fn has_unsaved_changes_detects_filesystem_edit() {
+        let mut app = App::new(fresh_input());
+        app.filesystem.workspace.mounts.push("/tmp/other".into());
         assert!(app.has_unsaved_changes());
     }
 
