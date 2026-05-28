@@ -309,6 +309,13 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
 struct SecretShadowMount {
     source: PathBuf,
     target: PathBuf,
+    kind: SecretShadowKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretShadowKind {
+    File,
+    Directory,
 }
 
 fn prepare_secret_shadow_mounts(
@@ -339,12 +346,32 @@ fn collect_secret_shadow_mounts(
     root: &Path,
     path: &Path,
     container_root: &Path,
-    shadow_root: &Path,
+    empty_dir: &Path,
     host_fs_allow: &[String],
     mounts: &mut Vec<SecretShadowMount>,
 ) -> Result<()> {
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to stat {}", path.display()))?;
+    if crate::host_fs::path_denied_by_rules(path, host_fs_allow) {
+        let relative = path
+            .strip_prefix(root)
+            .with_context(|| format!("{} is not under {}", path.display(), root.display()))?;
+        mounts.push(SecretShadowMount {
+            source: if meta.is_dir() {
+                empty_dir.to_path_buf()
+            } else {
+                PathBuf::from("/dev/null")
+            },
+            target: container_root.join(relative),
+            kind: if meta.is_dir() {
+                SecretShadowKind::Directory
+            } else {
+                SecretShadowKind::File
+            },
+        });
+        return Ok(());
+    }
+
     if meta.is_dir() {
         for entry in
             std::fs::read_dir(path).with_context(|| format!("failed to list {}", path.display()))?
@@ -354,31 +381,12 @@ fn collect_secret_shadow_mounts(
                 root,
                 &entry.path(),
                 container_root,
-                shadow_root,
+                empty_dir,
                 host_fs_allow,
                 mounts,
             )?;
         }
-        return Ok(());
     }
-    if !meta.is_file() || !crate::host_fs::path_denied_by_rules(path, host_fs_allow) {
-        return Ok(());
-    }
-
-    let relative = path
-        .strip_prefix(root)
-        .with_context(|| format!("{} is not under {}", path.display(), root.display()))?;
-    let source = shadow_root.join(relative);
-    if let Some(parent) = source.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    std::fs::write(&source, b"")
-        .with_context(|| format!("failed to write secret shadow {}", source.display()))?;
-    mounts.push(SecretShadowMount {
-        source,
-        target: container_root.join(relative),
-    });
     Ok(())
 }
 
@@ -407,7 +415,7 @@ fn write_secret_shadow_compose_override(
     std::fs::write(&path, out)
         .with_context(|| format!("failed to write compose override {}", path.display()))?;
     eprintln!(
-        "[agent-container] shadowing {} existing denied workspace file(s)",
+        "[agent-container] shadowing {} existing denied workspace path(s)",
         mounts.len()
     );
     Ok(Some(path))
@@ -534,6 +542,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("work");
         std::fs::create_dir_all(workspace.join("private")).unwrap();
+        std::fs::create_dir_all(workspace.join("blocked-dir")).unwrap();
         std::fs::write(workspace.join(".env"), "secret").unwrap();
         std::fs::write(workspace.join("private/token.txt"), "secret").unwrap();
         std::fs::write(workspace.join("README.md"), "ok").unwrap();
@@ -542,6 +551,7 @@ mod tests {
         let rules = vec![
             format!("{}/**", canonical_workspace.display()),
             format!("!{}/private/**", canonical_workspace.display()),
+            format!("!{}/blocked-dir", canonical_workspace.display()),
         ];
         let mounts =
             prepare_secret_shadow_mounts(&workspace, Path::new("/workspace"), 42, &rules).unwrap();
@@ -550,8 +560,21 @@ mod tests {
             .map(|mount| mount.target.display().to_string())
             .collect();
         assert!(targets.contains(&"/workspace/.env".to_string()));
-        assert!(targets.contains(&"/workspace/private/token.txt".to_string()));
+        assert!(targets.contains(&"/workspace/private".to_string()));
+        assert!(targets.contains(&"/workspace/blocked-dir".to_string()));
         assert!(!targets.contains(&"/workspace/README.md".to_string()));
+        let file_mount = mounts
+            .iter()
+            .find(|mount| mount.target == Path::new("/workspace/.env"))
+            .unwrap();
+        assert_eq!(file_mount.source, PathBuf::from("/dev/null"));
+        assert_eq!(file_mount.kind, SecretShadowKind::File);
+        let dir_mount = mounts
+            .iter()
+            .find(|mount| mount.target == Path::new("/workspace/blocked-dir"))
+            .unwrap();
+        assert_ne!(dir_mount.source, PathBuf::from("/dev/null"));
+        assert_eq!(dir_mount.kind, SecretShadowKind::Directory);
     }
 
     #[test]
