@@ -381,6 +381,60 @@ pub enum FilesystemAccess {
     Readwrite,
 }
 
+pub struct FilesystemMatcher {
+    roots: Vec<PathBuf>,
+    hide: Vec<Regex>,
+    readonly: Vec<Regex>,
+}
+
+impl FilesystemMatcher {
+    pub fn new(workspace: &Path, policy: &crate::settings::FilesystemPolicy) -> Result<Self> {
+        let roots = mounted_roots(workspace, policy)?;
+        let hide = compile_regexes(&policy.hide)?;
+        let readonly = compile_regexes(&policy.readonly)?;
+        Ok(Self {
+            roots,
+            hide,
+            readonly,
+        })
+    }
+
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
+    pub fn classify_existing_or_absolute(&self, path: &Path) -> Result<FilesystemAccess> {
+        let path = if path.exists() {
+            std::fs::canonicalize(path)
+                .with_context(|| format!("failed to resolve {}", path.display()))?
+        } else {
+            normalize_absolute(path)?
+        };
+        self.classify_resolved(&path)
+    }
+
+    pub fn classify_resolved(&self, path: &Path) -> Result<FilesystemAccess> {
+        for root in &self.roots {
+            if !path.starts_with(root) {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(Path::new(""))
+                .to_string_lossy()
+                .replace('\\', "/");
+            if matches_any_compiled_regex(&self.hide, &rel) {
+                return Ok(FilesystemAccess::Hidden);
+            }
+            if matches_any_compiled_regex(&self.readonly, &rel) {
+                return Ok(FilesystemAccess::Readonly);
+            }
+            return Ok(FilesystemAccess::Readwrite);
+        }
+        Ok(FilesystemAccess::Hidden)
+    }
+}
+
 pub fn mounted_roots(
     workspace: &Path,
     policy: &crate::settings::FilesystemPolicy,
@@ -408,45 +462,26 @@ pub fn classify_path(
     policy: &crate::settings::FilesystemPolicy,
     path: &Path,
 ) -> Result<FilesystemAccess> {
-    let path = if path.exists() {
-        std::fs::canonicalize(path)
-            .with_context(|| format!("failed to resolve {}", path.display()))?
-    } else {
-        normalize_absolute(path)?
-    };
-    for root in mounted_roots(workspace, policy)? {
-        if !path.starts_with(&root) {
-            continue;
-        }
-        let rel = path
-            .strip_prefix(&root)
-            .unwrap_or(Path::new(""))
-            .to_string_lossy()
-            .replace('\\', "/");
-        if matches_any_regex(&policy.hide, &rel)? {
-            return Ok(FilesystemAccess::Hidden);
-        }
-        if matches_any_regex(&policy.readonly, &rel)? {
-            return Ok(FilesystemAccess::Readonly);
-        }
-        return Ok(FilesystemAccess::Readwrite);
-    }
-    Ok(FilesystemAccess::Hidden)
+    FilesystemMatcher::new(workspace, policy)?.classify_existing_or_absolute(path)
 }
 
-fn matches_any_regex(patterns: &[String], value: &str) -> Result<bool> {
-    let value = if value.is_empty() { "." } else { value };
+fn compile_regexes(patterns: &[String]) -> Result<Vec<Regex>> {
+    let mut regexes = Vec::new();
     for pattern in patterns {
         if pattern.trim().is_empty() {
             continue;
         }
-        let re = Regex::new(pattern)
-            .with_context(|| format!("invalid filesystem filter regex `{pattern}`"))?;
-        if re.is_match(value) {
-            return Ok(true);
-        }
+        regexes.push(
+            Regex::new(pattern)
+                .with_context(|| format!("invalid filesystem filter regex `{pattern}`"))?,
+        );
     }
-    Ok(false)
+    Ok(regexes)
+}
+
+fn matches_any_compiled_regex(regexes: &[Regex], value: &str) -> bool {
+    let value = if value.is_empty() { "." } else { value };
+    regexes.iter().any(|re| re.is_match(value))
 }
 
 fn search_recursive(

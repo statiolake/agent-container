@@ -323,9 +323,10 @@ fn prepare_secret_shadow_mounts(
         .with_context(|| format!("failed to prepare {}", shadow_root.display()))?;
 
     let mut mounts = Vec::new();
+    let matcher = crate::host_fs::FilesystemMatcher::new(workspace, filesystem)?;
     let canonical_workspace = std::fs::canonicalize(workspace)?;
-    for root in crate::host_fs::mounted_roots(workspace, filesystem)? {
-        let is_workspace_root = root == canonical_workspace;
+    for root in matcher.roots() {
+        let is_workspace_root = root == &canonical_workspace;
         let target_root = if is_workspace_root {
             container_workspace.to_path_buf()
         } else {
@@ -339,12 +340,11 @@ fn prepare_secret_shadow_mounts(
             });
         }
         collect_secret_shadow_mounts(
-            workspace,
             &root,
             &root,
             &target_root,
             &shadow_root,
-            filesystem,
+            &matcher,
             &mut mounts,
         )?;
     }
@@ -352,17 +352,16 @@ fn prepare_secret_shadow_mounts(
 }
 
 fn collect_secret_shadow_mounts(
-    workspace: &Path,
     root: &Path,
     path: &Path,
     container_root: &Path,
     empty_dir: &Path,
-    filesystem: &crate::settings::FilesystemPolicy,
+    matcher: &crate::host_fs::FilesystemMatcher,
     mounts: &mut Vec<SecretShadowMount>,
 ) -> Result<()> {
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to stat {}", path.display()))?;
-    match crate::host_fs::classify_path(workspace, filesystem, path)? {
+    match matcher.classify_resolved(path)? {
         crate::host_fs::FilesystemAccess::Hidden => {
             let relative = path
                 .strip_prefix(root)
@@ -398,12 +397,11 @@ fn collect_secret_shadow_mounts(
         {
             let entry = entry?;
             collect_secret_shadow_mounts(
-                workspace,
                 root,
                 &entry.path(),
                 container_root,
                 empty_dir,
-                filesystem,
+                matcher,
                 mounts,
             )?;
         }
