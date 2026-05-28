@@ -17,6 +17,23 @@ const MAX_READ_BYTES: u64 = 1024 * 1024;
 const MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
 const DEFAULT_SEARCH_RESULTS: usize = 100;
 const MAX_SEARCH_RESULTS: usize = 1000;
+const SENSITIVE_DENY_PATTERNS: &[&str] = &[
+    "**/.env",
+    "**/.env.*",
+    "**/*.env",
+    "**/*.env.*",
+    "**/*.pem",
+    "**/*.key",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/id_rsa",
+    "**/id_ecdsa",
+    "**/id_ed25519",
+    "**/.npmrc",
+    "**/.pypirc",
+    "**/.netrc",
+    "**/credentials",
+];
 
 #[derive(Debug, Clone)]
 pub struct HostFs {
@@ -364,7 +381,13 @@ fn path_allowed(path: &Path, patterns: &[String]) -> bool {
             allowed = !deny;
         }
     }
-    allowed
+    allowed && !sensitive_path_denied(&path)
+}
+
+fn sensitive_path_denied(path: &str) -> bool {
+    SENSITIVE_DENY_PATTERNS
+        .iter()
+        .any(|pattern| glob_match_path(pattern, path))
 }
 
 fn path_to_match_string(path: &Path) -> String {
@@ -475,6 +498,22 @@ mod tests {
         assert!(path_allowed(Path::new("/tmp/project"), &rules));
         assert!(!path_allowed(Path::new("/tmp/project/secrets/key"), &rules));
         assert!(!path_allowed(Path::new("/tmp/other"), &rules));
+    }
+
+    #[test]
+    fn sensitive_files_stay_denied_even_inside_allowed_tree() {
+        let rules = vec!["/tmp/project/**".to_string()];
+        for path in [
+            "/tmp/project/.env",
+            "/tmp/project/.env.local",
+            "/tmp/project/app.env",
+            "/tmp/project/id_ed25519",
+            "/tmp/project/token.pem",
+            "/tmp/project/.npmrc",
+        ] {
+            assert!(!path_allowed(Path::new(path), &rules), "{path}");
+        }
+        assert!(path_allowed(Path::new("/tmp/project/README.md"), &rules));
     }
 
     #[test]

@@ -85,7 +85,9 @@ impl TaskRunnerPolicy {
 /// Host filesystem access exposed through the built-in `host-fs` MCP
 /// server. Patterns use an allowlist form of gitignore-like glob rules:
 /// unprefixed patterns allow access, `!pattern` denies access, and the
-/// initial state is denied (as if `!*` had already matched).
+/// initial state is denied (as if `!*` had already matched). The broker
+/// also applies hard-coded denies for common secret file names after
+/// user rules.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostFsPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
