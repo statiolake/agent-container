@@ -309,13 +309,6 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
 struct SecretShadowMount {
     source: PathBuf,
     target: PathBuf,
-    kind: SecretShadowKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SecretShadowKind {
-    File,
-    Directory,
 }
 
 fn prepare_secret_shadow_mounts(
@@ -363,11 +356,6 @@ fn collect_secret_shadow_mounts(
                 PathBuf::from("/dev/null")
             },
             target: container_root.join(relative),
-            kind: if meta.is_dir() {
-                SecretShadowKind::Directory
-            } else {
-                SecretShadowKind::File
-            },
         });
         return Ok(());
     }
@@ -568,13 +556,11 @@ mod tests {
             .find(|mount| mount.target == Path::new("/workspace/.env"))
             .unwrap();
         assert_eq!(file_mount.source, PathBuf::from("/dev/null"));
-        assert_eq!(file_mount.kind, SecretShadowKind::File);
         let dir_mount = mounts
             .iter()
             .find(|mount| mount.target == Path::new("/workspace/blocked-dir"))
             .unwrap();
         assert_ne!(dir_mount.source, PathBuf::from("/dev/null"));
-        assert_eq!(dir_mount.kind, SecretShadowKind::Directory);
     }
 
     #[test]
