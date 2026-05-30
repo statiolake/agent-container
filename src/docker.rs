@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::IsTerminal;
+use std::io::{ErrorKind, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -359,8 +359,17 @@ fn collect_secret_shadow_mounts(
     matcher: &crate::host_fs::FilesystemMatcher,
     mounts: &mut Vec<SecretShadowMount>,
 ) -> Result<()> {
-    let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            eprintln!(
+                "[agent-container] warning: skipping unreadable filesystem path {}: {e}",
+                path.display()
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("failed to stat {}", path.display())),
+    };
     match matcher.classify_resolved(path)? {
         crate::host_fs::FilesystemAccess::Hidden => {
             let relative = path
@@ -392,10 +401,31 @@ fn collect_secret_shadow_mounts(
     }
 
     if meta.is_dir() {
-        for entry in
-            std::fs::read_dir(path).with_context(|| format!("failed to list {}", path.display()))?
-        {
-            let entry = entry?;
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "[agent-container] warning: skipping unreadable filesystem directory {}: {e}",
+                    path.display()
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e).with_context(|| format!("failed to list {}", path.display())),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    eprintln!(
+                        "[agent-container] warning: skipping unreadable filesystem entry under {}: {e}",
+                        path.display()
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("failed to list {}", path.display()));
+                }
+            };
             collect_secret_shadow_mounts(
                 root,
                 &entry.path(),
