@@ -194,7 +194,8 @@ impl HostFs {
         let path = required_string(arguments, "path")?;
         let path = resolve_existing_path(path)?;
         let policy = self.latest_policy()?;
-        ensure_readable_by(&self.workspace, &path, &policy)?;
+        let matcher = FilesystemMatcher::new(&self.workspace, &policy)?;
+        ensure_listable_by(&matcher, &path)?;
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(&path)
             .with_context(|| format!("failed to list {}", path.display()))?
@@ -203,10 +204,7 @@ impl HostFs {
             let entry_path = entry.path();
             let allowed_path =
                 std::fs::canonicalize(&entry_path).unwrap_or_else(|_| entry_path.clone());
-            if matches!(
-                classify_path(&self.workspace, &policy, &allowed_path)?,
-                FilesystemAccess::Hidden
-            ) {
+            if !list_entry_visible(&matcher, &allowed_path)? {
                 continue;
             }
             let meta = entry.metadata()?;
@@ -304,6 +302,23 @@ fn ensure_readable_by(
             path.display()
         ),
     }
+}
+
+fn ensure_listable_by(matcher: &FilesystemMatcher, path: &Path) -> Result<()> {
+    if list_entry_visible(matcher, path)? {
+        return Ok(());
+    }
+    bail!(
+        "{} is hidden by [filesystem].hide or outside mounted roots",
+        path.display()
+    )
+}
+
+fn list_entry_visible(matcher: &FilesystemMatcher, path: &Path) -> Result<bool> {
+    Ok(!matches!(
+        matcher.classify_resolved(path)?,
+        FilesystemAccess::Hidden
+    ) || matcher.has_visible_descendant_root(path))
 }
 
 fn required_string<'a>(arguments: Option<&'a Value>, key: &str) -> Result<&'a str> {
@@ -432,6 +447,10 @@ impl FilesystemMatcher {
             return Ok(FilesystemAccess::Readwrite);
         }
         Ok(FilesystemAccess::Hidden)
+    }
+
+    pub fn has_visible_descendant_root(&self, path: &Path) -> bool {
+        self.roots.iter().any(|root| root != path && root.starts_with(path))
     }
 }
 
@@ -590,5 +609,24 @@ mod tests {
             classify_path(&workspace, &policy, dir.path()).unwrap(),
             FilesystemAccess::Hidden
         );
+    }
+
+    #[test]
+    fn host_list_can_walk_to_visible_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("foo");
+        let workspace = parent.join("work");
+        let sibling = dir.path().join("bar");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let policy = crate::settings::FilesystemPolicy::default();
+        let matcher = FilesystemMatcher::new(&workspace, &policy).unwrap();
+
+        assert!(list_entry_visible(&matcher, dir.path()).unwrap());
+        assert!(list_entry_visible(&matcher, &parent).unwrap());
+        assert!(list_entry_visible(&matcher, &workspace).unwrap());
+        assert!(!list_entry_visible(&matcher, &sibling).unwrap());
+        ensure_listable_by(&matcher, dir.path()).unwrap();
+        ensure_listable_by(&matcher, &parent).unwrap();
     }
 }
