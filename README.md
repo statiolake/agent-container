@@ -146,8 +146,10 @@ Codex, with a checkbox per tool:
 
 Tools default to the upstream's `readOnlyHint` annotation (read-only on,
 destructive off). The allowlist lives in agent-container `settings.toml`:
-Claude Code uses `[claude_code.mcp]`, Codex uses `[codex.mcp]`, and legacy
-top-level `[mcp]` is still read as Claude Code policy then migrated on save.
+Claude Code uses `[claude_code.mcp]` for servers from `~/.claude.json`,
+Codex uses `[codex.mcp]` for servers from `~/.codex/config.toml`, and
+legacy top-level `[mcp]` is still read as Claude Code policy then migrated
+on save.
 
 ### Drop into the container for troubleshooting
 

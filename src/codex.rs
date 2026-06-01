@@ -321,6 +321,8 @@ const INHERITED_SCALAR_KEYS: &[&str] = &[
     "personality",
 ];
 
+const MCP_SERVERS_KEY: &str = "mcp_servers";
+
 /// Write `~/.codex/config.toml` into the container's persistent home.
 ///
 /// The file is composed from two sources:
@@ -338,7 +340,6 @@ pub fn write_container_config(
     broker_url_from_container: &str,
     task_runner_enabled: bool,
     host_fs_enabled: bool,
-    mcp_policy: &crate::policy::McpPolicy,
 ) -> Result<()> {
     let mut table = toml::value::Table::new();
 
@@ -353,6 +354,9 @@ pub fn write_container_config(
                 if let Some(v) = host_table.get(*key).cloned() {
                     table.insert((*key).to_string(), v);
                 }
+            }
+            if let Some(v) = host_table.get(MCP_SERVERS_KEY).cloned() {
+                table.insert(MCP_SERVERS_KEY.to_string(), v);
             }
         }
     }
@@ -372,7 +376,6 @@ pub fn write_container_config(
         broker_url_from_container,
         task_runner_enabled,
         host_fs_enabled,
-        mcp_policy,
     );
 
     let dir = container_home.join(".codex");
@@ -393,19 +396,24 @@ fn inject_builtin_mcp_servers(
     broker_url: &str,
     task_runner_enabled: bool,
     host_fs_enabled: bool,
-    mcp_policy: &crate::policy::McpPolicy,
 ) {
     if !task_runner_enabled && !host_fs_enabled {
         return;
     }
-    let mut servers = toml::value::Table::new();
-    if task_runner_enabled && codex_mcp_server_enabled(mcp_policy, crate::task_runner::NAME) {
+    let mut servers = table
+        .remove(MCP_SERVERS_KEY)
+        .and_then(|value| match value {
+            toml::Value::Table(table) => Some(table),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if task_runner_enabled && !servers.contains_key(crate::task_runner::NAME) {
         servers.insert(
             crate::task_runner::NAME.to_string(),
             codex_http_mcp_entry(broker_url, crate::task_runner::NAME),
         );
     }
-    if host_fs_enabled && codex_mcp_server_enabled(mcp_policy, crate::host_fs::NAME) {
+    if host_fs_enabled && !servers.contains_key(crate::host_fs::NAME) {
         servers.insert(
             crate::host_fs::NAME.to_string(),
             codex_http_mcp_entry(broker_url, crate::host_fs::NAME),
@@ -427,10 +435,6 @@ fn codex_http_mcp_entry(broker_url: &str, name: &str) -> toml::Value {
         )),
     );
     toml::Value::Table(entry)
-}
-
-fn codex_mcp_server_enabled(policy: &crate::policy::McpPolicy, name: &str) -> bool {
-    policy.servers.get(name).map(|p| p.enabled).unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -463,7 +467,6 @@ trust_level = "trusted"
             "http://broker",
             false,
             false,
-            &crate::policy::McpPolicy::default(),
         )
         .unwrap();
         let out = fs::read_to_string(container_home.path().join(".codex/config.toml")).unwrap();
@@ -487,7 +490,6 @@ trust_level = "trusted"
             "http://broker",
             false,
             false,
-            &crate::policy::McpPolicy::default(),
         )
         .unwrap();
         let out = fs::read_to_string(container_home.path().join(".codex/config.toml")).unwrap();
@@ -508,7 +510,6 @@ trust_level = "trusted"
             "http://host.docker.internal:7000/",
             true,
             true,
-            &crate::policy::McpPolicy::default(),
         )
         .unwrap();
         let out = fs::read_to_string(container_home.path().join(".codex/config.toml")).unwrap();
@@ -525,25 +526,41 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn codex_mcp_policy_can_disable_builtin_server_injection() {
+    fn preserves_host_codex_mcp_servers_and_does_not_override_builtin_names() {
         let host_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
-        let mut policy = crate::policy::McpPolicy::default();
-        policy.set_server_enabled(crate::host_fs::NAME, false);
+        fs::create_dir_all(host_home.path().join(".codex")).unwrap();
+        fs::write(
+            host_home.path().join(".codex/config.toml"),
+            r#"
+[mcp_servers.local]
+url = "http://127.0.0.1:3333/mcp"
+
+[mcp_servers.host-fs]
+url = "http://example.invalid/custom-host-fs"
+"#,
+        )
+        .unwrap();
         write_container_config(
             host_home.path(),
             container_home.path(),
             "http://host.docker.internal:7000",
             true,
             true,
-            &policy,
         )
         .unwrap();
         let out = fs::read_to_string(container_home.path().join(".codex/config.toml")).unwrap();
         let parsed: toml::Value = toml::from_str(&out).unwrap();
         let servers = parsed["mcp_servers"].as_table().unwrap();
         assert!(servers.contains_key(crate::task_runner::NAME));
-        assert!(!servers.contains_key(crate::host_fs::NAME));
+        assert_eq!(
+            servers["local"]["url"].as_str(),
+            Some("http://127.0.0.1:3333/mcp")
+        );
+        assert_eq!(
+            servers[crate::host_fs::NAME]["url"].as_str(),
+            Some("http://example.invalid/custom-host-fs")
+        );
     }
 
     #[test]

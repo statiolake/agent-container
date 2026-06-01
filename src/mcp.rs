@@ -80,6 +80,39 @@ pub fn load_servers(claude_json: &Path) -> Result<Vec<McpServer>> {
     Ok(out)
 }
 
+/// Read every MCP server definition out of Codex's `~/.codex/config.toml`
+/// `[mcp_servers.<name>]` table. The shape mirrors `codex mcp add` output:
+/// HTTP servers usually have `url`, while stdio servers have `command`,
+/// `args`, and optional `env`.
+pub fn load_codex_servers(codex_config: &Path) -> Result<Vec<McpServer>> {
+    if !codex_config.is_file() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(codex_config)
+        .with_context(|| format!("failed to read {}", codex_config.display()))?;
+    let cfg: toml::Value = toml::from_str(&raw)
+        .with_context(|| format!("failed to parse {} as TOML", codex_config.display()))?;
+
+    let Some(map) = cfg.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return Ok(Vec::new());
+    };
+
+    let mut out = Vec::new();
+    for (name, value) in map {
+        match parse_toml_entry(name, value) {
+            Ok(Some(server)) => out.push(server),
+            Ok(None) => {
+                tracing::debug!(name, "skipping unrecognised Codex MCP server entry");
+            }
+            Err(e) => {
+                tracing::warn!(name, error = %e, "failed to parse Codex MCP server entry; skipping");
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name().cmp(b.name()));
+    Ok(out)
+}
+
 #[derive(Deserialize)]
 struct RawEntry {
     #[serde(default, rename = "type", alias = "transport")]
@@ -99,7 +132,19 @@ struct RawEntry {
 fn parse_entry(name: &str, value: &Value) -> Result<Option<McpServer>> {
     let mut entry: RawEntry =
         serde_json::from_value(value.clone()).context("entry is not a valid MCP server object")?;
-    expand_entry_env(&mut entry).context("failed to expand environment variables")?;
+    parse_raw_entry(name, &mut entry)
+}
+
+fn parse_toml_entry(name: &str, value: &toml::Value) -> Result<Option<McpServer>> {
+    let mut entry: RawEntry = value
+        .clone()
+        .try_into()
+        .context("entry is not a valid MCP server object")?;
+    parse_raw_entry(name, &mut entry)
+}
+
+fn parse_raw_entry(name: &str, entry: &mut RawEntry) -> Result<Option<McpServer>> {
+    expand_entry_env(entry).context("failed to expand environment variables")?;
 
     // Decide transport. Claude Code infers stdio when `command` is present
     // and no `type` is set; http/sse require a URL.
@@ -116,18 +161,18 @@ fn parse_entry(name: &str, value: &Value) -> Result<Option<McpServer>> {
 
     match transport.as_str() {
         "stdio" => {
-            let Some(command) = entry.command else {
+            let Some(command) = entry.command.take() else {
                 return Ok(None);
             };
             Ok(Some(McpServer::Stdio(StdioMcpServer {
                 name: name.to_string(),
                 command,
-                args: entry.args,
-                env: entry.env,
+                args: std::mem::take(&mut entry.args),
+                env: std::mem::take(&mut entry.env),
             })))
         }
         "http" | "sse" => {
-            let Some(url) = entry.url else {
+            let Some(url) = entry.url.take() else {
                 return Ok(None);
             };
             if url.is_empty() {
@@ -137,7 +182,7 @@ fn parse_entry(name: &str, value: &Value) -> Result<Option<McpServer>> {
                 name: name.to_string(),
                 transport,
                 url,
-                headers: entry.headers,
+                headers: std::mem::take(&mut entry.headers),
             })))
         }
         _ => Ok(None),
@@ -217,6 +262,12 @@ mod tests {
         f
     }
 
+    fn write_toml(toml: &str) -> tempfile::NamedTempFile {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        fs::write(f.path(), toml).unwrap();
+        f
+    }
+
     #[test]
     fn loads_both_http_and_stdio_servers() {
         let f = write(
@@ -245,6 +296,26 @@ mod tests {
                 ("web", "http"),
             ]
         );
+    }
+
+    #[test]
+    fn loads_codex_mcp_servers_from_toml() {
+        let f = write_toml(
+            r#"
+[mcp_servers.web]
+url = "https://example.com/mcp"
+
+[mcp_servers.fs]
+command = "node"
+args = ["server.js"]
+"#,
+        );
+        let servers = load_codex_servers(f.path()).unwrap();
+        let pairs: Vec<_> = servers
+            .iter()
+            .map(|s| (s.name(), s.transport_label()))
+            .collect();
+        assert_eq!(pairs, vec![("fs", "stdio"), ("web", "http")]);
     }
 
     #[test]

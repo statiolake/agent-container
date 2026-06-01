@@ -157,9 +157,9 @@ Supported TOML shape:
   list_issues = true
   create_issue = false
 
-  [codex.mcp.servers.host-fs.tools]
-  HostRead = true
-  HostWrite = false
+  [codex.mcp.servers.local-tools.tools]
+  search = true
+  mutate = false
 
   [task_runner.tasks]
   build_image = "docker build -t my-app ."

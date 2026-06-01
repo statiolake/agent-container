@@ -2459,7 +2459,7 @@ mod tests {
                 readonly: Vec::new(),
             },
             claude_tool_catalog: vec![entry("s", "t", Some(true))],
-            codex_tool_catalog: vec![entry("host-fs", "HostRead", Some(true))],
+            codex_tool_catalog: vec![entry("local-tools", "search", Some(true))],
             mcp_global: McpPolicy::default(),
             mcp_workspace: McpPolicy::default(),
             codex_mcp_global: McpPolicy::default(),

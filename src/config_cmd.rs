@@ -59,8 +59,10 @@ pub fn resolve_scope_opt(global: bool, workspace: bool) -> Option<Scope> {
 pub async fn run_editor(initial_scope: Scope) -> Result<()> {
     let host = HostPaths::detect()?;
 
-    let servers = mcp::load_servers(&host.home.join(".claude.json"))
+    let claude_servers = mcp::load_servers(&host.home.join(".claude.json"))
         .context("failed to load MCP servers from ~/.claude.json")?;
+    let codex_servers = mcp::load_codex_servers(&host.home.join(".codex/config.toml"))
+        .context("failed to load MCP servers from ~/.codex/config.toml")?;
 
     let oauth = Arc::new(OAuthStore::new(
         load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
@@ -76,65 +78,37 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
     let merged = Settings::load_merged(&host.workspace)
         .context("failed to load agent-container settings")?;
 
-    let mut entries: Vec<ToolEntry> = Vec::new();
-    let mut skipped: Vec<(String, String)> = Vec::new();
-    if servers.is_empty() {
-        eprintln!(
-            "[agent-container] note: no MCP servers declared in ~/.claude.json; the MCP tab will be empty."
-        );
-    } else {
-        println!("Fetching tools from {} MCP server(s) in parallel...", servers.len());
-        let mut fetches = FuturesUnordered::new();
-        for server in servers.iter().cloned() {
-            let oauth = oauth.clone();
-            fetches.push(async move {
-                let name = server.name().to_string();
-                let transport = server.transport_label().to_string();
-                let result = fetch_any_with_timeout(&server, &oauth).await;
-                (name, transport, result)
-            });
-        }
+    let (claude_entries, mut skipped) =
+        fetch_tool_catalog("Claude Code", &claude_servers, &oauth).await;
+    let (codex_entries, codex_skipped) =
+        fetch_tool_catalog("Codex", &codex_servers, &oauth).await;
+    skipped.extend(codex_skipped);
 
-        while let Some((name, transport, result)) = fetches.next().await {
-            match result {
-                Ok(tools) => {
-                    println!("  {} ({})... {} tool(s)", name, transport, tools.len());
-                    for tool in tools {
-                        let read_only_hint = tool.read_only_hint();
-                        entries.push(ToolEntry {
-                            server_name: name.clone(),
-                            tool_name: tool.name,
-                            description: tool.description.unwrap_or_default(),
-                            read_only_hint,
-                        });
-                    }
-                }
-                Err(e) => {
-                    println!("  {} ({})... FAILED ({e:#})", name, transport);
-                    skipped.push((name, format!("{e:#}")));
-                }
-            }
-        }
-        entries.sort_by(|a, b| {
-            a.server_name
-                .cmp(&b.server_name)
-                .then_with(|| a.tool_name.cmp(&b.tool_name))
-        });
+    if claude_servers.is_empty() {
+        eprintln!(
+            "[agent-container] note: no MCP servers declared in ~/.claude.json; the Claude Code MCP tab will be empty."
+        );
+    }
+    if codex_servers.is_empty() {
+        eprintln!(
+            "[agent-container] note: no MCP servers declared in ~/.codex/config.toml; the Codex MCP tab will be empty."
+        );
     }
 
     // The TUI keeps two complete McpPolicy / tasks views in memory and
     // edits the active scope's view directly. Keep a copy of the catalog
     // here so the post-save minimisation can inspect every (server,
     // tool) pair regardless of which scope the user wound up saving.
-    let catalog = entries.clone();
+    let claude_catalog = claude_entries.clone();
+    let codex_catalog = codex_entries.clone();
     let input = TuiInput {
         initial_scope,
         proxy_allow_global: global_settings.proxy.allow.clone(),
         proxy_allow_workspace: workspace_settings.proxy.allow.clone(),
         filesystem_global: global_settings.filesystem.clone(),
         filesystem_workspace: workspace_settings.filesystem.clone(),
-        claude_tool_catalog: entries,
-        codex_tool_catalog: builtin_codex_tool_catalog(),
+        claude_tool_catalog: claude_entries,
+        codex_tool_catalog: codex_entries,
         mcp_global: global_settings.claude_code.mcp.clone(),
         mcp_workspace: workspace_settings.claude_code.mcp.clone(),
         codex_mcp_global: global_settings.codex.mcp.clone(),
@@ -173,10 +147,10 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
                 Scope::Global => out.mcp_global,
                 Scope::Workspace => out.mcp_workspace,
             };
-            minimise_policy_against_base(&mut target.claude_code.mcp, &base_mcp, &catalog);
-            let (base_codex_mcp, codex_catalog) = match saved_scope {
-                Scope::Workspace => (global_settings.codex.mcp.clone(), builtin_codex_tool_catalog()),
-                Scope::Global => (McpPolicy::default(), builtin_codex_tool_catalog()),
+            minimise_policy_against_base(&mut target.claude_code.mcp, &base_mcp, &claude_catalog);
+            let base_codex_mcp = match saved_scope {
+                Scope::Workspace => global_settings.codex.mcp.clone(),
+                Scope::Global => McpPolicy::default(),
             };
             target.codex.mcp = match saved_scope {
                 Scope::Global => out.codex_mcp_global,
@@ -300,37 +274,8 @@ fn template_for(scope: Scope) -> String {
         }
     };
     format!(
-        "{header}\n# Uncomment examples below.\n# [proxy]\n# allow = [\"^my-internal\\\\.example$\"]\n\n# [filesystem]\n# mounts = [\"/Users/me/project-notes\"]\n# hide = [\"(^|/)\\\\.env(\\\\..*)?$\"]\n# readonly = [\"(^|/)\\\\.claude(/|$)\"]\n\n# Claude Code MCP policy:\n# [claude_code.mcp.servers.github]\n# enabled = true\n# [claude_code.mcp.servers.github.tools]\n# list_issues = true\n# create_issue = false\n\n# Codex MCP policy:\n# [codex.mcp.servers.host-fs.tools]\n# HostRead = true\n# HostWrite = false\n\n# [claude]\n# tmux_prefix = \"C-b\"\n"
+        "{header}\n# Uncomment examples below.\n# [proxy]\n# allow = [\"^my-internal\\\\.example$\"]\n\n# [filesystem]\n# mounts = [\"/Users/me/project-notes\"]\n# hide = [\"(^|/)\\\\.env(\\\\..*)?$\"]\n# readonly = [\"(^|/)\\\\.claude(/|$)\"]\n\n# Claude Code MCP policy:\n# [claude_code.mcp.servers.github]\n# enabled = true\n# [claude_code.mcp.servers.github.tools]\n# list_issues = true\n# create_issue = false\n\n# Codex MCP policy:\n# [codex.mcp.servers.local-tools.tools]\n# search = true\n# mutate = false\n\n# [claude]\n# tmux_prefix = \"C-b\"\n"
     )
-}
-
-fn builtin_codex_tool_catalog() -> Vec<ToolEntry> {
-    vec![
-        ToolEntry {
-            server_name: crate::host_fs::NAME.to_string(),
-            tool_name: "HostRead".to_string(),
-            description: "Read a UTF-8 text file from an allowed host filesystem root.".to_string(),
-            read_only_hint: Some(true),
-        },
-        ToolEntry {
-            server_name: crate::host_fs::NAME.to_string(),
-            tool_name: "HostList".to_string(),
-            description: "List an allowed host directory.".to_string(),
-            read_only_hint: Some(true),
-        },
-        ToolEntry {
-            server_name: crate::host_fs::NAME.to_string(),
-            tool_name: "HostWrite".to_string(),
-            description: "Write UTF-8 text to an allowed, non-readonly host file.".to_string(),
-            read_only_hint: Some(false),
-        },
-        ToolEntry {
-            server_name: crate::host_fs::NAME.to_string(),
-            tool_name: "HostSearch".to_string(),
-            description: "Search UTF-8 text files under an allowed host directory.".to_string(),
-            read_only_hint: Some(true),
-        },
-    ]
 }
 
 async fn fetch_any(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> {
@@ -341,6 +286,60 @@ async fn fetch_any(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> 
         }
         McpServer::Stdio(s) => fetch_tools_stdio(s).await,
     }
+}
+
+async fn fetch_tool_catalog(
+    label: &str,
+    servers: &[McpServer],
+    oauth: &Arc<OAuthStore>,
+) -> (Vec<ToolEntry>, Vec<(String, String)>) {
+    let mut entries = Vec::new();
+    let mut skipped = Vec::new();
+    if servers.is_empty() {
+        return (entries, skipped);
+    }
+
+    println!(
+        "Fetching {label} tools from {} MCP server(s) in parallel...",
+        servers.len()
+    );
+    let mut fetches = FuturesUnordered::new();
+    for server in servers.iter().cloned() {
+        let oauth = oauth.clone();
+        fetches.push(async move {
+            let name = server.name().to_string();
+            let transport = server.transport_label().to_string();
+            let result = fetch_any_with_timeout(&server, &oauth).await;
+            (name, transport, result)
+        });
+    }
+
+    while let Some((name, transport, result)) = fetches.next().await {
+        match result {
+            Ok(tools) => {
+                println!("  {label}: {} ({})... {} tool(s)", name, transport, tools.len());
+                for tool in tools {
+                    let read_only_hint = tool.read_only_hint();
+                    entries.push(ToolEntry {
+                        server_name: name.clone(),
+                        tool_name: tool.name,
+                        description: tool.description.unwrap_or_default(),
+                        read_only_hint,
+                    });
+                }
+            }
+            Err(e) => {
+                println!("  {label}: {} ({})... FAILED ({e:#})", name, transport);
+                skipped.push((format!("{label}/{name}"), format!("{e:#}")));
+            }
+        }
+    }
+    entries.sort_by(|a, b| {
+        a.server_name
+            .cmp(&b.server_name)
+            .then_with(|| a.tool_name.cmp(&b.tool_name))
+    });
+    (entries, skipped)
 }
 
 async fn fetch_any_with_timeout(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> {

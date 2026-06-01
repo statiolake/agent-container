@@ -279,7 +279,6 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         &broker_url_from_container,
         task_runner_enabled,
         host_fs_enabled,
-        &merged_settings.codex.mcp,
     )
         .context("failed to write codex config.toml into container home")?;
 
@@ -443,7 +442,6 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         &broker_url_from_container,
         task_runner_enabled,
         host_fs_enabled,
-        &merged_settings.codex.mcp,
     )
         .context("failed to write codex config.toml into container home")?;
 
