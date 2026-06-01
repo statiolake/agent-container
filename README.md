@@ -118,9 +118,9 @@ directory does not exist on the host, an empty read-only directory is
 mounted there so an in-container agent cannot create workspace-local
 agent-container settings for itself.
 
-Claude Code runs inside tmux so agent teams can attach panes. tmux mouse
-support is enabled automatically. The tmux prefix defaults to `C-b`; set
-`[claude] tmux_prefix = "C-q"` in agent-container settings if you want a
+Claude Code and Codex run inside tmux so agent teams can attach panes. tmux
+mouse support is enabled automatically. The tmux prefix defaults to `C-b`;
+set `[claude] tmux_prefix = "C-q"` in agent-container settings if you want a
 different prefix.
 
 ### Configure the MCP tool allowlist
@@ -248,12 +248,12 @@ container's persistent `$HOME` (kept at
   top-level directories. The plugin marketplace/cache tree itself is not
   copied, so Claude Code does not try to refresh marketplaces from inside
   the container.
-- `~/.codex/config.toml` — only `model`, `model_reasoning_effort`,
-  `personality`, plus pinned `approval_policy = "never"` and
-  `sandbox_mode = "danger-full-access"` (the container is the sandbox;
-  Codex's own bubblewrap can't nest). Built-in agent-container MCP
-  servers such as `task-runner` and `host-fs` are injected here when
-  enabled so Codex can reach the same broker tools as Claude Code.
+- `~/.codex/config.toml` — only model/persona scalar settings are inherited,
+  while `[mcp_servers.*]` entries are rewritten to the agent-container broker.
+  The container pins `approval_policy = "never"` and
+  `sandbox_mode = "danger-full-access"` because the container is the sandbox.
+  Built-in MCP servers such as `task-runner` and `host-fs` are injected when
+  enabled so Codex reaches the same broker tools as Claude Code.
 - Codex history state — matching host sessions are selected by the
   session file's recorded cwd and imported into the container home. The
   container mounts that workspace-specific history view at Codex's normal

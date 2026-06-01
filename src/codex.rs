@@ -330,6 +330,9 @@ const MCP_SERVERS_KEY: &str = "mcp_servers";
 ///   from the host's `~/.codex/config.toml` so the container follows the
 ///   same behaviour. Host-absolute `[projects.*]` trust entries and any
 ///   sandbox-related toggles are dropped.
+/// - Rewrite host-declared `[mcp_servers.*]` entries to the in-container
+///   broker URL so Codex gets the same proxying and policy controls as
+///   Claude Code.
 /// - Pin `approval_policy = "never"` and `sandbox_mode = "danger-full-access"`
 ///   because the docker container itself is the sandbox; Codex's bubblewrap
 ///   cannot recreate user namespaces inside docker and would otherwise
@@ -338,6 +341,7 @@ pub fn write_container_config(
     host_home: &Path,
     container_home: &Path,
     broker_url_from_container: &str,
+    mcp_servers: &[crate::mcp::McpServer],
     task_runner_enabled: bool,
     host_fs_enabled: bool,
 ) -> Result<()> {
@@ -355,9 +359,6 @@ pub fn write_container_config(
                     table.insert((*key).to_string(), v);
                 }
             }
-            if let Some(v) = host_table.get(MCP_SERVERS_KEY).cloned() {
-                table.insert(MCP_SERVERS_KEY.to_string(), v);
-            }
         }
     }
 
@@ -374,6 +375,7 @@ pub fn write_container_config(
     inject_builtin_mcp_servers(
         &mut table,
         broker_url_from_container,
+        mcp_servers,
         task_runner_enabled,
         host_fs_enabled,
     );
@@ -394,19 +396,20 @@ pub fn write_container_config(
 fn inject_builtin_mcp_servers(
     table: &mut toml::value::Table,
     broker_url: &str,
+    mcp_servers: &[crate::mcp::McpServer],
     task_runner_enabled: bool,
     host_fs_enabled: bool,
 ) {
-    if !task_runner_enabled && !host_fs_enabled {
+    if mcp_servers.is_empty() && !task_runner_enabled && !host_fs_enabled {
         return;
     }
-    let mut servers = table
-        .remove(MCP_SERVERS_KEY)
-        .and_then(|value| match value {
-            toml::Value::Table(table) => Some(table),
-            _ => None,
-        })
-        .unwrap_or_default();
+    let mut servers = toml::value::Table::new();
+    for server in mcp_servers {
+        servers.insert(
+            server.name().to_string(),
+            codex_http_mcp_entry(broker_url, server.name()),
+        );
+    }
     if task_runner_enabled && !servers.contains_key(crate::task_runner::NAME) {
         servers.insert(
             crate::task_runner::NAME.to_string(),
@@ -465,6 +468,7 @@ trust_level = "trusted"
             host_home.path(),
             container_home.path(),
             "http://broker",
+            &[],
             false,
             false,
         )
@@ -488,6 +492,7 @@ trust_level = "trusted"
             host_home.path(),
             container_home.path(),
             "http://broker",
+            &[],
             false,
             false,
         )
@@ -508,6 +513,7 @@ trust_level = "trusted"
             host_home.path(),
             container_home.path(),
             "http://host.docker.internal:7000/",
+            &[],
             true,
             true,
         )
@@ -526,7 +532,7 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn preserves_host_codex_mcp_servers_and_does_not_override_builtin_names() {
+    fn rewrites_host_codex_mcp_servers_to_broker_routes() {
         let host_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
         fs::create_dir_all(host_home.path().join(".codex")).unwrap();
@@ -541,10 +547,13 @@ url = "http://example.invalid/custom-host-fs"
 "#,
         )
         .unwrap();
+        let mcp_servers =
+            crate::mcp::load_codex_servers(&host_home.path().join(".codex/config.toml")).unwrap();
         write_container_config(
             host_home.path(),
             container_home.path(),
             "http://host.docker.internal:7000",
+            &mcp_servers,
             true,
             true,
         )
@@ -555,11 +564,11 @@ url = "http://example.invalid/custom-host-fs"
         assert!(servers.contains_key(crate::task_runner::NAME));
         assert_eq!(
             servers["local"]["url"].as_str(),
-            Some("http://127.0.0.1:3333/mcp")
+            Some("http://host.docker.internal:7000/mcp/local")
         );
         assert_eq!(
             servers[crate::host_fs::NAME]["url"].as_str(),
-            Some("http://example.invalid/custom-host-fs")
+            Some("http://host.docker.internal:7000/mcp/host-fs")
         );
     }
 

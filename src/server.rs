@@ -76,6 +76,13 @@ pub struct RunningServer {
 pub struct McpReloadConfig {
     pub workspace: PathBuf,
     pub task_runner_enabled: bool,
+    pub policy_scope: McpPolicyScope,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum McpPolicyScope {
+    ClaudeCode,
+    Codex,
 }
 
 pub async fn spawn(
@@ -217,7 +224,10 @@ async fn reload_mcp_settings(state: &BrokerState, config: &McpReloadConfig) -> R
         .context("failed to reload merged settings")?;
     {
         let mut policy = state.policy.write().await;
-        *policy = merged.claude_code.mcp;
+        *policy = match config.policy_scope {
+            McpPolicyScope::ClaudeCode => merged.claude_code.mcp,
+            McpPolicyScope::Codex => merged.codex.mcp,
+        };
     }
 
     if config.task_runner_enabled {

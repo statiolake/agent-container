@@ -181,15 +181,20 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         &host.home.join(".claude.json"),
     )
     .context("failed to read awsAuthRefresh from ~/.claude/settings.json or ~/.claude.json")?;
-    let mcp_servers = mcp::load_servers(&host.home.join(".claude.json"))
+    let claude_mcp_servers = mcp::load_servers(&host.home.join(".claude.json"))
         .context("failed to load MCP servers from ~/.claude.json")?;
+    let codex_mcp_servers = mcp::load_codex_servers(&host.home.join(".codex/config.toml"))
+        .context("failed to load MCP servers from ~/.codex/config.toml")?;
     let merged_settings = settings::Settings::load_merged(&host.workspace)
         .context("failed to load agent-container settings (global + workspace)")?;
-    let policy = merged_settings.claude_code.mcp.clone();
+    let claude_policy = merged_settings.claude_code.mcp.clone();
+    let codex_policy = merged_settings.codex.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
     let task_runner_tasks = load_task_runner_tasks(&host)?;
-    let task_runner = build_task_runner(&task_runner_tasks, &mcp_servers);
-    let host_fs = build_host_fs(&host.workspace, &mcp_servers);
+    let claude_task_runner = build_task_runner(&task_runner_tasks, &claude_mcp_servers);
+    let codex_task_runner = build_task_runner(&task_runner_tasks, &codex_mcp_servers);
+    let claude_host_fs = build_host_fs(&host.workspace, &claude_mcp_servers);
+    let codex_host_fs = build_host_fs(&host.workspace, &codex_mcp_servers);
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
     ));
@@ -200,18 +205,29 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
             setup.profile
         );
     }
-    if !mcp_servers.is_empty() {
-        let labels: Vec<_> = mcp_servers
+    if !claude_mcp_servers.is_empty() {
+        let labels: Vec<_> = claude_mcp_servers
             .iter()
             .map(|s| format!("{}({})", s.name(), s.transport_label()))
             .collect();
         eprintln!(
             "[agent-container] proxying {} MCP server(s) through broker: {}",
-            mcp_servers.len(),
+            claude_mcp_servers.len(),
             labels.join(", ")
         );
     }
-    if let Some(runner) = &task_runner {
+    if !codex_mcp_servers.is_empty() {
+        let labels: Vec<_> = codex_mcp_servers
+            .iter()
+            .map(|s| format!("{}({})", s.name(), s.transport_label()))
+            .collect();
+        eprintln!(
+            "[agent-container] proxying {} Codex MCP server(s) through broker: {}",
+            codex_mcp_servers.len(),
+            labels.join(", ")
+        );
+    }
+    if let Some(runner) = &claude_task_runner {
         eprintln!(
             "[agent-container] task-runner MCP exposing {} task(s): {}",
             runner.tasks.len(),
@@ -235,29 +251,56 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         container_root: host.container_workspace().display().to_string(),
         host_root: host.workspace.display().to_string(),
     };
-    let task_runner_enabled = task_runner.is_some();
-    let host_fs_enabled = host_fs.is_some();
-    let broker = server::spawn(
+    let claude_task_runner_enabled = claude_task_runner.is_some();
+    let claude_host_fs_enabled = claude_host_fs.is_some();
+    let codex_task_runner_enabled = codex_task_runner.is_some();
+    let codex_host_fs_enabled = codex_host_fs.is_some();
+    let claude_broker = server::spawn(
         bedrock.clone().map(|b| (b, refresh.clone())),
-        mcp_servers.clone(),
-        task_runner,
-        host_fs,
-        policy,
+        claude_mcp_servers.clone(),
+        claude_task_runner,
+        claude_host_fs,
+        claude_policy,
         oauth_store.clone(),
         Some(stdio_bridge),
         Some(server::McpReloadConfig {
             workspace: host.workspace.clone(),
-            task_runner_enabled,
+            task_runner_enabled: claude_task_runner_enabled,
+            policy_scope: server::McpPolicyScope::ClaudeCode,
         }),
     )
     .await?;
-    tracing::info!(addr = %broker.addr, "host broker listening");
+    tracing::info!(addr = %claude_broker.addr, "Claude Code broker listening");
+    let codex_broker = server::spawn(
+        None,
+        codex_mcp_servers.clone(),
+        codex_task_runner,
+        codex_host_fs,
+        codex_policy,
+        oauth_store.clone(),
+        Some(stdio_mcp::PathBridge {
+            container_root: host.container_workspace().display().to_string(),
+            host_root: host.workspace.display().to_string(),
+        }),
+        Some(server::McpReloadConfig {
+            workspace: host.workspace.clone(),
+            task_runner_enabled: codex_task_runner_enabled,
+            policy_scope: server::McpPolicyScope::Codex,
+        }),
+    )
+    .await?;
+    tracing::info!(addr = %codex_broker.addr, "Codex broker listening");
     let host_kind = host_kind::HostKind::detect()
         .context("failed to detect Docker engine flavour for broker hostname")?;
     let broker_url_from_container = format!(
         "http://{}:{}",
         host_kind.broker_host_name(),
-        broker.addr.port()
+        claude_broker.addr.port()
+    );
+    let codex_broker_url_from_container = format!(
+        "http://{}:{}",
+        host_kind.broker_host_name(),
+        codex_broker.addr.port()
     );
     tracing::info!(?host_kind, broker_url = %broker_url_from_container, "broker URL for container");
 
@@ -266,9 +309,9 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         sync::SyncOptions {
             bedrock: bedrock.as_ref(),
             broker_url_from_container: &broker_url_from_container,
-            mcp_servers: &mcp_servers,
-            task_runner_enabled,
-            host_fs_enabled,
+            mcp_servers: &claude_mcp_servers,
+            task_runner_enabled: claude_task_runner_enabled,
+            host_fs_enabled: claude_host_fs_enabled,
         },
     )
     .context("failed to sync host Claude Code state into container")?;
@@ -276,11 +319,12 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
     codex::write_container_config(
         &host.home,
         &host.container_home,
-        &broker_url_from_container,
-        task_runner_enabled,
-        host_fs_enabled,
+        &codex_broker_url_from_container,
+        &codex_mcp_servers,
+        codex_task_runner_enabled,
+        codex_host_fs_enabled,
     )
-        .context("failed to write codex config.toml into container home")?;
+    .context("failed to write codex config.toml into container home")?;
 
     let credentials_path = claude_creds
         .as_ref()
@@ -296,7 +340,7 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
 
     let agent_command = match agent {
         AgentKind::Claude => claude_agent_command(merged_settings.claude.tmux_prefix())?,
-        AgentKind::Codex => vec!["codex".to_string()],
+        AgentKind::Codex => codex_agent_command(merged_settings.claude.tmux_prefix())?,
     };
 
     let exit = docker::run(docker::RunOptions {
@@ -313,7 +357,8 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
     })
     .await?;
 
-    broker.handle.abort();
+    claude_broker.handle.abort();
+    codex_broker.handle.abort();
     drop(claude_creds);
     drop(codex_auth);
     std::process::exit(exit);
@@ -334,6 +379,24 @@ fn claude_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
         ]
         .join(" "),
         "agent-container-claude".to_string(),
+    ])
+}
+
+fn codex_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
+    validate_tmux_key(tmux_prefix)?;
+    Ok(vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        [
+            "exec tmux",
+            "start-server \\;",
+            "set-option -g mouse on \\;",
+            &format!("set-option -g prefix {tmux_prefix} \\;"),
+            &format!("bind-key {tmux_prefix} send-prefix \\;"),
+            "new-session -A -s codex -- codex \"$@\"",
+        ]
+        .join(" "),
+        "agent-container-codex".to_string(),
     ])
 }
 
@@ -366,13 +429,18 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     )
     .ok()
     .flatten();
-    let mcp_servers = mcp::load_servers(&host.home.join(".claude.json")).unwrap_or_default();
+    let claude_mcp_servers = mcp::load_servers(&host.home.join(".claude.json")).unwrap_or_default();
+    let codex_mcp_servers =
+        mcp::load_codex_servers(&host.home.join(".codex/config.toml")).unwrap_or_default();
     let merged_settings = settings::Settings::load_merged(&host.workspace).unwrap_or_default();
-    let policy = merged_settings.claude_code.mcp.clone();
+    let claude_policy = merged_settings.claude_code.mcp.clone();
+    let codex_policy = merged_settings.codex.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
     let task_runner_tasks = load_task_runner_tasks(&host).unwrap_or_default();
-    let task_runner = build_task_runner(&task_runner_tasks, &mcp_servers);
-    let host_fs = build_host_fs(&host.workspace, &mcp_servers);
+    let claude_task_runner = build_task_runner(&task_runner_tasks, &claude_mcp_servers);
+    let codex_task_runner = build_task_runner(&task_runner_tasks, &codex_mcp_servers);
+    let claude_host_fs = build_host_fs(&host.workspace, &claude_mcp_servers);
+    let codex_host_fs = build_host_fs(&host.workspace, &codex_mcp_servers);
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().unwrap_or_default(),
     ));
@@ -400,19 +468,40 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         container_root: host.container_workspace().display().to_string(),
         host_root: host.workspace.display().to_string(),
     };
-    let task_runner_enabled = task_runner.is_some();
-    let host_fs_enabled = host_fs.is_some();
-    let broker = server::spawn(
+    let claude_task_runner_enabled = claude_task_runner.is_some();
+    let claude_host_fs_enabled = claude_host_fs.is_some();
+    let codex_task_runner_enabled = codex_task_runner.is_some();
+    let codex_host_fs_enabled = codex_host_fs.is_some();
+    let claude_broker = server::spawn(
         bedrock.clone().map(|b| (b, refresh.clone())),
-        mcp_servers.clone(),
-        task_runner,
-        host_fs,
-        policy,
-        oauth_store,
+        claude_mcp_servers.clone(),
+        claude_task_runner,
+        claude_host_fs,
+        claude_policy,
+        oauth_store.clone(),
         Some(stdio_bridge),
         Some(server::McpReloadConfig {
             workspace: host.workspace.clone(),
-            task_runner_enabled,
+            task_runner_enabled: claude_task_runner_enabled,
+            policy_scope: server::McpPolicyScope::ClaudeCode,
+        }),
+    )
+    .await?;
+    let codex_broker = server::spawn(
+        None,
+        codex_mcp_servers.clone(),
+        codex_task_runner,
+        codex_host_fs,
+        codex_policy,
+        oauth_store,
+        Some(stdio_mcp::PathBridge {
+            container_root: host.container_workspace().display().to_string(),
+            host_root: host.workspace.display().to_string(),
+        }),
+        Some(server::McpReloadConfig {
+            workspace: host.workspace.clone(),
+            task_runner_enabled: codex_task_runner_enabled,
+            policy_scope: server::McpPolicyScope::Codex,
         }),
     )
     .await?;
@@ -421,7 +510,12 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     let broker_url_from_container = format!(
         "http://{}:{}",
         host_kind.broker_host_name(),
-        broker.addr.port()
+        claude_broker.addr.port()
+    );
+    let codex_broker_url_from_container = format!(
+        "http://{}:{}",
+        host_kind.broker_host_name(),
+        codex_broker.addr.port()
     );
 
     sync::sync_host_state(
@@ -429,9 +523,9 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         sync::SyncOptions {
             bedrock: bedrock.as_ref(),
             broker_url_from_container: &broker_url_from_container,
-            mcp_servers: &mcp_servers,
-            task_runner_enabled,
-            host_fs_enabled,
+            mcp_servers: &claude_mcp_servers,
+            task_runner_enabled: claude_task_runner_enabled,
+            host_fs_enabled: claude_host_fs_enabled,
         },
     )
     .context("failed to sync host Claude Code state into container")?;
@@ -439,11 +533,12 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     codex::write_container_config(
         &host.home,
         &host.container_home,
-        &broker_url_from_container,
-        task_runner_enabled,
-        host_fs_enabled,
+        &codex_broker_url_from_container,
+        &codex_mcp_servers,
+        codex_task_runner_enabled,
+        codex_host_fs_enabled,
     )
-        .context("failed to write codex config.toml into container home")?;
+    .context("failed to write codex config.toml into container home")?;
 
     let credentials_path = claude_creds
         .as_ref()
@@ -480,7 +575,8 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     })
     .await?;
 
-    broker.handle.abort();
+    claude_broker.handle.abort();
+    codex_broker.handle.abort();
     drop(claude_creds);
     drop(codex_auth);
     std::process::exit(exit);
@@ -671,6 +767,17 @@ mod tests {
         assert!(script.contains("set-option -g prefix C-q"));
         assert!(script.contains("bind-key C-q send-prefix"));
         assert!(script.contains("new-session -A -s claude-code"));
+    }
+
+    #[test]
+    fn codex_runs_in_tmux_with_mouse_and_configured_prefix() {
+        let command = codex_agent_command("C-q").unwrap();
+        let script = &command[2];
+
+        assert!(script.contains("set-option -g mouse on"));
+        assert!(script.contains("set-option -g prefix C-q"));
+        assert!(script.contains("bind-key C-q send-prefix"));
+        assert!(script.contains("new-session -A -s codex"));
     }
 
     #[test]

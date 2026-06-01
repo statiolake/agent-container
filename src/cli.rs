@@ -193,10 +193,10 @@ names such as `.env`, `.env.*`, private key files, `.npmrc`, `.pypirc`, and
 shadow-mounted at container startup. The host-fs MCP reloads the policy on
 every tool call, so saved settings take effect there without restarting.
 
-Claude Code runs inside tmux so agent teams can attach panes. tmux mouse
-support is enabled automatically. `claude.tmux_prefix` controls tmux's prefix
-key; omit it to keep tmux's default `C-b`, or set it to a tmux key name such
-as `C-q`."#;
+Claude Code and Codex run inside tmux so agent teams can attach panes. tmux
+mouse support is enabled automatically. `claude.tmux_prefix` controls tmux's
+prefix key for agent sessions; omit it to keep tmux's default `C-b`, or set it
+to a tmux key name such as `C-q`."#;
 
 const CONFIG_EXAMPLES: &str = r#"Examples:
   agent-container config
