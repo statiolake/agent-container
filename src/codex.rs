@@ -332,7 +332,13 @@ const INHERITED_SCALAR_KEYS: &[&str] = &[
 ///   because the docker container itself is the sandbox; Codex's bubblewrap
 ///   cannot recreate user namespaces inside docker and would otherwise
 ///   fail every nested shell exec.
-pub fn write_container_config(host_home: &Path, container_home: &Path) -> Result<()> {
+pub fn write_container_config(
+    host_home: &Path,
+    container_home: &Path,
+    broker_url_from_container: &str,
+    task_runner_enabled: bool,
+    host_fs_enabled: bool,
+) -> Result<()> {
     let mut table = toml::value::Table::new();
 
     let host_config = host_home.join(".codex/config.toml");
@@ -360,6 +366,12 @@ pub fn write_container_config(host_home: &Path, container_home: &Path) -> Result
         "sandbox_mode".to_string(),
         toml::Value::String("danger-full-access".into()),
     );
+    inject_builtin_mcp_servers(
+        &mut table,
+        broker_url_from_container,
+        task_runner_enabled,
+        host_fs_enabled,
+    );
 
     let dir = container_home.join(".codex");
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
@@ -372,6 +384,44 @@ pub fn write_container_config(host_home: &Path, container_home: &Path) -> Result
     fs::write(&path, format!("{header}{body}"))
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+fn inject_builtin_mcp_servers(
+    table: &mut toml::value::Table,
+    broker_url: &str,
+    task_runner_enabled: bool,
+    host_fs_enabled: bool,
+) {
+    if !task_runner_enabled && !host_fs_enabled {
+        return;
+    }
+    let mut servers = toml::value::Table::new();
+    if task_runner_enabled {
+        servers.insert(
+            crate::task_runner::NAME.to_string(),
+            codex_http_mcp_entry(broker_url, crate::task_runner::NAME),
+        );
+    }
+    if host_fs_enabled {
+        servers.insert(
+            crate::host_fs::NAME.to_string(),
+            codex_http_mcp_entry(broker_url, crate::host_fs::NAME),
+        );
+    }
+    table.insert("mcp_servers".to_string(), toml::Value::Table(servers));
+}
+
+fn codex_http_mcp_entry(broker_url: &str, name: &str) -> toml::Value {
+    let mut entry = toml::value::Table::new();
+    entry.insert(
+        "url".to_string(),
+        toml::Value::String(format!(
+            "{}/mcp/{}",
+            broker_url.trim_end_matches('/'),
+            name
+        )),
+    );
+    toml::Value::Table(entry)
 }
 
 #[cfg(test)]
@@ -398,7 +448,14 @@ trust_level = "trusted"
         )
         .unwrap();
 
-        write_container_config(host_home.path(), container_home.path()).unwrap();
+        write_container_config(
+            host_home.path(),
+            container_home.path(),
+            "http://broker",
+            false,
+            false,
+        )
+        .unwrap();
         let out = fs::read_to_string(container_home.path().join(".codex/config.toml")).unwrap();
         let parsed: toml::Value = toml::from_str(&out).unwrap();
         let t = parsed.as_table().unwrap();
@@ -414,13 +471,45 @@ trust_level = "trusted"
     fn works_without_host_config() {
         let host_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
-        write_container_config(host_home.path(), container_home.path()).unwrap();
+        write_container_config(
+            host_home.path(),
+            container_home.path(),
+            "http://broker",
+            false,
+            false,
+        )
+        .unwrap();
         let out = fs::read_to_string(container_home.path().join(".codex/config.toml")).unwrap();
         let parsed: toml::Value = toml::from_str(&out).unwrap();
         let t = parsed.as_table().unwrap();
         assert_eq!(t["approval_policy"].as_str(), Some("never"));
         assert_eq!(t["sandbox_mode"].as_str(), Some("danger-full-access"));
         assert!(t.get("model").is_none());
+    }
+
+    #[test]
+    fn injects_builtin_mcp_servers_for_codex() {
+        let host_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        write_container_config(
+            host_home.path(),
+            container_home.path(),
+            "http://host.docker.internal:7000/",
+            true,
+            true,
+        )
+        .unwrap();
+        let out = fs::read_to_string(container_home.path().join(".codex/config.toml")).unwrap();
+        let parsed: toml::Value = toml::from_str(&out).unwrap();
+        let servers = parsed["mcp_servers"].as_table().unwrap();
+        assert_eq!(
+            servers[crate::task_runner::NAME]["url"].as_str(),
+            Some("http://host.docker.internal:7000/mcp/task-runner")
+        );
+        assert_eq!(
+            servers[crate::host_fs::NAME]["url"].as_str(),
+            Some("http://host.docker.internal:7000/mcp/host-fs")
+        );
     }
 
     #[test]

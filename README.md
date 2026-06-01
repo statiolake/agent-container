@@ -248,7 +248,9 @@ container's persistent `$HOME` (kept at
 - `~/.codex/config.toml` — only `model`, `model_reasoning_effort`,
   `personality`, plus pinned `approval_policy = "never"` and
   `sandbox_mode = "danger-full-access"` (the container is the sandbox;
-  Codex's own bubblewrap can't nest).
+  Codex's own bubblewrap can't nest). Built-in agent-container MCP
+  servers such as `task-runner` and `host-fs` are injected here when
+  enabled so Codex can reach the same broker tools as Claude Code.
 - Codex history state — matching host sessions are selected by the
   session file's recorded cwd and imported into the container home. The
   container mounts that workspace-specific history view at Codex's normal

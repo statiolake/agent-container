@@ -273,7 +273,13 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
     )
     .context("failed to sync host Claude Code state into container")?;
 
-    codex::write_container_config(&host.home, &host.container_home)
+    codex::write_container_config(
+        &host.home,
+        &host.container_home,
+        &broker_url_from_container,
+        task_runner_enabled,
+        host_fs_enabled,
+    )
         .context("failed to write codex config.toml into container home")?;
 
     let credentials_path = claude_creds
@@ -430,7 +436,13 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     )
     .context("failed to sync host Claude Code state into container")?;
 
-    codex::write_container_config(&host.home, &host.container_home)
+    codex::write_container_config(
+        &host.home,
+        &host.container_home,
+        &broker_url_from_container,
+        task_runner_enabled,
+        host_fs_enabled,
+    )
         .context("failed to write codex config.toml into container home")?;
 
     let credentials_path = claude_creds
