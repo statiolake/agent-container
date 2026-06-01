@@ -181,7 +181,7 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         &host.home.join(".claude.json"),
     )
     .context("failed to read awsAuthRefresh from ~/.claude/settings.json or ~/.claude.json")?;
-    let mcp_servers = load_external_mcp_servers(&host.home.join(".claude.json"))
+    let mcp_servers = mcp::load_servers(&host.home.join(".claude.json"))
         .context("failed to load MCP servers from ~/.claude.json")?;
     let merged_settings = settings::Settings::load_merged(&host.workspace)
         .context("failed to load agent-container settings (global + workspace)")?;
@@ -366,8 +366,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     )
     .ok()
     .flatten();
-    let mcp_servers =
-        load_external_mcp_servers(&host.home.join(".claude.json")).unwrap_or_default();
+    let mcp_servers = mcp::load_servers(&host.home.join(".claude.json")).unwrap_or_default();
     let merged_settings = settings::Settings::load_merged(&host.workspace).unwrap_or_default();
     let policy = merged_settings.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
@@ -519,41 +518,39 @@ fn prepare_claude_credentials(
     }
 }
 
-fn load_external_mcp_servers(path: &std::path::Path) -> Result<Vec<mcp::McpServer>> {
-    let servers = mcp::load_servers(path)?;
-    Ok(servers
-        .into_iter()
-        .filter(|server| {
-            let reserved = is_builtin_mcp_name(server.name());
-            if reserved {
-                eprintln!(
-                    "[agent-container] note: ignoring ~/.claude.json MCP server named '{}' because agent-container provides that built-in server",
-                    server.name()
-                );
-            }
-            !reserved
-        })
-        .collect())
-}
-
-fn is_builtin_mcp_name(name: &str) -> bool {
-    matches!(name, task_runner::NAME | host_fs::NAME)
-}
-
-/// Build the task-runner backend. Empty task tables still register an
-/// empty MCP server so a running session can discover tasks added later
-/// via settings reload.
+/// Build the optional task-runner backend, skipping it if the user
+/// already has an MCP server by the same name declared in
+/// `~/.claude.json` (we'd clobber their setup otherwise). Empty task
+/// tables still register an empty MCP server so a running session can
+/// discover tasks added later via settings reload.
 fn build_task_runner(
     tasks: &std::collections::BTreeMap<String, task_runner::TaskSpec>,
-    _declared_servers: &[mcp::McpServer],
+    declared_servers: &[mcp::McpServer],
 ) -> Option<task_runner::TaskRunner> {
+    if declared_servers
+        .iter()
+        .any(|s| s.name() == task_runner::NAME)
+    {
+        eprintln!(
+            "[agent-container] note: skipping built-in task-runner because ~/.claude.json already declares an MCP server named '{}'",
+            task_runner::NAME
+        );
+        return None;
+    }
     Some(task_runner::TaskRunner::new(tasks.clone()))
 }
 
 fn build_host_fs(
     workspace: &std::path::Path,
-    _declared_servers: &[mcp::McpServer],
+    declared_servers: &[mcp::McpServer],
 ) -> Option<host_fs::HostFs> {
+    if declared_servers.iter().any(|s| s.name() == host_fs::NAME) {
+        eprintln!(
+            "[agent-container] note: skipping built-in host-fs because ~/.claude.json already declares an MCP server named '{}'",
+            host_fs::NAME
+        );
+        return None;
+    }
     Some(host_fs::HostFs::new(workspace.to_path_buf()))
 }
 
