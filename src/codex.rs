@@ -1,16 +1,21 @@
 //! Helpers for the Codex pathway: ship the host's ChatGPT-subscription
 //! auth token into the container through a short-lived 0600 temp file and
-//! mount only the host-side history paths Codex needs for resume/history
-//! views. The rest of `~/.codex` (trust_level lists, plugins, caches, …)
-//! stays outside the container. We also pin a minimal `config.toml` inside
-//! the container so Codex does not try to nest its own bubblewrap sandbox
-//! (which fails inside docker because user namespaces cannot be recreated).
+//! prepare a workspace-scoped Codex history view for resume/history. The
+//! rest of `~/.codex` (trust_level lists, unrelated sessions, plugins,
+//! caches, …) stays outside the container. We also pin a minimal
+//! `config.toml` inside the container so Codex does not try to nest its
+//! own bubblewrap sandbox (which fails inside docker because user
+//! namespaces cannot be recreated).
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde_json::Value;
 
+use crate::paths::encode_project_dir;
 use crate::shared_cred::{HostSync, SharedCredFile, shared_dir};
 
 pub struct CodexAuthFile {
@@ -53,18 +58,55 @@ pub fn prepare_auth(host_home: &Path) -> Result<CodexAuthFile> {
     })
 }
 
-/// Prepare the host-side Codex history paths that should be shared with
-/// the container. This deliberately does not mount the whole `~/.codex`
-/// tree: auth and generated container config are handled separately, and
-/// caches/plugins/tmp state should stay owned by whichever Codex runtime
-/// created it.
-pub fn prepare_history_mounts(host_home: &Path) -> Result<CodexHistoryMounts> {
-    let codex_root = host_home.join(".codex");
-    let sessions_dir = ensure_dir(&codex_root.join("sessions"))?;
-    let archived_sessions_dir = ensure_dir(&codex_root.join("archived_sessions"))?;
-    let shell_snapshots_dir = ensure_dir(&codex_root.join("shell_snapshots"))?;
-    let session_index_path = ensure_file(&codex_root.join("session_index.jsonl"))?;
-    let history_path = ensure_file(&codex_root.join("history.jsonl"))?;
+/// Prepare a Codex history tree for this workspace only.
+///
+/// Codex stores sessions globally under `~/.codex/sessions` and identifies
+/// their workspace inside each JSONL file. To avoid exposing every host
+/// session to the container, import only files whose recorded cwd matches
+/// the current workspace into the persistent container home, then mount
+/// that workspace-specific tree at `~/.codex` history paths.
+pub fn prepare_history_mounts(
+    host_home: &Path,
+    container_home: &Path,
+    workspace: &Path,
+) -> Result<CodexHistoryMounts> {
+    let host_codex_root = host_home.join(".codex");
+    let history_root = container_home
+        .join(".codex")
+        .join("workspace-history")
+        .join(encode_project_dir(workspace));
+
+    let sessions_dir = ensure_dir(&history_root.join("sessions"))?;
+    let archived_sessions_dir = ensure_dir(&history_root.join("archived_sessions"))?;
+    let shell_snapshots_dir = ensure_dir(&history_root.join("shell_snapshots"))?;
+    let session_index_path = ensure_file(&history_root.join("session_index.jsonl"))?;
+    let history_path = ensure_file(&history_root.join("history.jsonl"))?;
+
+    let workspace_keys = workspace_keys(workspace)?;
+    let imported = import_matching_sessions(
+        &host_codex_root.join("sessions"),
+        &sessions_dir,
+        &workspace_keys,
+    )?;
+    let imported_archived = import_matching_sessions(
+        &host_codex_root.join("archived_sessions"),
+        &archived_sessions_dir,
+        &workspace_keys,
+    )?;
+    let mut session_ids: HashSet<String> = imported.keys().cloned().collect();
+    session_ids.extend(imported_archived.keys().cloned());
+
+    copy_matching_shell_snapshots(
+        &host_codex_root.join("shell_snapshots"),
+        &shell_snapshots_dir,
+        &session_ids,
+    )?;
+    write_filtered_session_index(
+        &host_codex_root.join("session_index.jsonl"),
+        &session_index_path,
+        &session_ids,
+    )?;
+
     Ok(CodexHistoryMounts {
         sessions_dir,
         archived_sessions_dir,
@@ -72,6 +114,184 @@ pub fn prepare_history_mounts(host_home: &Path) -> Result<CodexHistoryMounts> {
         session_index_path,
         history_path,
     })
+}
+
+fn workspace_keys(workspace: &Path) -> Result<HashSet<String>> {
+    let mut keys = HashSet::new();
+    keys.insert(workspace.display().to_string());
+    if let Ok(canonical) = std::fs::canonicalize(workspace) {
+        keys.insert(canonical.display().to_string());
+    }
+    Ok(keys)
+}
+
+fn import_matching_sessions(
+    src_root: &Path,
+    dest_root: &Path,
+    workspace_keys: &HashSet<String>,
+) -> Result<HashMap<String, PathBuf>> {
+    let mut imported = HashMap::new();
+    if !src_root.is_dir() {
+        return Ok(imported);
+    }
+    for src in jsonl_files_under(src_root)? {
+        let Some(meta) = read_session_meta(&src)? else {
+            continue;
+        };
+        if !workspace_keys.contains(&meta.cwd) {
+            continue;
+        }
+        let relative = src
+            .strip_prefix(src_root)
+            .with_context(|| format!("{} is not under {}", src.display(), src_root.display()))?;
+        let dest = dest_root.join(relative);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::copy(&src, &dest)
+            .with_context(|| format!("failed to import Codex session {}", src.display()))?;
+        imported.insert(meta.id, dest);
+    }
+    Ok(imported)
+}
+
+fn jsonl_files_under(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_jsonl_files(root, &mut files)?;
+    Ok(files)
+}
+
+fn collect_jsonl_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("failed to list {}", path.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            collect_jsonl_files(&path, files)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SessionMeta {
+    id: String,
+    cwd: String,
+}
+
+fn read_session_meta(path: &Path) -> Result<Option<SessionMeta>> {
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(64) {
+        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let Some(id) = payload.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(cwd) = payload.get("cwd").and_then(Value::as_str) else {
+            continue;
+        };
+        return Ok(Some(SessionMeta {
+            id: id.to_string(),
+            cwd: cwd.to_string(),
+        }));
+    }
+    Ok(None)
+}
+
+fn copy_matching_shell_snapshots(
+    src_root: &Path,
+    dest_root: &Path,
+    session_ids: &HashSet<String>,
+) -> Result<()> {
+    if !src_root.is_dir() {
+        return Ok(());
+    }
+    for entry in
+        fs::read_dir(src_root).with_context(|| format!("failed to list {}", src_root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.metadata()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !session_ids.iter().any(|id| name.starts_with(id)) {
+            continue;
+        }
+        fs::copy(&path, dest_root.join(name.as_ref()))
+            .with_context(|| format!("failed to import Codex shell snapshot {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn write_filtered_session_index(
+    host_index_path: &Path,
+    dest_index_path: &Path,
+    session_ids: &HashSet<String>,
+) -> Result<()> {
+    let mut lines_by_id = HashMap::new();
+    collect_index_lines(dest_index_path, None, &mut lines_by_id)?;
+    collect_index_lines(host_index_path, Some(session_ids), &mut lines_by_id)?;
+
+    let mut lines: Vec<String> = lines_by_id.into_values().collect();
+    lines.sort_by(|a, b| {
+        let a_ts = index_updated_at(a).unwrap_or_default();
+        let b_ts = index_updated_at(b).unwrap_or_default();
+        a_ts.cmp(&b_ts)
+    });
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    fs::write(dest_index_path, out)
+        .with_context(|| format!("failed to write {}", dest_index_path.display()))
+}
+
+fn collect_index_lines(
+    path: &Path,
+    session_ids: Option<&HashSet<String>>,
+    out: &mut HashMap<String, String>,
+) -> Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    for line in BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if session_ids.map(|ids| ids.contains(id)).unwrap_or(true) {
+            out.insert(id.to_string(), line);
+        }
+    }
+    Ok(())
+}
+
+fn index_updated_at(line: &str) -> Option<String> {
+    serde_json::from_str::<Value>(line)
+        .ok()?
+        .get("updated_at")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn ensure_dir(path: &Path) -> Result<PathBuf> {
@@ -204,27 +424,95 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn prepares_history_mount_paths_without_mounting_whole_codex_home() {
+    fn prepares_workspace_scoped_history_mount_paths() {
         let host_home = tempfile::tempdir().unwrap();
-        let mounts = prepare_history_mounts(host_home.path()).unwrap();
-        let codex_root = std::fs::canonicalize(host_home.path().join(".codex")).unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = host_home.path().join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        let mounts =
+            prepare_history_mounts(host_home.path(), container_home.path(), &workspace).unwrap();
+        let history_root = std::fs::canonicalize(
+            container_home
+                .path()
+                .join(".codex/workspace-history")
+                .join(encode_project_dir(&workspace)),
+        )
+        .unwrap();
 
-        assert_eq!(mounts.sessions_dir, codex_root.join("sessions"));
+        assert_eq!(mounts.sessions_dir, history_root.join("sessions"));
         assert_eq!(
             mounts.archived_sessions_dir,
-            codex_root.join("archived_sessions")
+            history_root.join("archived_sessions")
         );
         assert_eq!(
             mounts.shell_snapshots_dir,
-            codex_root.join("shell_snapshots")
+            history_root.join("shell_snapshots")
         );
         assert_eq!(
             mounts.session_index_path,
-            codex_root.join("session_index.jsonl")
+            history_root.join("session_index.jsonl")
         );
-        assert_eq!(mounts.history_path, codex_root.join("history.jsonl"));
+        assert_eq!(mounts.history_path, history_root.join("history.jsonl"));
         assert!(mounts.sessions_dir.is_dir());
         assert!(mounts.session_index_path.is_file());
         assert!(mounts.history_path.is_file());
+    }
+
+    #[test]
+    fn imports_only_sessions_for_current_workspace() {
+        let host_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = host_home.path().join("repo");
+        let other_workspace = host_home.path().join("other");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&other_workspace).unwrap();
+        let host_codex = host_home.path().join(".codex");
+        let host_sessions = host_codex.join("sessions/2026/06/01");
+        fs::create_dir_all(&host_sessions).unwrap();
+        write_session(
+            &host_sessions.join("rollout-good.jsonl"),
+            "good",
+            &workspace.display().to_string(),
+        );
+        write_session(
+            &host_sessions.join("rollout-other.jsonl"),
+            "other",
+            &other_workspace.display().to_string(),
+        );
+        fs::write(
+            host_codex.join("session_index.jsonl"),
+            "{\"id\":\"good\",\"thread_name\":\"good\",\"updated_at\":\"2026-06-01T00:00:00Z\"}\n\
+             {\"id\":\"other\",\"thread_name\":\"other\",\"updated_at\":\"2026-06-01T00:00:01Z\"}\n",
+        )
+        .unwrap();
+
+        let mounts =
+            prepare_history_mounts(host_home.path(), container_home.path(), &workspace).unwrap();
+
+        assert!(
+            mounts
+                .sessions_dir
+                .join("2026/06/01/rollout-good.jsonl")
+                .is_file()
+        );
+        assert!(
+            !mounts
+                .sessions_dir
+                .join("2026/06/01/rollout-other.jsonl")
+                .exists()
+        );
+        let index = fs::read_to_string(mounts.session_index_path).unwrap();
+        assert!(index.contains("\"id\":\"good\""));
+        assert!(!index.contains("\"id\":\"other\""));
+    }
+
+    fn write_session(path: &Path, id: &str, cwd: &str) {
+        fs::write(
+            path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}}}\n"
+            ),
+        )
+        .unwrap();
     }
 }

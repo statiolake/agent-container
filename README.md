@@ -108,10 +108,9 @@ primary, so a Claude session can call `codex exec …` as a shell tool
 and vice versa. In either mode the workspace is the current directory,
 mounted at the same absolute path inside the container, and
 `~/.claude/projects/<cwd-encoded>/` keeps the session history on the
-host. Codex history/resume files under `~/.codex/sessions`,
-`~/.codex/archived_sessions`, `~/.codex/session_index.jsonl`,
-`~/.codex/history.jsonl`, and `~/.codex/shell_snapshots` are also mounted
-from the host.
+host. Codex imports only sessions whose recorded cwd matches the current
+workspace into a container-side history tree, so resume/history does not
+expose unrelated host projects.
 
 The workspace mount is writable, but `<workspace>/.agent-container` is
 overlaid as read-only at the same path inside the container. If the
@@ -250,11 +249,10 @@ container's persistent `$HOME` (kept at
   `personality`, plus pinned `approval_policy = "never"` and
   `sandbox_mode = "danger-full-access"` (the container is the sandbox;
   Codex's own bubblewrap can't nest).
-- Codex history state — `~/.codex/sessions/`,
-  `~/.codex/archived_sessions/`, `~/.codex/shell_snapshots/`,
-  `~/.codex/session_index.jsonl`, and `~/.codex/history.jsonl` are
-  mounted from the host so in-container Codex can resume and browse the
-  same history.
+- Codex history state — matching host sessions are selected by the
+  session file's recorded cwd and imported into the container home. The
+  container mounts that workspace-specific history view at Codex's normal
+  history paths.
 
 Everything else your agents need is left to the container itself. The
 persistent home survives across runs, so onboarding prompts and login
