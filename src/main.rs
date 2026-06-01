@@ -340,9 +340,8 @@ async fn run_cmd(
         .as_ref()
         .map(|c| c.path.clone())
         .unwrap_or_else(|| PathBuf::from("/dev/null"));
-    let codex_history =
-        codex::prepare_history_mounts(&host.home, &host.container_home, &host.workspace)
-            .context("failed to prepare Codex history mounts")?;
+    let codex_history = codex::prepare_history_mounts(&host.home)
+        .context("failed to prepare Codex history mounts")?;
 
     let agent_command = match agent {
         AgentKind::Claude => claude_agent_command(merged_settings.claude.tmux_prefix())?,
@@ -561,9 +560,8 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         .as_ref()
         .map(|c| c.path.clone())
         .unwrap_or_else(|| PathBuf::from("/dev/null"));
-    let codex_history =
-        codex::prepare_history_mounts(&host.home, &host.container_home, &host.workspace)
-            .context("failed to prepare Codex history mounts")?;
+    let codex_history = codex::prepare_history_mounts(&host.home)
+        .context("failed to prepare Codex history mounts")?;
 
     let agent_command = if passthrough.is_empty() {
         vec!["bash".to_string(), "-l".to_string()]
