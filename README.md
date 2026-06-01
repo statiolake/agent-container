@@ -129,8 +129,8 @@ different prefix.
 agent-container config mcp
 ```
 
-A full-screen ratatui UI with one tab per MCP server and a checkbox per
-tool:
+A full-screen ratatui UI includes separate MCP tabs for Claude Code and
+Codex, with a checkbox per tool:
 
 ```
  agent-container  MCP tool allowlist
@@ -140,13 +140,14 @@ tool:
    [ ] notion-create-pages [W]  Create pages
    …
 ────────────────────────────────────────────────────────────────
- h/l switch MCP · j/k move · space toggle · a/A tab on/off
+ h/l switch tab · j/k move · space toggle · a/A server on/off
  s save · q quit
 ```
 
 Tools default to the upstream's `readOnlyHint` annotation (read-only on,
-destructive off). The allowlist lives at
-`$XDG_CONFIG/agent-container/mcp.toml` and can be edited by hand.
+destructive off). The allowlist lives in agent-container `settings.toml`:
+Claude Code uses `[claude_code.mcp]`, Codex uses `[codex.mcp]`, and legacy
+top-level `[mcp]` is still read as Claude Code policy then migrated on save.
 
 ### Drop into the container for troubleshooting
 

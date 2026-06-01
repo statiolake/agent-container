@@ -13,7 +13,10 @@
 //! [proxy]
 //! allow = ["^my-internal-host\\.example$"]
 //!
-//! [mcp.servers.github]
+//! [claude_code.mcp.servers.github]
+//! enabled = true
+//!
+//! [codex.mcp.servers.github]
 //! enabled = true
 //!
 //! [task_runner.tasks]
@@ -43,8 +46,12 @@ use crate::policy::McpPolicy;
 pub struct Settings {
     #[serde(default, skip_serializing_if = "ProxyPolicy::is_empty")]
     pub proxy: ProxyPolicy,
-    #[serde(default, skip_serializing_if = "McpPolicy::is_empty_policy")]
+    #[serde(default, rename = "mcp", skip_serializing)]
     pub mcp: McpPolicy,
+    #[serde(default, skip_serializing_if = "ClaudeCodePolicy::is_empty")]
+    pub claude_code: ClaudeCodePolicy,
+    #[serde(default, skip_serializing_if = "CodexPolicy::is_empty")]
+    pub codex: CodexPolicy,
     #[serde(default, skip_serializing_if = "TaskRunnerPolicy::is_empty")]
     pub task_runner: TaskRunnerPolicy,
     #[serde(default, skip_serializing_if = "FilesystemPolicy::is_empty")]
@@ -133,6 +140,33 @@ pub fn default_filesystem_readonly() -> Vec<String> {
         .collect()
 }
 
+/// Claude Code MCP policy. Legacy top-level `[mcp]` is still accepted on
+/// read, then saved back as `[claude_code.mcp]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeCodePolicy {
+    #[serde(default, skip_serializing_if = "McpPolicy::is_empty_policy")]
+    pub mcp: McpPolicy,
+}
+
+impl ClaudeCodePolicy {
+    pub fn is_empty(&self) -> bool {
+        self.mcp.is_empty_policy()
+    }
+}
+
+/// Codex runtime options controlled by agent-container.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexPolicy {
+    #[serde(default, skip_serializing_if = "McpPolicy::is_empty_policy")]
+    pub mcp: McpPolicy,
+}
+
+impl CodexPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.mcp.is_empty_policy()
+    }
+}
+
 /// Claude Code runtime options controlled by agent-container.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudePolicy {
@@ -155,7 +189,7 @@ impl ClaudePolicy {
 }
 
 impl McpPolicy {
-    /// Convenience for `skip_serializing_if` so an empty `[mcp]` section
+    /// Convenience for `skip_serializing_if` so an empty MCP section
     /// doesn't round-trip back as a stray header.
     pub fn is_empty_policy(&self) -> bool {
         self.servers.is_empty()
@@ -176,7 +210,10 @@ impl Settings {
         }
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("invalid TOML at {}", path.display()))
+        let mut settings: Self =
+            toml::from_str(&raw).with_context(|| format!("invalid TOML at {}", path.display()))?;
+        settings.migrate_legacy_mcp();
+        Ok(settings)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
@@ -203,6 +240,8 @@ impl Settings {
                 allow: crate::proxy_allowlist::default_allow_entries(),
             },
             mcp: McpPolicy::default(),
+            claude_code: ClaudeCodePolicy::default(),
+            codex: CodexPolicy::default(),
             task_runner: TaskRunnerPolicy::default(),
             filesystem: FilesystemPolicy {
                 mounts: Vec::new(),
@@ -263,23 +302,30 @@ impl Settings {
     ///
     /// - `proxy.allow`: overlay entries are appended to the base list,
     ///   preserving order and removing exact duplicates.
-    /// - `mcp.servers.<server>`: if overlay declares a server, the whole
-    ///   entry replaces the base entry (matching VS Code's "workspace
-    ///   setting wins at the key" semantics). Servers unmentioned by
-    ///   overlay keep their base definition.
+    /// - `claude_code.mcp.servers.<server>` and
+    ///   `codex.mcp.servers.<server>`: if overlay declares a server, the
+    ///   whole entry replaces the base entry (matching VS Code's
+    ///   "workspace setting wins at the key" semantics). Servers
+    ///   unmentioned by overlay keep their base definition.
     /// - `task_runner.tasks.<name>`: same as MCP — overlay's same-named
     ///   task replaces the base's, others pass through.
     /// - `filesystem.mounts`, `filesystem.hide`, `filesystem.readonly`:
     ///   overlay entries are appended to the base list, preserving order
     ///   and removing exact duplicates.
     pub fn merge_in_place(&mut self, overlay: Self) {
+        self.migrate_legacy_mcp();
+        let mut overlay = overlay;
+        overlay.migrate_legacy_mcp();
         for pat in overlay.proxy.allow {
             if !self.proxy.allow.contains(&pat) {
                 self.proxy.allow.push(pat);
             }
         }
-        for (name, sp) in overlay.mcp.servers {
-            self.mcp.servers.insert(name, sp);
+        for (name, sp) in overlay.claude_code.mcp.servers {
+            self.claude_code.mcp.servers.insert(name, sp);
+        }
+        for (name, sp) in overlay.codex.mcp.servers {
+            self.codex.mcp.servers.insert(name, sp);
         }
         for (name, cmd) in overlay.task_runner.tasks {
             self.task_runner.tasks.insert(name, cmd);
@@ -290,6 +336,13 @@ impl Settings {
         if overlay.claude.tmux_prefix.is_some() {
             self.claude.tmux_prefix = overlay.claude.tmux_prefix;
         }
+    }
+
+    fn migrate_legacy_mcp(&mut self) {
+        if self.claude_code.mcp.is_empty_policy() && !self.mcp.is_empty_policy() {
+            self.claude_code.mcp = self.mcp.clone();
+        }
+        self.mcp = McpPolicy::default();
     }
 }
 
@@ -367,7 +420,27 @@ mod tests {
             s.proxy.allow.is_empty(),
             "existing file should not be padded with bundled defaults"
         );
-        assert!(s.mcp.servers.contains_key("gh"));
+        assert!(s.claude_code.mcp.servers.contains_key("gh"));
+    }
+
+    #[test]
+    fn legacy_mcp_reads_as_claude_code_and_saves_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "[mcp.servers.gh.tools]\nlist = true\n").unwrap();
+
+        let settings = Settings::load_from(&path).unwrap();
+        assert!(
+            settings
+                .claude_code
+                .mcp
+                .tool_allowed("gh", "list", Some(false))
+        );
+
+        settings.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[claude_code.mcp.servers.gh.tools]"));
+        assert!(!raw.contains("[mcp."));
     }
 
     #[test]
@@ -377,8 +450,8 @@ mod tests {
 
         let mut written = Settings::default();
         written.proxy.allow.push("^example\\.com$".into());
-        written.mcp.set_server_enabled("gh", true);
-        written.mcp.set_tool("gh", "list", true);
+        written.claude_code.mcp.set_server_enabled("gh", true);
+        written.claude_code.mcp.set_tool("gh", "list", true);
         written.save_to(&path).unwrap();
 
         let read = Settings::load_from(&path).unwrap();
@@ -387,7 +460,7 @@ mod tests {
 
     #[test]
     fn empty_sections_are_not_emitted() {
-        // Sparse configs stay sparse — no empty `[mcp]` or `[task_runner]`
+        // Sparse configs stay sparse — no empty MCP or `[task_runner]`
         // header on disk when the corresponding policy is empty.
         let settings = Settings {
             proxy: ProxyPolicy {
@@ -397,7 +470,7 @@ mod tests {
         };
         let raw = toml::to_string_pretty(&settings).unwrap();
         assert!(raw.contains("[proxy]"));
-        assert!(!raw.contains("[mcp"));
+        assert!(!raw.contains("mcp"));
         assert!(!raw.contains("[task_runner"));
     }
 
@@ -508,14 +581,14 @@ mod tests {
     #[test]
     fn merge_workspace_server_entry_replaces_global() {
         let mut base = Settings::default();
-        base.mcp.set_server_enabled("github", true);
-        base.mcp.set_tool("github", "list_issues", true);
+        base.claude_code.mcp.set_server_enabled("github", true);
+        base.claude_code.mcp.set_tool("github", "list_issues", true);
 
         let mut overlay = Settings::default();
-        overlay.mcp.set_server_enabled("github", false);
+        overlay.claude_code.mcp.set_server_enabled("github", false);
 
         base.merge_in_place(overlay);
-        let sp = base.mcp.servers.get("github").unwrap();
+        let sp = base.claude_code.mcp.servers.get("github").unwrap();
         assert!(!sp.enabled);
         // Workspace replaced the whole entry — no inherited tool overrides.
         assert!(sp.tools.is_empty());
@@ -524,14 +597,14 @@ mod tests {
     #[test]
     fn merge_keeps_global_servers_untouched_by_overlay() {
         let mut base = Settings::default();
-        base.mcp.set_server_enabled("a", true);
-        base.mcp.set_server_enabled("b", true);
+        base.claude_code.mcp.set_server_enabled("a", true);
+        base.claude_code.mcp.set_server_enabled("b", true);
 
         let mut overlay = Settings::default();
-        overlay.mcp.set_server_enabled("b", false);
+        overlay.claude_code.mcp.set_server_enabled("b", false);
 
         base.merge_in_place(overlay);
-        assert!(base.mcp.servers.get("a").unwrap().enabled);
-        assert!(!base.mcp.servers.get("b").unwrap().enabled);
+        assert!(base.claude_code.mcp.servers.get("a").unwrap().enabled);
+        assert!(!base.claude_code.mcp.servers.get("b").unwrap().enabled);
     }
 }

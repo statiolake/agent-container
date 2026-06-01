@@ -217,7 +217,7 @@ async fn reload_mcp_settings(state: &BrokerState, config: &McpReloadConfig) -> R
         .context("failed to reload merged settings")?;
     {
         let mut policy = state.policy.write().await;
-        *policy = merged.mcp;
+        *policy = merged.claude_code.mcp;
     }
 
     if config.task_runner_enabled {

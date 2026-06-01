@@ -185,7 +185,7 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         .context("failed to load MCP servers from ~/.claude.json")?;
     let merged_settings = settings::Settings::load_merged(&host.workspace)
         .context("failed to load agent-container settings (global + workspace)")?;
-    let policy = merged_settings.mcp.clone();
+    let policy = merged_settings.claude_code.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
     let task_runner_tasks = load_task_runner_tasks(&host)?;
     let task_runner = build_task_runner(&task_runner_tasks, &mcp_servers);
@@ -279,6 +279,7 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         &broker_url_from_container,
         task_runner_enabled,
         host_fs_enabled,
+        &merged_settings.codex.mcp,
     )
         .context("failed to write codex config.toml into container home")?;
 
@@ -368,7 +369,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     .flatten();
     let mcp_servers = mcp::load_servers(&host.home.join(".claude.json")).unwrap_or_default();
     let merged_settings = settings::Settings::load_merged(&host.workspace).unwrap_or_default();
-    let policy = merged_settings.mcp.clone();
+    let policy = merged_settings.claude_code.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
     let task_runner_tasks = load_task_runner_tasks(&host).unwrap_or_default();
     let task_runner = build_task_runner(&task_runner_tasks, &mcp_servers);
@@ -442,6 +443,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         &broker_url_from_container,
         task_runner_enabled,
         host_fs_enabled,
+        &merged_settings.codex.mcp,
     )
         .context("failed to write codex config.toml into container home")?;
 

@@ -133,9 +133,12 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
         proxy_allow_workspace: workspace_settings.proxy.allow.clone(),
         filesystem_global: global_settings.filesystem.clone(),
         filesystem_workspace: workspace_settings.filesystem.clone(),
-        tool_catalog: entries,
-        mcp_global: global_settings.mcp.clone(),
-        mcp_workspace: workspace_settings.mcp.clone(),
+        claude_tool_catalog: entries,
+        codex_tool_catalog: builtin_codex_tool_catalog(),
+        mcp_global: global_settings.claude_code.mcp.clone(),
+        mcp_workspace: workspace_settings.claude_code.mcp.clone(),
+        codex_mcp_global: global_settings.codex.mcp.clone(),
+        codex_mcp_workspace: workspace_settings.codex.mcp.clone(),
         tasks_global: global_settings.task_runner.tasks.clone(),
         tasks_workspace: workspace_settings.task_runner.tasks.clone(),
     };
@@ -149,7 +152,7 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
             // policy default.
             let (base_mcp, base_tasks) = match saved_scope {
                 Scope::Workspace => (
-                    global_settings.mcp.clone(),
+                    global_settings.claude_code.mcp.clone(),
                     global_settings.task_runner.tasks.clone(),
                 ),
                 Scope::Global => (McpPolicy::default(), BTreeMap::new()),
@@ -166,11 +169,24 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
                 Scope::Global => out.filesystem_global,
                 Scope::Workspace => out.filesystem_workspace,
             };
-            target.mcp = match saved_scope {
+            target.claude_code.mcp = match saved_scope {
                 Scope::Global => out.mcp_global,
                 Scope::Workspace => out.mcp_workspace,
             };
-            minimise_policy_against_base(&mut target.mcp, &base_mcp, &catalog);
+            minimise_policy_against_base(&mut target.claude_code.mcp, &base_mcp, &catalog);
+            let (base_codex_mcp, codex_catalog) = match saved_scope {
+                Scope::Workspace => (global_settings.codex.mcp.clone(), builtin_codex_tool_catalog()),
+                Scope::Global => (McpPolicy::default(), builtin_codex_tool_catalog()),
+            };
+            target.codex.mcp = match saved_scope {
+                Scope::Global => out.codex_mcp_global,
+                Scope::Workspace => out.codex_mcp_workspace,
+            };
+            minimise_policy_against_base(
+                &mut target.codex.mcp,
+                &base_codex_mcp,
+                &codex_catalog,
+            );
             let edited_tasks = match saved_scope {
                 Scope::Global => out.tasks_global,
                 Scope::Workspace => out.tasks_workspace,
@@ -284,8 +300,37 @@ fn template_for(scope: Scope) -> String {
         }
     };
     format!(
-        "{header}\n# Uncomment examples below.\n# [proxy]\n# allow = [\"^my-internal\\\\.example$\"]\n\n# [filesystem]\n# mounts = [\"/Users/me/project-notes\"]\n# hide = [\"(^|/)\\\\.env(\\\\..*)?$\"]\n# readonly = [\"(^|/)\\\\.claude(/|$)\"]\n\n# [mcp.servers.github]\n# enabled = true\n# [mcp.servers.github.tools]\n# list_issues = true\n# create_issue = false\n\n# [claude]\n# tmux_prefix = \"C-b\"\n"
+        "{header}\n# Uncomment examples below.\n# [proxy]\n# allow = [\"^my-internal\\\\.example$\"]\n\n# [filesystem]\n# mounts = [\"/Users/me/project-notes\"]\n# hide = [\"(^|/)\\\\.env(\\\\..*)?$\"]\n# readonly = [\"(^|/)\\\\.claude(/|$)\"]\n\n# Claude Code MCP policy:\n# [claude_code.mcp.servers.github]\n# enabled = true\n# [claude_code.mcp.servers.github.tools]\n# list_issues = true\n# create_issue = false\n\n# Codex MCP policy:\n# [codex.mcp.servers.host-fs.tools]\n# HostRead = true\n# HostWrite = false\n\n# [claude]\n# tmux_prefix = \"C-b\"\n"
     )
+}
+
+fn builtin_codex_tool_catalog() -> Vec<ToolEntry> {
+    vec![
+        ToolEntry {
+            server_name: crate::host_fs::NAME.to_string(),
+            tool_name: "HostRead".to_string(),
+            description: "Read a UTF-8 text file from an allowed host filesystem root.".to_string(),
+            read_only_hint: Some(true),
+        },
+        ToolEntry {
+            server_name: crate::host_fs::NAME.to_string(),
+            tool_name: "HostList".to_string(),
+            description: "List an allowed host directory.".to_string(),
+            read_only_hint: Some(true),
+        },
+        ToolEntry {
+            server_name: crate::host_fs::NAME.to_string(),
+            tool_name: "HostWrite".to_string(),
+            description: "Write UTF-8 text to an allowed, non-readonly host file.".to_string(),
+            read_only_hint: Some(false),
+        },
+        ToolEntry {
+            server_name: crate::host_fs::NAME.to_string(),
+            tool_name: "HostSearch".to_string(),
+            description: "Search UTF-8 text files under an allowed host directory.".to_string(),
+            read_only_hint: Some(true),
+        },
+    ]
 }
 
 async fn fetch_any(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> {

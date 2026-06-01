@@ -1,4 +1,5 @@
-//! Per-tool MCP allowlist. Serialised as the `[mcp]` section of
+//! Per-tool MCP allowlist. Serialised as the `[claude_code.mcp]` or
+//! `[codex.mcp]` section of
 //! `settings.toml` (see [`crate::settings`]) and read by both the broker
 //! (which enforces it at proxy time) and the `config` TUI (which toggles
 //! individual entries).
@@ -6,19 +7,19 @@
 //! Shape:
 //!
 //! ```toml
-//! [mcp.servers.github]
+//! [claude_code.mcp.servers.github]
 //! enabled = true
-//! [mcp.servers.github.tools]
+//! [claude_code.mcp.servers.github.tools]
 //! list_issues = true
 //! create_issue = false
 //!
-//! [mcp.servers.fs]
+//! [claude_code.mcp.servers.fs]
 //! enabled = false   # hides the whole server
 //! ```
 //!
-//! Tools that are not listed under `[mcp.servers.<name>.tools]` fall back
-//! to the upstream's `annotations.readOnlyHint`: tools declared read-only
-//! are allowed, everything else is denied.
+//! Tools that are not listed under an agent's `mcp.servers.<name>.tools`
+//! fall back to the upstream's `annotations.readOnlyHint`: tools declared
+//! read-only are allowed, everything else is denied.
 
 use std::collections::BTreeMap;
 
