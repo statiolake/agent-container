@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -25,6 +26,8 @@ use crate::paths::HostPaths;
 use crate::policy::McpPolicy;
 use crate::settings::{self, Scope, Settings};
 use crate::tui::{self, Outcome, ToolEntry, TuiInput};
+
+const MCP_TOOL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn stdio_is_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
@@ -87,7 +90,7 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
             fetches.push(async move {
                 let name = server.name().to_string();
                 let transport = server.transport_label().to_string();
-                let result = fetch_any(&server, &oauth).await;
+                let result = fetch_any_with_timeout(&server, &oauth).await;
                 (name, transport, result)
             });
         }
@@ -292,6 +295,16 @@ async fn fetch_any(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> 
             fetch_tools(h, bearer.as_deref()).await
         }
         McpServer::Stdio(s) => fetch_tools_stdio(s).await,
+    }
+}
+
+async fn fetch_any_with_timeout(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> {
+    match tokio::time::timeout(MCP_TOOL_FETCH_TIMEOUT, fetch_any(server, oauth)).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "timed out after {}s while fetching tools/list",
+            MCP_TOOL_FETCH_TIMEOUT.as_secs()
+        )),
     }
 }
 
