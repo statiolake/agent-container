@@ -16,6 +16,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::mcp::{self, McpServer};
 use crate::mcp_client::{Tool, fetch_tools, fetch_tools_stdio};
@@ -79,15 +80,22 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
             "[agent-container] note: no MCP servers declared in ~/.claude.json; the MCP tab will be empty."
         );
     } else {
-        println!("Fetching tools from {} MCP server(s)...", servers.len());
-        for server in &servers {
-            let name = server.name().to_string();
-            use std::io::Write;
-            print!("  {} ({})...", name, server.transport_label());
-            std::io::stdout().flush().ok();
-            match fetch_any(server, &oauth).await {
+        println!("Fetching tools from {} MCP server(s) in parallel...", servers.len());
+        let mut fetches = FuturesUnordered::new();
+        for server in servers.iter().cloned() {
+            let oauth = oauth.clone();
+            fetches.push(async move {
+                let name = server.name().to_string();
+                let transport = server.transport_label().to_string();
+                let result = fetch_any(&server, &oauth).await;
+                (name, transport, result)
+            });
+        }
+
+        while let Some((name, transport, result)) = fetches.next().await {
+            match result {
                 Ok(tools) => {
-                    println!(" {} tool(s)", tools.len());
+                    println!("  {} ({})... {} tool(s)", name, transport, tools.len());
                     for tool in tools {
                         let read_only_hint = tool.read_only_hint();
                         entries.push(ToolEntry {
@@ -99,7 +107,7 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    println!(" FAILED ({e:#})");
+                    println!("  {} ({})... FAILED ({e:#})", name, transport);
                     skipped.push((name, format!("{e:#}")));
                 }
             }
