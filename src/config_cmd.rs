@@ -80,8 +80,7 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
 
     let (claude_entries, mut skipped) =
         fetch_tool_catalog("Claude Code", &claude_servers, &oauth).await;
-    let (codex_entries, codex_skipped) =
-        fetch_tool_catalog("Codex", &codex_servers, &oauth).await;
+    let (codex_entries, codex_skipped) = fetch_tool_catalog("Codex", &codex_servers, &oauth).await;
     skipped.extend(codex_skipped);
 
     if claude_servers.is_empty() {
@@ -103,6 +102,8 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
     let codex_catalog = codex_entries.clone();
     let input = TuiInput {
         initial_scope,
+        general_global: global_settings.general.clone(),
+        general_workspace: workspace_settings.general.clone(),
         proxy_allow_global: global_settings.proxy.allow.clone(),
         proxy_allow_workspace: workspace_settings.proxy.allow.clone(),
         filesystem_global: global_settings.filesystem.clone(),
@@ -139,6 +140,10 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
                 Scope::Global => out.proxy_allow_global,
                 Scope::Workspace => out.proxy_allow_workspace,
             };
+            target.general = match saved_scope {
+                Scope::Global => out.general_global,
+                Scope::Workspace => out.general_workspace,
+            };
             target.filesystem = match saved_scope {
                 Scope::Global => out.filesystem_global,
                 Scope::Workspace => out.filesystem_workspace,
@@ -156,11 +161,7 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
                 Scope::Global => out.codex_mcp_global,
                 Scope::Workspace => out.codex_mcp_workspace,
             };
-            minimise_policy_against_base(
-                &mut target.codex.mcp,
-                &base_codex_mcp,
-                &codex_catalog,
-            );
+            minimise_policy_against_base(&mut target.codex.mcp, &base_codex_mcp, &codex_catalog);
             let edited_tasks = match saved_scope {
                 Scope::Global => out.tasks_global,
                 Scope::Workspace => out.tasks_workspace,
@@ -274,7 +275,7 @@ fn template_for(scope: Scope) -> String {
         }
     };
     format!(
-        "{header}\n# Uncomment examples below.\n# [proxy]\n# allow = [\"^my-internal\\\\.example$\"]\n\n# [filesystem]\n# mounts = [\"/Users/me/project-notes\"]\n# hide = [\"(^|/)\\\\.env(\\\\..*)?$\"]\n# readonly = [\"(^|/)\\\\.claude(/|$)\"]\n\n# Claude Code MCP policy:\n# [claude_code.mcp.servers.github]\n# enabled = true\n# [claude_code.mcp.servers.github.tools]\n# list_issues = true\n# create_issue = false\n\n# Codex MCP policy:\n# [codex.mcp.servers.local-tools.tools]\n# search = true\n# mutate = false\n\n# [claude]\n# tmux_prefix = \"C-b\"\n"
+        "{header}\n# Uncomment examples below.\n# [general]\n# default_agent = \"codex\"\n\n# [proxy]\n# allow = [\"^my-internal\\\\.example$\"]\n\n# [filesystem]\n# mounts = [\"/Users/me/project-notes\"]\n# hide = [\"(^|/)\\\\.env(\\\\..*)?$\"]\n# readonly = [\"(^|/)\\\\.claude(/|$)\"]\n\n# Claude Code MCP policy:\n# [claude_code.mcp.servers.github]\n# enabled = true\n# [claude_code.mcp.servers.github.tools]\n# list_issues = true\n# create_issue = false\n\n# Codex MCP policy:\n# [codex.mcp.servers.local-tools.tools]\n# search = true\n# mutate = false\n\n# [claude]\n# tmux_prefix = \"C-b\"\n"
     )
 }
 
@@ -317,7 +318,12 @@ async fn fetch_tool_catalog(
     while let Some((name, transport, result)) = fetches.next().await {
         match result {
             Ok(tools) => {
-                println!("  {label}: {} ({})... {} tool(s)", name, transport, tools.len());
+                println!(
+                    "  {label}: {} ({})... {} tool(s)",
+                    name,
+                    transport,
+                    tools.len()
+                );
                 for tool in tools {
                     let read_only_hint = tool.read_only_hint();
                     entries.push(ToolEntry {

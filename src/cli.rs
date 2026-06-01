@@ -18,11 +18,12 @@ pub enum Commands {
     /// Launch a coding agent inside the sandbox container.
     #[command(long_about = RUN_HELP)]
     Run {
-        /// Which agent to run as the session's primary binary. Both agents'
-        /// auth is still bind-mounted either way, so you can call the other
-        /// one from inside.
-        #[arg(long, value_enum, default_value_t = AgentKind::Claude)]
-        agent: AgentKind,
+        /// Which agent to run as the session's primary binary. Omit to use
+        /// `[general].default_agent` from settings (Claude Code if unset).
+        /// Both agents' auth is still bind-mounted either way, so you can
+        /// call the other one from inside.
+        #[arg(long, value_enum)]
+        agent: Option<AgentKind>,
         /// Rebuild the agent container image before starting, even if it
         /// already exists locally. The proxy image is still built only if
         /// missing.
@@ -150,6 +151,9 @@ Supported TOML shape:
   [proxy]
   allow = ["^api\\.github\\.com$"]
 
+  [general]
+  default_agent = "codex"
+
   [claude_code.mcp.servers.github]
   enabled = true
 
@@ -176,6 +180,8 @@ Supported TOML shape:
 `proxy.allow` entries are tinyproxy extended regex patterns. Claude Code and
 Codex have separate MCP policy sections; legacy top-level `[mcp]` is still
 read as Claude Code policy and is migrated on the next save.
+`general.default_agent` controls which agent `agent-container run` starts when
+`--agent` is omitted; explicit `--agent` still wins.
 Each task-runner entry becomes an MCP tool that runs on the host; MCP
 arguments are passed as environment variables, so a task command can refer to
 `$env`, `$value`, and similar names. `$CONFIG_ROOT` points at the host-side

@@ -2,6 +2,8 @@
 //!
 //! The window has two top-level tabs:
 //!
+//! - **General** — simple runtime defaults such as which agent
+//!   `agent-container run` starts when `--agent` is omitted.
 //! - **Proxy** — a scope-local list of tinyproxy allow regex patterns
 //!   (the ones that will be appended to the bundled base allowlist at
 //!   runtime). `i`/`+` appends, `e`/`Enter` edits, `d` removes.
@@ -45,7 +47,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs};
 
 use crate::policy::McpPolicy;
-use crate::settings::{FilesystemPolicy, Scope};
+use crate::settings::{DefaultAgent, FilesystemPolicy, GeneralPolicy, Scope};
 
 /// Single-line text buffer with readline-style editing primitives.
 ///
@@ -224,6 +226,8 @@ pub struct TuiInput {
     /// Each scope's current `proxy.allow` list as it lives on disk. Both
     /// are loaded up-front so scope-switching doesn't need to re-enter
     /// the TUI.
+    pub general_global: GeneralPolicy,
+    pub general_workspace: GeneralPolicy,
     pub proxy_allow_global: Vec<String>,
     pub proxy_allow_workspace: Vec<String>,
     pub filesystem_global: FilesystemPolicy,
@@ -249,6 +253,8 @@ pub struct TuiOutput {
     /// Which scope was active when the user hit `s`. The save pass writes
     /// only this scope; the other scope's buffer is discarded.
     pub saved_scope: Scope,
+    pub general_global: GeneralPolicy,
+    pub general_workspace: GeneralPolicy,
     pub proxy_allow_global: Vec<String>,
     pub proxy_allow_workspace: Vec<String>,
     pub filesystem_global: FilesystemPolicy,
@@ -268,6 +274,7 @@ pub enum Outcome {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TopTab {
+    General,
     Proxy,
     HostFs,
     McpClaude,
@@ -277,29 +284,38 @@ enum TopTab {
 impl TopTab {
     fn next(self) -> Self {
         match self {
+            TopTab::General => TopTab::Proxy,
             TopTab::Proxy => TopTab::HostFs,
             TopTab::HostFs => TopTab::McpClaude,
             TopTab::McpClaude => TopTab::McpCodex,
-            TopTab::McpCodex => TopTab::Proxy,
+            TopTab::McpCodex => TopTab::General,
         }
     }
     fn prev(self) -> Self {
         match self {
-            TopTab::Proxy => TopTab::McpCodex,
+            TopTab::General => TopTab::McpCodex,
+            TopTab::Proxy => TopTab::General,
             TopTab::HostFs => TopTab::Proxy,
             TopTab::McpClaude => TopTab::HostFs,
             TopTab::McpCodex => TopTab::McpClaude,
         }
     }
-    fn titles() -> [&'static str; 4] {
-        ["Proxy", "Filesystem", "MCP (Claude Code)", "MCP (Codex)"]
+    fn titles() -> [&'static str; 5] {
+        [
+            "General",
+            "Proxy",
+            "Filesystem",
+            "MCP (Claude Code)",
+            "MCP (Codex)",
+        ]
     }
     fn index(self) -> usize {
         match self {
-            TopTab::Proxy => 0,
-            TopTab::HostFs => 1,
-            TopTab::McpClaude => 2,
-            TopTab::McpCodex => 3,
+            TopTab::General => 0,
+            TopTab::Proxy => 1,
+            TopTab::HostFs => 2,
+            TopTab::McpClaude => 3,
+            TopTab::McpCodex => 4,
         }
     }
 }
@@ -680,6 +696,52 @@ impl FilesystemState {
     }
 }
 
+struct GeneralState {
+    global: GeneralPolicy,
+    workspace: GeneralPolicy,
+}
+
+impl GeneralState {
+    fn new(global: GeneralPolicy, workspace: GeneralPolicy) -> Self {
+        Self { global, workspace }
+    }
+
+    fn active_policy_mut(&mut self, scope: Scope) -> &mut GeneralPolicy {
+        match scope {
+            Scope::Global => &mut self.global,
+            Scope::Workspace => &mut self.workspace,
+        }
+    }
+
+    fn effective_agent(&self, scope: Scope) -> DefaultAgent {
+        match scope {
+            Scope::Global => self.global.default_agent(),
+            Scope::Workspace => self
+                .workspace
+                .default_agent
+                .or(self.global.default_agent)
+                .unwrap_or_default(),
+        }
+    }
+
+    fn origin(&self, scope: Scope) -> ProxyOrigin {
+        match scope {
+            Scope::Global => ProxyOrigin::Global,
+            Scope::Workspace if self.workspace.default_agent.is_some() => ProxyOrigin::Workspace,
+            Scope::Workspace => ProxyOrigin::Global,
+        }
+    }
+
+    fn toggle(&mut self, scope: Scope) {
+        let next = self.effective_agent(scope).toggle();
+        self.active_policy_mut(scope).default_agent = Some(next);
+    }
+
+    fn clear(&mut self, scope: Scope) {
+        self.active_policy_mut(scope).default_agent = None;
+    }
+}
+
 #[derive(Clone)]
 enum McpRow {
     TaskRunnerHeader,
@@ -996,6 +1058,8 @@ enum RowAction {
 /// decide whether `q` should pop a confirm-quit dialog.
 #[derive(Clone)]
 struct Snapshot {
+    general_global: GeneralPolicy,
+    general_workspace: GeneralPolicy,
     proxy_global: Vec<String>,
     proxy_workspace: Vec<String>,
     filesystem_global: FilesystemPolicy,
@@ -1011,6 +1075,7 @@ struct Snapshot {
 struct App {
     scope: Scope,
     tab: TopTab,
+    general: GeneralState,
     /// Holds both scopes' allow lists; the visible rows are derived
     /// from `scope`. Cursor is on the rendered (merged) view.
     proxy: ProxyState,
@@ -1027,6 +1092,8 @@ impl App {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         let initial = Snapshot {
+            general_global: input.general_global.clone(),
+            general_workspace: input.general_workspace.clone(),
             proxy_global: input.proxy_allow_global.clone(),
             proxy_workspace: input.proxy_allow_workspace.clone(),
             filesystem_global: input.filesystem_global.clone(),
@@ -1042,7 +1109,8 @@ impl App {
         let tasks_workspace = input.tasks_workspace;
         Self {
             scope: input.initial_scope,
-            tab: TopTab::Proxy,
+            tab: TopTab::General,
+            general: GeneralState::new(input.general_global, input.general_workspace),
             proxy: ProxyState::new(input.proxy_allow_global, input.proxy_allow_workspace),
             filesystem: FilesystemState::new(input.filesystem_global, input.filesystem_workspace),
             mcp_claude: McpState::new(
@@ -1067,6 +1135,8 @@ impl App {
 
     fn has_unsaved_changes(&self) -> bool {
         self.proxy.global != self.initial.proxy_global
+            || self.general.global != self.initial.general_global
+            || self.general.workspace != self.initial.general_workspace
             || self.proxy.workspace != self.initial.proxy_workspace
             || self.filesystem.global != self.initial.filesystem_global
             || self.filesystem.workspace != self.initial.filesystem_workspace
@@ -1102,6 +1172,7 @@ impl App {
 
     fn sync_list_state(&mut self) {
         let cur = match self.tab {
+            TopTab::General => 0,
             TopTab::Proxy => self.proxy.cursor,
             TopTab::HostFs => self.filesystem.cursor,
             TopTab::McpClaude => self.mcp_claude.cursor,
@@ -1113,6 +1184,8 @@ impl App {
     fn into_output(self) -> TuiOutput {
         TuiOutput {
             saved_scope: self.scope,
+            general_global: self.general.global,
+            general_workspace: self.general.workspace,
             proxy_allow_global: self.proxy.global,
             proxy_allow_workspace: self.proxy.workspace,
             filesystem_global: self.filesystem.global,
@@ -1397,26 +1470,31 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             KeyCode::Right | KeyCode::Char('l') => app.tab = app.tab.next(),
             KeyCode::Char('t') => app.toggle_scope(),
             KeyCode::Up | KeyCode::Char('k') => match app.tab {
+                TopTab::General => {}
                 TopTab::Proxy => app.proxy.move_up(),
                 TopTab::HostFs => app.filesystem.move_up(),
                 TopTab::McpClaude | TopTab::McpCodex => app.active_mcp_mut().move_up(),
             },
             KeyCode::Down | KeyCode::Char('j') => match app.tab {
+                TopTab::General => {}
                 TopTab::Proxy => app.proxy.move_down(scope),
                 TopTab::HostFs => app.filesystem.move_down(scope),
                 TopTab::McpClaude | TopTab::McpCodex => app.active_mcp_mut().move_down(scope),
             },
             KeyCode::Home | KeyCode::Char('g') => match app.tab {
+                TopTab::General => {}
                 TopTab::Proxy => app.proxy.jump_home(),
                 TopTab::HostFs => app.filesystem.jump_home(),
                 TopTab::McpClaude | TopTab::McpCodex => app.active_mcp_mut().jump_home(),
             },
             KeyCode::End | KeyCode::Char('G') => match app.tab {
+                TopTab::General => {}
                 TopTab::Proxy => app.proxy.jump_end(scope),
                 TopTab::HostFs => app.filesystem.jump_end(scope),
                 TopTab::McpClaude | TopTab::McpCodex => app.active_mcp_mut().jump_end(scope),
             },
             KeyCode::Char(' ') | KeyCode::Enter => match app.tab {
+                TopTab::General => app.general.toggle(scope),
                 TopTab::Proxy => {
                     if let Some(row) = app.proxy.current_row(scope) {
                         // Inherited (global) rows shown in the workspace
@@ -1483,7 +1561,9 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                     editing: None,
                 };
             }
-            KeyCode::Char('i') | KeyCode::Char('+') if matches!(app.tab, TopTab::McpClaude | TopTab::McpCodex) => {
+            KeyCode::Char('i') | KeyCode::Char('+')
+                if matches!(app.tab, TopTab::McpClaude | TopTab::McpCodex) =>
+            {
                 start_task_add(&mut app);
             }
             KeyCode::Char('e') if app.tab == TopTab::Proxy => {
@@ -1516,6 +1596,9 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             KeyCode::Char('d') if app.tab == TopTab::Proxy => {
                 app.proxy.remove_current(scope);
             }
+            KeyCode::Char('d') if app.tab == TopTab::General => {
+                app.general.clear(scope);
+            }
             KeyCode::Char('d') if app.tab == TopTab::HostFs => {
                 app.filesystem.remove_current(scope);
             }
@@ -1524,10 +1607,12 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 app.sync_tasks_from_active();
             }
             KeyCode::Char('a') if matches!(app.tab, TopTab::McpClaude | TopTab::McpCodex) => {
-                app.active_mcp_mut().toggle_all_in_focused_server(scope, true);
+                app.active_mcp_mut()
+                    .toggle_all_in_focused_server(scope, true);
             }
             KeyCode::Char('A') if matches!(app.tab, TopTab::McpClaude | TopTab::McpCodex) => {
-                app.active_mcp_mut().toggle_all_in_focused_server(scope, false);
+                app.active_mcp_mut()
+                    .toggle_all_in_focused_server(scope, false);
             }
             _ => {}
         }
@@ -1553,6 +1638,7 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     render_title(f, chunks[0], app);
     render_tabs(f, chunks[1], app);
     match app.tab {
+        TopTab::General => render_general(f, chunks[2], app),
         TopTab::Proxy => render_proxy(f, chunks[2], app),
         TopTab::HostFs => render_host_fs(f, chunks[2], app),
         TopTab::McpClaude | TopTab::McpCodex => render_mcp(f, chunks[2], app),
@@ -1643,6 +1729,36 @@ fn render_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         );
     f.render_widget(tabs, area);
+}
+
+fn render_general(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+    let agent = app.general.effective_agent(app.scope);
+    let origin = app.general.origin(app.scope);
+    let inherited = app.scope == Scope::Workspace && origin == ProxyOrigin::Global;
+    let value_style = if inherited {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let item = ListItem::new(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("default agent", Style::default().fg(Color::White)),
+        Span::raw("  "),
+        Span::styled(agent.label(), value_style.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            if inherited { "  inherited" } else { "" },
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    let list = List::new(vec![item])
+        .block(Block::default().borders(Borders::NONE))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
 fn render_proxy(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
@@ -1893,6 +2009,20 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
 
     let help = match app.tab {
+        TopTab::General => Line::from(vec![
+            key("h/l", Color::Cyan),
+            Span::raw(" tabs · "),
+            key("space", Color::Cyan),
+            Span::raw(" toggle default agent · "),
+            key("d", Color::Cyan),
+            Span::raw(" clear override · "),
+            key("t", Color::Yellow),
+            Span::raw(" scope · "),
+            key("s", Color::Green),
+            Span::raw(" save · "),
+            key("q", Color::Red),
+            Span::raw(" cancel"),
+        ]),
         TopTab::Proxy => Line::from(vec![
             key("h/l", Color::Cyan),
             Span::raw(" tabs · "),
@@ -1950,6 +2080,18 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
 
     let status = match app.tab {
+        TopTab::General => Line::from(vec![Span::styled(
+            format!(
+                "Global: {} · Workspace: {}",
+                app.general.global.default_agent().label(),
+                app.general
+                    .workspace
+                    .default_agent
+                    .map(DefaultAgent::label)
+                    .unwrap_or("inherited"),
+            ),
+            Style::default().fg(Color::DarkGray),
+        )]),
         TopTab::Proxy => Line::from(vec![Span::styled(
             format!(
                 "Global: {} · Workspace: {} allow pattern(s)",
@@ -2446,6 +2588,10 @@ mod tests {
     fn fresh_input() -> TuiInput {
         TuiInput {
             initial_scope: Scope::Workspace,
+            general_global: GeneralPolicy {
+                default_agent: Some(DefaultAgent::Claude),
+            },
+            general_workspace: GeneralPolicy::default(),
             proxy_allow_global: vec!["g".into()],
             proxy_allow_workspace: vec!["w".into()],
             filesystem_global: FilesystemPolicy {
@@ -2480,6 +2626,35 @@ mod tests {
         let mut app = App::new(fresh_input());
         app.proxy.workspace.push("w2".into());
         assert!(app.has_unsaved_changes());
+    }
+
+    #[test]
+    fn has_unsaved_changes_detects_default_agent_edit() {
+        let mut app = App::new(fresh_input());
+        app.general.toggle(Scope::Workspace);
+        assert!(app.has_unsaved_changes());
+    }
+
+    #[test]
+    fn workspace_default_agent_inherits_until_overridden() {
+        let mut general = GeneralState::new(
+            GeneralPolicy {
+                default_agent: Some(DefaultAgent::Codex),
+            },
+            GeneralPolicy::default(),
+        );
+        assert_eq!(
+            general.effective_agent(Scope::Workspace),
+            DefaultAgent::Codex
+        );
+        assert_eq!(general.origin(Scope::Workspace), ProxyOrigin::Global);
+
+        general.toggle(Scope::Workspace);
+        assert_eq!(
+            general.effective_agent(Scope::Workspace),
+            DefaultAgent::Claude
+        );
+        assert_eq!(general.origin(Scope::Workspace), ProxyOrigin::Workspace);
     }
 
     #[test]

@@ -19,6 +19,9 @@
 //! [codex.mcp.servers.github]
 //! enabled = true
 //!
+//! [general]
+//! default_agent = "claude"
+//!
 //! [task_runner.tasks]
 //! lint = "cargo check"
 //! build = "cargo build --release"
@@ -44,6 +47,8 @@ use crate::policy::McpPolicy;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    #[serde(default, skip_serializing_if = "GeneralPolicy::is_empty")]
+    pub general: GeneralPolicy,
     #[serde(default, skip_serializing_if = "ProxyPolicy::is_empty")]
     pub proxy: ProxyPolicy,
     #[serde(default, rename = "mcp", skip_serializing)]
@@ -58,6 +63,46 @@ pub struct Settings {
     pub filesystem: FilesystemPolicy,
     #[serde(default, skip_serializing_if = "ClaudePolicy::is_empty")]
     pub claude: ClaudePolicy,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneralPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<DefaultAgent>,
+}
+
+impl GeneralPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.default_agent.is_none()
+    }
+
+    pub fn default_agent(&self) -> DefaultAgent {
+        self.default_agent.unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DefaultAgent {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl DefaultAgent {
+    pub fn toggle(self) -> Self {
+        match self {
+            DefaultAgent::Claude => DefaultAgent::Codex,
+            DefaultAgent::Codex => DefaultAgent::Claude,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DefaultAgent::Claude => "Claude Code",
+            DefaultAgent::Codex => "Codex",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,6 +281,7 @@ impl Settings {
     /// (everything empty) is the right starting point.
     pub fn default_global() -> Self {
         Self {
+            general: GeneralPolicy::default(),
             proxy: ProxyPolicy {
                 allow: crate::proxy_allowlist::default_allow_entries(),
             },
@@ -302,6 +348,7 @@ impl Settings {
     ///
     /// - `proxy.allow`: overlay entries are appended to the base list,
     ///   preserving order and removing exact duplicates.
+    /// - `general.default_agent`: workspace overrides global when set.
     /// - `claude_code.mcp.servers.<server>` and
     ///   `codex.mcp.servers.<server>`: if overlay declares a server, the
     ///   whole entry replaces the base entry (matching VS Code's
@@ -316,6 +363,9 @@ impl Settings {
         self.migrate_legacy_mcp();
         let mut overlay = overlay;
         overlay.migrate_legacy_mcp();
+        if overlay.general.default_agent.is_some() {
+            self.general.default_agent = overlay.general.default_agent;
+        }
         for pat in overlay.proxy.allow {
             if !self.proxy.allow.contains(&pat) {
                 self.proxy.allow.push(pat);
@@ -493,6 +543,34 @@ mod tests {
             base.proxy.allow,
             vec!["a".to_string(), "b".into(), "c".into()]
         );
+    }
+
+    #[test]
+    fn default_agent_roundtrips_and_workspace_overrides_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let written = Settings {
+            general: GeneralPolicy {
+                default_agent: Some(DefaultAgent::Codex),
+            },
+            ..Default::default()
+        };
+        written.save_to(&path).unwrap();
+
+        let read = Settings::load_from(&path).unwrap();
+        assert_eq!(read.general.default_agent(), DefaultAgent::Codex);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[general]"));
+        assert!(raw.contains("default_agent = \"codex\""));
+
+        let mut base = Settings {
+            general: GeneralPolicy {
+                default_agent: Some(DefaultAgent::Claude),
+            },
+            ..Default::default()
+        };
+        base.merge_in_place(read);
+        assert_eq!(base.general.default_agent(), DefaultAgent::Codex);
     }
 
     #[test]

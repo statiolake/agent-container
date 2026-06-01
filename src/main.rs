@@ -169,7 +169,11 @@ fn should_explain_config_instead_of_tui(cli: &Cli) -> bool {
     )
 }
 
-async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>) -> Result<()> {
+async fn run_cmd(
+    agent_override: Option<AgentKind>,
+    rebuild_image: bool,
+    passthrough: Vec<String>,
+) -> Result<()> {
     let host = paths::HostPaths::detect()?;
 
     // Host-side discovery — always performed so broker/sync can populate
@@ -187,6 +191,8 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
         .context("failed to load MCP servers from ~/.codex/config.toml")?;
     let merged_settings = settings::Settings::load_merged(&host.workspace)
         .context("failed to load agent-container settings (global + workspace)")?;
+    let agent = agent_override
+        .unwrap_or_else(|| agent_kind_from_default(merged_settings.general.default_agent()));
     let claude_policy = merged_settings.claude_code.mcp.clone();
     let codex_policy = merged_settings.codex.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
@@ -362,6 +368,13 @@ async fn run_cmd(agent: AgentKind, rebuild_image: bool, passthrough: Vec<String>
     drop(claude_creds);
     drop(codex_auth);
     std::process::exit(exit);
+}
+
+fn agent_kind_from_default(agent: settings::DefaultAgent) -> AgentKind {
+    match agent {
+        settings::DefaultAgent::Claude => AgentKind::Claude,
+        settings::DefaultAgent::Codex => AgentKind::Codex,
+    }
 }
 
 fn claude_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {

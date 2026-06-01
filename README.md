@@ -103,6 +103,10 @@ agent-container run --rebuild-image         # rebuild agent-container:dev first
 agent-container run --agent codex -- exec "what does this repo do?"
 ```
 
+`agent-container run` defaults to Claude Code unless
+`[general] default_agent = "codex"` is set with `agent-container config`.
+An explicit `--agent` flag always wins over the setting.
+
 Both agents' auth is bind-mounted regardless of which one is the
 primary, so a Claude session can call `codex exec …` as a shell tool
 and vice versa. In either mode the workspace is the current directory,

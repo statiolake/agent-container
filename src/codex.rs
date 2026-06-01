@@ -321,8 +321,6 @@ const INHERITED_SCALAR_KEYS: &[&str] = &[
     "personality",
 ];
 
-const MCP_SERVERS_KEY: &str = "mcp_servers";
-
 /// Write `~/.codex/config.toml` into the container's persistent home.
 ///
 /// The file is composed from two sources:
@@ -431,11 +429,7 @@ fn codex_http_mcp_entry(broker_url: &str, name: &str) -> toml::Value {
     let mut entry = toml::value::Table::new();
     entry.insert(
         "url".to_string(),
-        toml::Value::String(format!(
-            "{}/mcp/{}",
-            broker_url.trim_end_matches('/'),
-            name
-        )),
+        toml::Value::String(format!("{}/mcp/{}", broker_url.trim_end_matches('/'), name)),
     );
     toml::Value::Table(entry)
 }

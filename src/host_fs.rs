@@ -315,10 +315,16 @@ fn ensure_listable_by(matcher: &FilesystemMatcher, path: &Path) -> Result<()> {
 }
 
 fn list_entry_visible(matcher: &FilesystemMatcher, path: &Path) -> Result<bool> {
-    Ok(!matches!(
-        matcher.classify_resolved(path)?,
-        FilesystemAccess::Hidden
-    ) || matcher.has_visible_descendant_root(path))
+    let path = if path.exists() {
+        std::fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve {}", path.display()))?
+    } else {
+        normalize_absolute(path)?
+    };
+    Ok(
+        !matches!(matcher.classify_resolved(&path)?, FilesystemAccess::Hidden)
+            || matcher.has_visible_descendant_root(&path),
+    )
 }
 
 fn required_string<'a>(arguments: Option<&'a Value>, key: &str) -> Result<&'a str> {
@@ -450,7 +456,9 @@ impl FilesystemMatcher {
     }
 
     pub fn has_visible_descendant_root(&self, path: &Path) -> bool {
-        self.roots.iter().any(|root| root != path && root.starts_with(path))
+        self.roots
+            .iter()
+            .any(|root| root != path && root.starts_with(path))
     }
 }
 
