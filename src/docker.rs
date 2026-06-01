@@ -76,6 +76,7 @@ pub struct RunOptions {
     pub host: HostPaths,
     pub credentials_path: PathBuf,
     pub codex_auth_path: PathBuf,
+    pub codex_history: crate::codex::CodexHistoryMounts,
     pub bedrock_setup: Option<BedrockSetup>,
     /// Pre-built `http://<host>:<port>` URL the container should use to
     /// reach the broker. The hostname encodes the engine-flavour choice
@@ -178,6 +179,29 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         (
             "CODEX_AUTH_PATH",
             opts.codex_auth_path.display().to_string(),
+        ),
+        (
+            "CODEX_SESSIONS_DIR",
+            opts.codex_history.sessions_dir.display().to_string(),
+        ),
+        (
+            "CODEX_ARCHIVED_SESSIONS_DIR",
+            opts.codex_history
+                .archived_sessions_dir
+                .display()
+                .to_string(),
+        ),
+        (
+            "CODEX_SHELL_SNAPSHOTS_DIR",
+            opts.codex_history.shell_snapshots_dir.display().to_string(),
+        ),
+        (
+            "CODEX_SESSION_INDEX_PATH",
+            opts.codex_history.session_index_path.display().to_string(),
+        ),
+        (
+            "CODEX_HISTORY_PATH",
+            opts.codex_history.history_path.display().to_string(),
         ),
         ("ALLOWLIST_PATH", allowlist_path.display().to_string()),
         ("HOST_UID", uid.to_string()),

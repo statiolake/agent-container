@@ -62,6 +62,11 @@ services:
       - "${CREDENTIALS_PATH}:/home/agent/.claude/.credentials.json"
       - "${CLAUDE_MD_MOUNT_SRC}:/home/agent/.claude/CLAUDE.md:ro"
       - "${CODEX_AUTH_PATH}:/home/agent/.codex/auth.json"
+      - "${CODEX_SESSIONS_DIR}:/home/agent/.codex/sessions"
+      - "${CODEX_ARCHIVED_SESSIONS_DIR}:/home/agent/.codex/archived_sessions"
+      - "${CODEX_SHELL_SNAPSHOTS_DIR}:/home/agent/.codex/shell_snapshots"
+      - "${CODEX_SESSION_INDEX_PATH}:/home/agent/.codex/session_index.jsonl"
+      - "${CODEX_HISTORY_PATH}:/home/agent/.codex/history.jsonl"
     user: "${HOST_UID}:${HOST_GID}"
     working_dir: "${CONTAINER_WORKSPACE_PATH}"
     stdin_open: true

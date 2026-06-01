@@ -16,8 +16,7 @@ destructive tool calls remain real failure modes. `agent-container`
 shrinks the blast radius to "whatever is in the current workspace":
 
 - **No host filesystem access** beyond the current working directory
-  plus the matching `~/.claude/projects/<cwd>` session history
-  directory.
+  plus the matching Claude/Codex session history directories.
 - **No host credentials** — the agent sees only the bind-mounted OAuth
   tokens, not `~/.ssh`, `~/.aws/credentials`, browser cookies, …
 - **No direct internet**. The container runs on a `--internal` Docker
@@ -109,7 +108,10 @@ primary, so a Claude session can call `codex exec …` as a shell tool
 and vice versa. In either mode the workspace is the current directory,
 mounted at the same absolute path inside the container, and
 `~/.claude/projects/<cwd-encoded>/` keeps the session history on the
-host.
+host. Codex history/resume files under `~/.codex/sessions`,
+`~/.codex/archived_sessions`, `~/.codex/session_index.jsonl`,
+`~/.codex/history.jsonl`, and `~/.codex/shell_snapshots` are also mounted
+from the host.
 
 The workspace mount is writable, but `<workspace>/.agent-container` is
 overlaid as read-only at the same path inside the container. If the
@@ -248,6 +250,11 @@ container's persistent `$HOME` (kept at
   `personality`, plus pinned `approval_policy = "never"` and
   `sandbox_mode = "danger-full-access"` (the container is the sandbox;
   Codex's own bubblewrap can't nest).
+- Codex history state — `~/.codex/sessions/`,
+  `~/.codex/archived_sessions/`, `~/.codex/shell_snapshots/`,
+  `~/.codex/session_index.jsonl`, and `~/.codex/history.jsonl` are
+  mounted from the host so in-container Codex can resume and browse the
+  same history.
 
 Everything else your agents need is left to the container itself. The
 persistent home survives across runs, so onboarding prompts and login

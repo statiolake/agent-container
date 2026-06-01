@@ -1,10 +1,10 @@
 //! Helpers for the Codex pathway: ship the host's ChatGPT-subscription
-//! auth token into the container through a short-lived 0600 temp file so
-//! the container can run `@openai/codex` without inheriting anything else
-//! from `~/.codex` (trust_level lists, session history, …), and pin a
-//! minimal `config.toml` inside the container so Codex does not try to
-//! nest its own bubblewrap sandbox (which fails inside docker because
-//! user namespaces cannot be recreated).
+//! auth token into the container through a short-lived 0600 temp file and
+//! mount only the host-side history paths Codex needs for resume/history
+//! views. The rest of `~/.codex` (trust_level lists, plugins, caches, …)
+//! stays outside the container. We also pin a minimal `config.toml` inside
+//! the container so Codex does not try to nest its own bubblewrap sandbox
+//! (which fails inside docker because user namespaces cannot be recreated).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,14 @@ pub struct CodexAuthFile {
     /// agent-container to drop this writes the (possibly refreshed)
     /// auth.json back to `~/.codex/auth.json` on the host.
     _shared: SharedCredFile,
+}
+
+pub struct CodexHistoryMounts {
+    pub sessions_dir: PathBuf,
+    pub archived_sessions_dir: PathBuf,
+    pub shell_snapshots_dir: PathBuf,
+    pub session_index_path: PathBuf,
+    pub history_path: PathBuf,
 }
 
 /// Open `~/.codex/auth.json` through the shared-credential machinery.
@@ -43,6 +51,43 @@ pub fn prepare_auth(host_home: &Path) -> Result<CodexAuthFile> {
         path: shared.path.clone(),
         _shared: shared,
     })
+}
+
+/// Prepare the host-side Codex history paths that should be shared with
+/// the container. This deliberately does not mount the whole `~/.codex`
+/// tree: auth and generated container config are handled separately, and
+/// caches/plugins/tmp state should stay owned by whichever Codex runtime
+/// created it.
+pub fn prepare_history_mounts(host_home: &Path) -> Result<CodexHistoryMounts> {
+    let codex_root = host_home.join(".codex");
+    let sessions_dir = ensure_dir(&codex_root.join("sessions"))?;
+    let archived_sessions_dir = ensure_dir(&codex_root.join("archived_sessions"))?;
+    let shell_snapshots_dir = ensure_dir(&codex_root.join("shell_snapshots"))?;
+    let session_index_path = ensure_file(&codex_root.join("session_index.jsonl"))?;
+    let history_path = ensure_file(&codex_root.join("history.jsonl"))?;
+    Ok(CodexHistoryMounts {
+        sessions_dir,
+        archived_sessions_dir,
+        shell_snapshots_dir,
+        session_index_path,
+        history_path,
+    })
+}
+
+fn ensure_dir(path: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    std::fs::canonicalize(path).with_context(|| format!("failed to resolve {}", path.display()))
+}
+
+fn ensure_file(path: &Path) -> Result<PathBuf> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    if !path.exists() {
+        fs::write(path, "").with_context(|| format!("failed to create {}", path.display()))?;
+    }
+    std::fs::canonicalize(path).with_context(|| format!("failed to resolve {}", path.display()))
 }
 
 /// Top-level scalar keys we inherit from the host's `~/.codex/config.toml`
@@ -156,5 +201,30 @@ trust_level = "trusted"
         assert_eq!(t["approval_policy"].as_str(), Some("never"));
         assert_eq!(t["sandbox_mode"].as_str(), Some("danger-full-access"));
         assert!(t.get("model").is_none());
+    }
+
+    #[test]
+    fn prepares_history_mount_paths_without_mounting_whole_codex_home() {
+        let host_home = tempfile::tempdir().unwrap();
+        let mounts = prepare_history_mounts(host_home.path()).unwrap();
+        let codex_root = std::fs::canonicalize(host_home.path().join(".codex")).unwrap();
+
+        assert_eq!(mounts.sessions_dir, codex_root.join("sessions"));
+        assert_eq!(
+            mounts.archived_sessions_dir,
+            codex_root.join("archived_sessions")
+        );
+        assert_eq!(
+            mounts.shell_snapshots_dir,
+            codex_root.join("shell_snapshots")
+        );
+        assert_eq!(
+            mounts.session_index_path,
+            codex_root.join("session_index.jsonl")
+        );
+        assert_eq!(mounts.history_path, codex_root.join("history.jsonl"));
+        assert!(mounts.sessions_dir.is_dir());
+        assert!(mounts.session_index_path.is_file());
+        assert!(mounts.history_path.is_file());
     }
 }
