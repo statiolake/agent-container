@@ -30,7 +30,8 @@ pub enum Commands {
         #[arg(long)]
         rebuild_image: bool,
         /// Extra arguments forwarded to the chosen agent inside the container.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Must appear after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
         passthrough: Vec<String>,
     },
 
@@ -44,8 +45,8 @@ pub enum Commands {
         #[arg(long)]
         rebuild_image: bool,
         /// Optional command to exec inside bash instead of dropping to a
-        /// prompt (e.g. `agent-container shell -- cat /etc/resolv.conf`).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// prompt. Must appear after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
         passthrough: Vec<String>,
     },
 
@@ -109,7 +110,9 @@ const TOP_LEVEL_EXAMPLES: &str = r#"Examples:
   agent-container run
   agent-container run --rebuild-image
   agent-container run --agent codex
+  agent-container run -- --continue
   agent-container shell
+  agent-container shell -- cat /etc/resolv.conf
   agent-container config
   agent-container config show --workspace"#;
 
@@ -121,12 +124,18 @@ runs. The container gets a persistent home under agent-container's data
 directory, plus filtered Claude Code and Codex auth/config state from the
 host. Network egress goes through the bundled proxy allowlist. Host-only
 operations should be exposed through `[task_runner.tasks]` instead of relying
-on ordinary container shell access."#;
+on ordinary container shell access.
+
+Arguments for the chosen agent are accepted only after `--`, for example
+`agent-container run -- --continue`."#;
 
 const SHELL_HELP: &str = r#"Open an interactive shell inside the same container environment used by `run`.
 
 This is useful for debugging mounts, proxy behavior, credentials, or the exact
-filesystem view an agent will see. It skips launching Claude Code or Codex."#;
+filesystem view an agent will see. It skips launching Claude Code or Codex.
+
+Commands to run inside bash are accepted only after `--`, for example
+`agent-container shell -- cat /etc/resolv.conf`."#;
 
 const CONFIG_HELP: &str = r#"Edit agent-container settings.
 
@@ -216,3 +225,49 @@ const CONFIG_SHOW_HELP: &str = r#"Print settings as TOML.
 
 Without flags this prints the merged runtime view: global settings plus the
 workspace overlay. Use `--global` or `--workspace` to inspect a single file."#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_passthrough_requires_double_dash() {
+        let cli = Cli::try_parse_from([
+            "agent-container",
+            "run",
+            "--agent",
+            "codex",
+            "--",
+            "--continue",
+            "thread-id",
+        ])
+        .unwrap();
+
+        let Commands::Run {
+            agent, passthrough, ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert_eq!(agent, Some(AgentKind::Codex));
+        assert_eq!(passthrough, ["--continue", "thread-id"]);
+
+        assert!(Cli::try_parse_from(["agent-container", "run", "--continue"]).is_err());
+        assert!(Cli::try_parse_from(["agent-container", "run", "exec", "prompt"]).is_err());
+    }
+
+    #[test]
+    fn shell_passthrough_requires_double_dash() {
+        let cli =
+            Cli::try_parse_from(["agent-container", "shell", "--", "cat", "/etc/resolv.conf"])
+                .unwrap();
+
+        let Commands::Shell { passthrough, .. } = cli.command else {
+            panic!("expected shell command");
+        };
+        assert_eq!(passthrough, ["cat", "/etc/resolv.conf"]);
+
+        assert!(Cli::try_parse_from(["agent-container", "shell", "cat"]).is_err());
+        assert!(Cli::try_parse_from(["agent-container", "shell", "--bogus"]).is_err());
+    }
+}
