@@ -121,8 +121,9 @@ async fn main() -> Result<()> {
         Commands::Run {
             agent,
             rebuild_image,
+            tmux,
             passthrough,
-        } => run_cmd(agent, rebuild_image, passthrough).await,
+        } => run_cmd(agent, rebuild_image, tmux, passthrough).await,
         Commands::Shell {
             rebuild_image,
             passthrough,
@@ -172,6 +173,7 @@ fn should_explain_config_instead_of_tui(cli: &Cli) -> bool {
 async fn run_cmd(
     agent_override: Option<AgentKind>,
     rebuild_image: bool,
+    tmux: bool,
     passthrough: Vec<String>,
 ) -> Result<()> {
     let host = paths::HostPaths::detect()?;
@@ -343,10 +345,7 @@ async fn run_cmd(
     let codex_history = codex::prepare_history_mounts(&host.home)
         .context("failed to prepare Codex history mounts")?;
 
-    let agent_command = match agent {
-        AgentKind::Claude => claude_agent_command(merged_settings.claude.tmux_prefix())?,
-        AgentKind::Codex => codex_agent_command(merged_settings.claude.tmux_prefix())?,
-    };
+    let agent_command = agent_command(agent, tmux, merged_settings.claude.tmux_prefix())?;
 
     let exit = docker::run(docker::RunOptions {
         host,
@@ -376,7 +375,19 @@ fn agent_kind_from_default(agent: settings::DefaultAgent) -> AgentKind {
     }
 }
 
-fn claude_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
+fn agent_command(agent: AgentKind, tmux: bool, tmux_prefix: &str) -> Result<Vec<String>> {
+    match (agent, tmux) {
+        (AgentKind::Claude, false) => Ok(vec![
+            "claude".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ]),
+        (AgentKind::Codex, false) => Ok(vec!["codex".to_string()]),
+        (AgentKind::Claude, true) => claude_tmux_agent_command(tmux_prefix),
+        (AgentKind::Codex, true) => codex_tmux_agent_command(tmux_prefix),
+    }
+}
+
+fn claude_tmux_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
     validate_tmux_key(tmux_prefix)?;
     Ok(vec![
         "sh".to_string(),
@@ -394,7 +405,7 @@ fn claude_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
     ])
 }
 
-fn codex_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
+fn codex_tmux_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
     validate_tmux_key(tmux_prefix)?;
     Ok(vec![
         "sh".to_string(),
@@ -770,8 +781,22 @@ mod tests {
     }
 
     #[test]
+    fn claude_runs_directly_by_default() {
+        let command = agent_command(AgentKind::Claude, false, "C-q;touch").unwrap();
+
+        assert_eq!(command, ["claude", "--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn codex_runs_directly_by_default() {
+        let command = agent_command(AgentKind::Codex, false, "C-q;touch").unwrap();
+
+        assert_eq!(command, ["codex"]);
+    }
+
+    #[test]
     fn claude_runs_in_tmux_with_mouse_and_configured_prefix() {
-        let command = claude_agent_command("C-q").unwrap();
+        let command = agent_command(AgentKind::Claude, true, "C-q").unwrap();
         let script = &command[2];
 
         assert!(script.contains("set-option -g mouse on"));
@@ -782,7 +807,7 @@ mod tests {
 
     #[test]
     fn codex_runs_in_tmux_with_mouse_and_configured_prefix() {
-        let command = codex_agent_command("C-q").unwrap();
+        let command = agent_command(AgentKind::Codex, true, "C-q").unwrap();
         let script = &command[2];
 
         assert!(script.contains("set-option -g mouse on"));
@@ -793,7 +818,7 @@ mod tests {
 
     #[test]
     fn claude_tmux_prefix_rejects_shell_metacharacters() {
-        let err = claude_agent_command("C-q;touch").unwrap_err();
+        let err = agent_command(AgentKind::Claude, true, "C-q;touch").unwrap_err();
         assert!(format!("{err:#}").contains("invalid claude.tmux_prefix"));
     }
 }

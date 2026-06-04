@@ -100,6 +100,7 @@ The container images (`agent-container:dev` and
 agent-container run                         # Claude Code
 agent-container run --agent codex           # Codex
 agent-container run --rebuild-image         # rebuild agent-container:dev first
+agent-container run --tmux                  # run the agent inside tmux
 agent-container run --agent codex -- exec "what does this repo do?"
 ```
 
@@ -123,10 +124,11 @@ directory does not exist on the host, an empty read-only directory is
 mounted there so an in-container agent cannot create workspace-local
 agent-container settings for itself.
 
-Claude Code and Codex run inside tmux so agent teams can attach panes. tmux
-mouse support is enabled automatically. The tmux prefix defaults to `C-b`;
-set `[claude] tmux_prefix = "C-q"` in agent-container settings if you want a
-different prefix.
+Claude Code and Codex run directly by default. Pass `agent-container run
+--tmux` to wrap the agent in tmux so agent teams can attach panes. tmux mouse
+support is enabled automatically in that mode. The tmux prefix defaults to
+`C-b`; set `[claude] tmux_prefix = "C-q"` in agent-container settings if you
+want a different prefix.
 
 ### Configure the MCP tool allowlist
 

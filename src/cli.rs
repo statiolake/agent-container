@@ -29,6 +29,10 @@ pub enum Commands {
         /// missing.
         #[arg(long)]
         rebuild_image: bool,
+        /// Run the agent inside tmux. Without this flag, the agent binary is
+        /// launched directly.
+        #[arg(long)]
+        tmux: bool,
         /// Extra arguments forwarded to the chosen agent inside the container.
         /// Must appear after `--`.
         #[arg(last = true, allow_hyphen_values = true)]
@@ -110,6 +114,7 @@ const TOP_LEVEL_EXAMPLES: &str = r#"Examples:
   agent-container run
   agent-container run --rebuild-image
   agent-container run --agent codex
+  agent-container run --tmux
   agent-container run -- --continue
   agent-container shell
   agent-container shell -- cat /etc/resolv.conf
@@ -127,7 +132,8 @@ operations should be exposed through `[task_runner.tasks]` instead of relying
 on ordinary container shell access.
 
 Arguments for the chosen agent are accepted only after `--`, for example
-`agent-container run -- --continue`."#;
+`agent-container run -- --continue`. Pass `--tmux` when you want the agent
+wrapped in a tmux session for agent teams or pane attachment."#;
 
 const SHELL_HELP: &str = r#"Open an interactive shell inside the same container environment used by `run`.
 
@@ -208,10 +214,11 @@ names such as `.env`, `.env.*`, private key files, `.npmrc`, `.pypirc`, and
 shadow-mounted at container startup. The host-fs MCP reloads the policy on
 every tool call, so saved settings take effect there without restarting.
 
-Claude Code and Codex run inside tmux so agent teams can attach panes. tmux
-mouse support is enabled automatically. `claude.tmux_prefix` controls tmux's
-prefix key for agent sessions; omit it to keep tmux's default `C-b`, or set it
-to a tmux key name such as `C-q`."#;
+Claude Code and Codex run directly by default. Pass `agent-container run
+--tmux` to wrap the agent in tmux so agent teams can attach panes. tmux mouse
+support is enabled automatically in that mode. `claude.tmux_prefix` controls
+tmux's prefix key for agent sessions; omit it to keep tmux's default `C-b`, or
+set it to a tmux key name such as `C-q`."#;
 
 const CONFIG_EXAMPLES: &str = r#"Examples:
   agent-container config
@@ -244,16 +251,35 @@ mod tests {
         .unwrap();
 
         let Commands::Run {
-            agent, passthrough, ..
+            agent,
+            tmux,
+            passthrough,
+            ..
         } = cli.command
         else {
             panic!("expected run command");
         };
         assert_eq!(agent, Some(AgentKind::Codex));
+        assert!(!tmux);
         assert_eq!(passthrough, ["--continue", "thread-id"]);
 
         assert!(Cli::try_parse_from(["agent-container", "run", "--continue"]).is_err());
         assert!(Cli::try_parse_from(["agent-container", "run", "exec", "prompt"]).is_err());
+    }
+
+    #[test]
+    fn run_tmux_is_a_real_option_before_passthrough_separator() {
+        let cli =
+            Cli::try_parse_from(["agent-container", "run", "--tmux", "--", "--continue"]).unwrap();
+
+        let Commands::Run {
+            tmux, passthrough, ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert!(tmux);
+        assert_eq!(passthrough, ["--continue"]);
     }
 
     #[test]
