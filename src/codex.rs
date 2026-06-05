@@ -1,8 +1,7 @@
-//! Helpers for the Codex pathway: ship the host's ChatGPT-subscription
-//! auth token into the container through a short-lived 0600 temp file and
-//! mount the host-side Codex history paths needed for resume/history. The
-//! rest of `~/.codex` (trust_level lists, plugins, caches, …) stays outside
-//! the container. We also pin a minimal
+//! Helpers for the Codex pathway: mount the host's `~/.codex/auth.json`
+//! directly and mount the host-side Codex history paths needed for
+//! resume/history. The rest of `~/.codex` (trust_level lists, plugins,
+//! caches, …) stays outside the container. We also pin a minimal
 //! `config.toml` inside the container so Codex does not try to nest its
 //! own bubblewrap sandbox (which fails inside docker because user
 //! namespaces cannot be recreated).
@@ -12,14 +11,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::shared_cred::{HostSync, SharedCredFile, shared_dir};
-
 pub struct CodexAuthFile {
     pub path: PathBuf,
-    /// Owns the shared lock; see [`crate::shared_cred`]. The last
-    /// agent-container to drop this writes the (possibly refreshed)
-    /// auth.json back to `~/.codex/auth.json` on the host.
-    _shared: SharedCredFile,
 }
 
 pub struct CodexHistoryMounts {
@@ -30,28 +23,27 @@ pub struct CodexHistoryMounts {
     pub history_path: PathBuf,
 }
 
-/// Open `~/.codex/auth.json` through the shared-credential machinery.
-///
-/// All concurrent agent-container processes on this host see the same
-/// `auth.json`, so a token refresh in one container is observable by
-/// the others via the bind-mounted shared file. The host copy is
-/// updated only when the last container exits.
+/// Return the host `~/.codex/auth.json` path for direct bind-mounting.
+/// Codex stores its first-party auth in this file rather than macOS
+/// Keychain, so direct mounting keeps host and container on the same
+/// refresh-token lineage.
 pub fn prepare_auth(host_home: &Path) -> Result<CodexAuthFile> {
     let src = host_home.join(".codex/auth.json");
-    let shared_path = shared_dir()?.join("codex-auth.json");
-    let host_sync = HostSync::File(src.clone());
-    let (shared, _raw) = SharedCredFile::open(shared_path, host_sync, move || {
-        fs::read_to_string(&src).with_context(|| {
-            format!(
-                "failed to read Codex auth at {}; run `codex login` on the host first",
-                src.display()
-            )
-        })
+    let metadata = fs::metadata(&src).with_context(|| {
+        format!(
+            "failed to read Codex auth at {}; run `codex login` on the host first",
+            src.display()
+        )
     })?;
-    Ok(CodexAuthFile {
-        path: shared.path.clone(),
-        _shared: shared,
-    })
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "Codex auth path is not a file at {}; run `codex login` on the host first",
+            src.display()
+        );
+    }
+    let path = std::fs::canonicalize(&src)
+        .with_context(|| format!("failed to resolve Codex auth at {}", src.display()))?;
+    Ok(CodexAuthFile { path })
 }
 
 /// Prepare the host Codex history paths mounted into the container.
@@ -369,5 +361,18 @@ url = "http://example.invalid/custom-host-fs"
         assert!(mounts.shell_snapshots_dir.is_dir());
         assert!(mounts.session_index_path.is_file());
         assert!(mounts.history_path.is_file());
+    }
+
+    #[test]
+    fn prepares_auth_by_mounting_host_auth_directly() {
+        let host_home = tempfile::tempdir().unwrap();
+        let codex_root = host_home.path().join(".codex");
+        fs::create_dir_all(&codex_root).unwrap();
+        let auth_path = codex_root.join("auth.json");
+        fs::write(&auth_path, "{}").unwrap();
+
+        let auth = prepare_auth(host_home.path()).unwrap();
+
+        assert_eq!(auth.path, std::fs::canonicalize(auth_path).unwrap());
     }
 }
