@@ -13,7 +13,7 @@
 //!   cached so `tools/call` can fall back to the same default.
 //! - Streaming (SSE) responses are passed through unfiltered for now.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,6 +45,7 @@ enum McpBackend {
         spec: StdioMcpServer,
         handle: StdioHandle,
         bridge: Option<PathBridge>,
+        initialized: bool,
     },
     FailedStdio {
         spec: StdioMcpServer,
@@ -63,10 +64,12 @@ impl Clone for McpBackend {
                 spec,
                 handle,
                 bridge,
+                initialized,
             } => Self::Stdio {
                 spec: spec.clone(),
                 handle: handle.clone(),
                 bridge: bridge.clone(),
+                initialized: *initialized,
             },
             Self::FailedStdio {
                 spec,
@@ -92,6 +95,7 @@ struct BrokerState {
     annotations: Mutex<HashMap<String, HashMap<String, Option<bool>>>>,
     recovery: Mutex<HashMap<String, String>>,
     http_sessions: Mutex<HashMap<String, HttpSession>>,
+    http_initialized: Mutex<HashSet<String>>,
     oauth: Arc<OAuthStore>,
     http_client: reqwest::Client,
 }
@@ -168,6 +172,7 @@ pub async fn spawn(
                             spec: s,
                             handle,
                             bridge: stdio_bridge.clone(),
+                            initialized: false,
                         },
                     );
                 }
@@ -227,6 +232,7 @@ pub async fn spawn(
         annotations: Mutex::new(HashMap::new()),
         recovery: Mutex::new(HashMap::new()),
         http_sessions: Mutex::new(HashMap::new()),
+        http_initialized: Mutex::new(HashSet::new()),
         oauth,
         http_client,
     });
@@ -430,12 +436,34 @@ enum BackendKind {
     HostFs,
 }
 
-fn is_recoverable_catalog_method(method: Option<&str>) -> bool {
-    matches!(method, Some("initialize" | "tools/list"))
-}
-
-fn is_initialized_notification(method: Option<&str>) -> bool {
-    method == Some("notifications/initialized")
+fn local_standard_mcp_response(body: &[u8]) -> Option<Result<Response>> {
+    let method = parse_method(body)?;
+    let id = parse_jsonrpc_id(body);
+    match method.as_str() {
+        "initialize" => Some(synthetic_initialize_response(id)),
+        m if m.starts_with("notifications/") => Some(
+            Response::builder()
+                .status(StatusCode::ACCEPTED)
+                .body(Body::empty())
+                .context("building notification response"),
+        ),
+        "ping" => Some(json_response_value(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
+        }))),
+        "resources/list" => Some(json_response_value(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"resources": []}
+        }))),
+        "prompts/list" => Some(json_response_value(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"prompts": []}
+        }))),
+        _ => None,
+    }
 }
 
 fn parse_jsonrpc_id(body: &[u8]) -> Value {
@@ -512,6 +540,7 @@ fn recovery_tool_json(server_name: &str, reason: Option<&str>) -> Value {
 }
 
 async fn mark_mcp_recovery(state: &BrokerState, server_name: &str, reason: String) {
+    state.http_initialized.lock().await.remove(server_name);
     let mut recovery = state.recovery.lock().await;
     let changed = recovery.get(server_name) != Some(&reason);
     recovery.insert(server_name.to_string(), reason);
@@ -528,10 +557,6 @@ async fn clear_mcp_recovery(state: &BrokerState, server_name: &str) {
     if changed {
         broadcast_tools_list_changed(state).await;
     }
-}
-
-async fn has_mcp_recovery(state: &BrokerState, server_name: &str) -> bool {
-    state.recovery.lock().await.contains_key(server_name)
 }
 
 fn jsonrpc_error_text(value: &Value) -> Option<String> {
@@ -569,20 +594,37 @@ async fn forward_http(
         return restart_mcp_server(state, server_name, id).await;
     }
 
+    if let Some(response) = local_standard_mcp_response(&body_bytes) {
+        return response;
+    }
+
     if let Some(blocked) = enforce_tool_call_policy(&state, server_name, &body_bytes).await {
         return Ok(blocked);
     }
 
     let method_name = parse_method(&body_bytes);
     let is_tools_list = method_name.as_deref() == Some("tools/list");
-    let is_initialize = method_name.as_deref() == Some("initialize");
-    let is_recoverable_catalog = is_recoverable_catalog_method(method_name.as_deref());
-    let is_initialized = is_initialized_notification(method_name.as_deref());
+    let tool_call = parse_tool_call(&body_bytes);
 
-    if is_initialized && has_mcp_recovery(&state, server_name).await {
-        return Ok(Response::builder()
-            .status(StatusCode::ACCEPTED)
-            .body(Body::empty())?);
+    if is_tools_list || tool_call.is_some() {
+        if let Err(e) = ensure_http_initialized(&state, server_name, &server).await {
+            let reason = format!("{e:#}");
+            mark_mcp_recovery(&state, server_name, reason.clone()).await;
+            if is_tools_list {
+                return recovery_tools_list_response(
+                    parse_jsonrpc_id(&body_bytes),
+                    server_name,
+                    &reason,
+                );
+            }
+            if let Some(call) = tool_call.as_ref() {
+                return recovery_tool_result_response(
+                    call.id.clone(),
+                    format!("MCP server '{server_name}' is not initialized: {reason}"),
+                    true,
+                );
+            }
+        }
     }
 
     match state.oauth.access_token(server_name).await {
@@ -594,53 +636,66 @@ async fn forward_http(
             );
         }
         Ok(None) => {}
-        Err(e) if is_recoverable_catalog => {
+        Err(e) if is_tools_list => {
             let reason = format!("failed to refresh OAuth token for '{server_name}': {e:#}");
             mark_mcp_recovery(&state, server_name, reason.clone()).await;
-            if is_initialize {
-                return synthetic_initialize_response(parse_jsonrpc_id(&body_bytes));
-            }
             return recovery_tools_list_response(
                 parse_jsonrpc_id(&body_bytes),
                 server_name,
                 &reason,
             );
         }
-        Err(e) if is_initialized => {
+        Err(e) if tool_call.is_some() => {
             let reason = format!("failed to refresh OAuth token for '{server_name}': {e:#}");
-            mark_mcp_recovery(&state, server_name, reason).await;
-            return Ok(Response::builder()
-                .status(StatusCode::ACCEPTED)
-                .body(Body::empty())?);
+            mark_mcp_recovery(&state, server_name, reason.clone()).await;
+            if let Some(call) = tool_call.as_ref() {
+                return recovery_tool_result_response(call.id.clone(), reason, true);
+            }
         }
         Err(e) => {
             return Err(e).with_context(|| format!("refreshing OAuth token for '{server_name}'"));
         }
     }
 
-    if !is_initialize {
-        if let Some(session) = state.http_sessions.lock().await.get(server_name).cloned() {
-            headers.insert(
-                "mcp-session-id",
-                reqwest::header::HeaderValue::from_str(&session.session_id)
-                    .context("building stored MCP session header")?,
-            );
-            headers.insert(
-                "mcp-protocol-version",
-                reqwest::header::HeaderValue::from_str(&session.protocol_version)
-                    .context("building stored MCP protocol header")?,
-            );
-        }
+    if let Some(session) = state.http_sessions.lock().await.get(server_name).cloned() {
+        headers.insert(
+            "mcp-session-id",
+            reqwest::header::HeaderValue::from_str(&session.session_id)
+                .context("building stored MCP session header")?,
+        );
+        headers.insert(
+            "mcp-protocol-version",
+            reqwest::header::HeaderValue::from_str(&session.protocol_version)
+                .context("building stored MCP protocol header")?,
+        );
     }
 
-    let upstream = state
+    let upstream = match state
         .http_client
         .request(method, &upstream_url)
         .headers(headers)
         .body(body_bytes.to_vec())
         .send()
         .await
-        .context("upstream MCP request failed")?;
+    {
+        Ok(upstream) => upstream,
+        Err(e) if is_tools_list => {
+            let reason = format!("upstream MCP request failed: {e:#}");
+            mark_mcp_recovery(&state, server_name, reason.clone()).await;
+            return recovery_tools_list_response(
+                parse_jsonrpc_id(&body_bytes),
+                server_name,
+                &reason,
+            );
+        }
+        Err(e) if tool_call.is_some() => {
+            let reason = format!("upstream MCP request failed: {e:#}");
+            mark_mcp_recovery(&state, server_name, reason.clone()).await;
+            let call = tool_call.as_ref().expect("tool_call checked by guard");
+            return recovery_tool_result_response(call.id.clone(), reason, true);
+        }
+        Err(e) => return Err(e).context("upstream MCP request failed"),
+    };
 
     let status = StatusCode::from_u16(upstream.status().as_u16())?;
     let upstream_content_type = upstream
@@ -654,12 +709,6 @@ async fn forward_http(
         upstream_content_type.as_deref(),
         Some(t) if t.starts_with("text/event-stream")
     );
-    let upstream_session_id = upstream
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-
     let mut out_headers = HeaderMap::new();
     for (n, v) in upstream.headers() {
         if is_hop_by_hop(n.as_str()) {
@@ -673,7 +722,7 @@ async fn forward_http(
         }
     }
 
-    if (is_recoverable_catalog || is_initialized) && !status.is_success() {
+    if is_tools_list && !status.is_success() {
         let raw = upstream
             .bytes()
             .await
@@ -684,14 +733,6 @@ async fn forward_http(
             String::from_utf8_lossy(&raw)
         );
         mark_mcp_recovery(&state, server_name, reason.clone()).await;
-        if is_initialize {
-            return synthetic_initialize_response(parse_jsonrpc_id(&body_bytes));
-        }
-        if is_initialized {
-            return Ok(Response::builder()
-                .status(StatusCode::ACCEPTED)
-                .body(Body::empty())?);
-        }
         return recovery_tools_list_response(parse_jsonrpc_id(&body_bytes), server_name, &reason);
     }
 
@@ -726,48 +767,6 @@ async fn forward_http(
             }
             Err(e) => {
                 tracing::warn!(server = %server_name, error = %e, "tools/list filter failed; passing through");
-                raw.to_vec()
-            }
-        };
-        let mut builder = Response::builder().status(status);
-        *builder.headers_mut().expect("response builder headers") = out_headers;
-        return Ok(builder.body(Body::from(body_bytes))?);
-    }
-
-    if is_initialize && is_json && status.is_success() {
-        let raw = upstream
-            .bytes()
-            .await
-            .context("failed to buffer initialize response body")?;
-        if let Ok(parsed) = serde_json::from_slice::<Value>(&raw) {
-            if let Some(reason) = jsonrpc_error_text(&parsed) {
-                mark_mcp_recovery(&state, server_name, reason).await;
-                return synthetic_initialize_response(parse_jsonrpc_id(&body_bytes));
-            }
-            if let Some(session_id) = upstream_session_id {
-                let protocol_version = parsed
-                    .pointer("/result/protocolVersion")
-                    .and_then(Value::as_str)
-                    .unwrap_or("2025-06-18")
-                    .to_string();
-                state.http_sessions.lock().await.insert(
-                    server_name.to_string(),
-                    HttpSession {
-                        session_id,
-                        protocol_version,
-                    },
-                );
-            }
-        }
-        clear_mcp_recovery(&state, server_name).await;
-        let body_bytes = match force_tools_list_changed_body(&raw) {
-            Ok(bytes) => {
-                // Content-Length now reflects the rewritten body.
-                out_headers.remove(reqwest::header::CONTENT_LENGTH.as_str());
-                bytes
-            }
-            Err(e) => {
-                tracing::warn!(server = %server_name, error = %e, "initialize capability rewrite failed; passing through");
                 raw.to_vec()
             }
         };
@@ -921,9 +920,9 @@ async fn forward_failed_stdio_post(
     if let Some(id) = is_recovery_tool_call(&body_bytes) {
         return restart_mcp_server(state, server_name, id).await;
     }
-    if method_name.as_deref() == Some("initialize") {
+    if let Some(response) = local_standard_mcp_response(&body_bytes) {
         mark_mcp_recovery(&state, server_name, error).await;
-        return synthetic_initialize_response(parse_jsonrpc_id(&body_bytes));
+        return response;
     }
     if method_name.as_deref() == Some("tools/list") {
         mark_mcp_recovery(&state, server_name, error.clone()).await;
@@ -952,14 +951,39 @@ async fn forward_stdio_post(
         return restart_mcp_server(state, server_name, id).await;
     }
 
+    if let Some(response) = local_standard_mcp_response(&body_bytes) {
+        return response;
+    }
+
     if let Some(blocked) = enforce_tool_call_policy(&state, server_name, &body_bytes).await {
         return Ok(blocked);
     }
 
     let method_name = parse_method(&body_bytes);
     let is_tools_list = method_name.as_deref() == Some("tools/list");
-    let is_initialize = method_name.as_deref() == Some("initialize");
-    let is_recoverable_catalog = is_recoverable_catalog_method(method_name.as_deref());
+    let tool_call = parse_tool_call(&body_bytes);
+
+    if is_tools_list || tool_call.is_some() {
+        if let Err(e) = ensure_stdio_initialized(&state, server_name, &handle).await {
+            let reason = format!("{e:#}");
+            mark_mcp_recovery(&state, server_name, reason.clone()).await;
+            if is_tools_list {
+                return recovery_tools_list_response(
+                    parse_jsonrpc_id(&body_bytes),
+                    server_name,
+                    &reason,
+                );
+            }
+            if let Some(call) = tool_call.as_ref() {
+                return recovery_tool_result_response(
+                    call.id.clone(),
+                    format!("MCP server '{server_name}' is not initialized: {reason}"),
+                    true,
+                );
+            }
+        }
+    }
+
     tracing::debug!(
         server = %server_name,
         method = method_name.as_deref().unwrap_or("<unparsed>"),
@@ -967,10 +991,25 @@ async fn forward_stdio_post(
         "forwarding POST to stdio MCP",
     );
 
-    let outcome = handle
-        .submit_post(body_bytes.to_vec())
-        .await
-        .context("stdio MCP submit failed")?;
+    let outcome = match handle.submit_post(body_bytes.to_vec()).await {
+        Ok(outcome) => outcome,
+        Err(e) if is_tools_list => {
+            let reason = format!("stdio MCP submit failed: {e:#}");
+            mark_mcp_recovery(&state, server_name, reason.clone()).await;
+            return recovery_tools_list_response(
+                parse_jsonrpc_id(&body_bytes),
+                server_name,
+                &reason,
+            );
+        }
+        Err(e) if tool_call.is_some() => {
+            let reason = format!("stdio MCP submit failed: {e:#}");
+            mark_mcp_recovery(&state, server_name, reason.clone()).await;
+            let call = tool_call.as_ref().expect("tool_call checked by guard");
+            return recovery_tool_result_response(call.id.clone(), reason, true);
+        }
+        Err(e) => return Err(e).context("stdio MCP submit failed"),
+    };
 
     // Notifications / responses to server-initiated requests: nothing to
     // wait on, confirm receipt to the HTTP caller.
@@ -980,22 +1019,37 @@ async fn forward_stdio_post(
             .body(Body::empty())?);
     };
 
-    let response_value = response_rx
-        .await
-        .map_err(|_| anyhow::anyhow!("stdio MCP dropped the response channel before answering"))?;
-    if is_recoverable_catalog {
+    let response_value = match response_rx.await {
+        Ok(value) => value,
+        Err(_) if is_tools_list => {
+            let reason = "stdio MCP dropped the tools/list response channel before answering";
+            mark_mcp_recovery(&state, server_name, reason.to_string()).await;
+            return recovery_tools_list_response(
+                parse_jsonrpc_id(&body_bytes),
+                server_name,
+                reason,
+            );
+        }
+        Err(_) if tool_call.is_some() => {
+            let reason = "stdio MCP dropped the tools/call response channel before answering";
+            mark_mcp_recovery(&state, server_name, reason.to_string()).await;
+            let call = tool_call.as_ref().expect("tool_call checked by guard");
+            return recovery_tool_result_response(call.id.clone(), reason.to_string(), true);
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "stdio MCP dropped the response channel before answering"
+            ));
+        }
+    };
+    if is_tools_list {
         if let Some(reason) = jsonrpc_error_text(&response_value) {
             mark_mcp_recovery(&state, server_name, reason.clone()).await;
-            if is_initialize {
-                return synthetic_initialize_response(parse_jsonrpc_id(&body_bytes));
-            }
-            if is_tools_list {
-                return recovery_tools_list_response(
-                    parse_jsonrpc_id(&body_bytes),
-                    server_name,
-                    &reason,
-                );
-            }
+            return recovery_tools_list_response(
+                parse_jsonrpc_id(&body_bytes),
+                server_name,
+                &reason,
+            );
         }
         clear_mcp_recovery(&state, server_name).await;
     }
@@ -1018,14 +1072,6 @@ async fn forward_stdio_post(
             Ok(filtered) => filtered,
             Err(e) => {
                 tracing::warn!(server = %server_name, error = %e, "tools/list filter failed; passing stdio response through");
-                response_bytes
-            }
-        }
-    } else if is_initialize {
-        match force_tools_list_changed_body(&response_bytes) {
-            Ok(rewritten) => rewritten,
-            Err(e) => {
-                tracing::warn!(server = %server_name, error = %e, "initialize capability rewrite failed; passing stdio response through");
                 response_bytes
             }
         }
@@ -1163,6 +1209,7 @@ async fn restart_mcp_server(
                             spec,
                             handle,
                             bridge,
+                            initialized: true,
                         },
                     );
                     clear_mcp_recovery(&state, server_name).await;
@@ -1202,6 +1249,53 @@ async fn restart_mcp_server(
             true,
         ),
     }
+}
+
+async fn ensure_http_initialized(
+    state: &BrokerState,
+    server_name: &str,
+    server: &HttpMcpServer,
+) -> Result<()> {
+    if state.http_initialized.lock().await.contains(server_name) {
+        return Ok(());
+    }
+    initialize_http_backend(state, server_name, server)
+        .await
+        .map(|_| ())?;
+    clear_mcp_recovery(state, server_name).await;
+    broadcast_tools_list_changed(state).await;
+    Ok(())
+}
+
+async fn ensure_stdio_initialized(
+    state: &BrokerState,
+    server_name: &str,
+    handle: &StdioHandle,
+) -> Result<()> {
+    let already_initialized = {
+        let mcp = state.mcp.read().await;
+        matches!(
+            mcp.get(server_name),
+            Some(McpBackend::Stdio {
+                initialized: true,
+                ..
+            })
+        )
+    };
+    if already_initialized {
+        return Ok(());
+    }
+
+    initialize_stdio_handle(handle).await?;
+
+    let mut mcp = state.mcp.write().await;
+    if let Some(McpBackend::Stdio { initialized, .. }) = mcp.get_mut(server_name) {
+        *initialized = true;
+    }
+    drop(mcp);
+    clear_mcp_recovery(state, server_name).await;
+    broadcast_tools_list_changed(state).await;
+    Ok(())
 }
 
 async fn initialize_stdio_handle(handle: &StdioHandle) -> Result<usize> {
@@ -1345,6 +1439,11 @@ async fn initialize_http_backend(
         .and_then(Value::as_array)
         .map(Vec::len)
         .context("tools/list response missing result.tools")?;
+    state
+        .http_initialized
+        .lock()
+        .await
+        .insert(server_name.to_string());
     Ok(count)
 }
 
@@ -1477,34 +1576,6 @@ fn sse_notification_frame(
             None
         }
     }
-}
-
-fn force_tools_list_changed_body(raw: &[u8]) -> Result<Vec<u8>> {
-    let mut parsed: Value =
-        serde_json::from_slice(raw).context("parsing initialize response as JSON")?;
-    let Some(result) = parsed.get_mut("result") else {
-        return serde_json::to_vec(&parsed).context("re-serialising initialize response");
-    };
-    if !result.is_object() {
-        return serde_json::to_vec(&parsed).context("re-serialising initialize response");
-    }
-
-    let result = result.as_object_mut().expect("checked object");
-    let capabilities = result.entry("capabilities").or_insert_with(|| json!({}));
-    if !capabilities.is_object() {
-        *capabilities = json!({});
-    }
-    let capabilities = capabilities.as_object_mut().expect("checked object");
-    let tools = capabilities.entry("tools").or_insert_with(|| json!({}));
-    if !tools.is_object() {
-        *tools = json!({});
-    }
-    tools
-        .as_object_mut()
-        .expect("checked object")
-        .insert("listChanged".to_string(), Value::Bool(true));
-
-    serde_json::to_vec(&parsed).context("re-serialising initialize response")
 }
 
 /// Run the tool-call allowlist gate. Returns a pre-built JSON-RPC error
@@ -1996,23 +2067,6 @@ mod tests {
         assert!(text.ends_with("\n\n"));
     }
 
-    #[test]
-    fn initialize_rewrite_advertises_tools_list_changed() {
-        let raw = br#"{
-          "jsonrpc":"2.0",
-          "id":1,
-          "result":{
-            "protocolVersion":"2025-06-18",
-            "capabilities":{"tools":{}},
-            "serverInfo":{"name":"upstream","version":"1.0.0"}
-          }
-        }"#;
-        let out = force_tools_list_changed_body(raw).unwrap();
-        let v: Value = serde_json::from_slice(&out).unwrap();
-        assert_eq!(v["result"]["capabilities"]["tools"]["listChanged"], true);
-        assert_eq!(v["result"]["serverInfo"]["name"], "upstream");
-    }
-
     #[tokio::test]
     async fn synthetic_initialize_advertises_tools_list_changed() {
         let resp = synthetic_initialize_response(Value::from(9)).unwrap();
@@ -2027,6 +2081,32 @@ mod tests {
             v["result"]["serverInfo"]["name"],
             "agent-container-recovery"
         );
+    }
+
+    #[tokio::test]
+    async fn local_standard_response_handles_handshake_without_upstream() {
+        let init = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let init_resp = local_standard_mcp_response(init).unwrap().unwrap();
+        let init_body = axum::body::to_bytes(init_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let init_json: Value = serde_json::from_slice(&init_body).unwrap();
+        assert_eq!(
+            init_json["result"]["capabilities"]["tools"]["listChanged"],
+            true
+        );
+
+        let ping = br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+        let ping_resp = local_standard_mcp_response(ping).unwrap().unwrap();
+        let ping_body = axum::body::to_bytes(ping_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ping_json: Value = serde_json::from_slice(&ping_body).unwrap();
+        assert_eq!(ping_json["result"], json!({}));
+
+        let initialized = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let initialized_resp = local_standard_mcp_response(initialized).unwrap().unwrap();
+        assert_eq!(initialized_resp.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
