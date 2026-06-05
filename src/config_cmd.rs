@@ -21,6 +21,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::mcp::{self, McpServer};
 use crate::mcp_client::{Tool, fetch_tools, fetch_tools_stdio};
+use crate::mcp_recovery;
 use crate::oauth::{OAuthStore, load_from_keychain};
 use crate::paths::HostPaths;
 use crate::policy::McpPolicy;
@@ -78,10 +79,8 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
     let merged = Settings::load_merged(&host.workspace)
         .context("failed to load agent-container settings")?;
 
-    let (claude_entries, mut skipped) =
-        fetch_tool_catalog("Claude Code", &claude_servers, &oauth).await;
-    let (codex_entries, codex_skipped) = fetch_tool_catalog("Codex", &codex_servers, &oauth).await;
-    skipped.extend(codex_skipped);
+    let claude_entries = fetch_tool_catalog("Claude Code", &claude_servers, &oauth).await;
+    let codex_entries = fetch_tool_catalog("Codex", &codex_servers, &oauth).await;
 
     if claude_servers.is_empty() {
         eprintln!(
@@ -170,15 +169,6 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
             let path = settings::path(saved_scope, &host.workspace)?;
             target.save_to(&path).context("failed to save settings")?;
             println!("Saved to {} ({:?} scope)", path.display(), saved_scope);
-            if !skipped.is_empty() {
-                println!(
-                    "Skipped {} server(s); their existing policy entries were not touched:",
-                    skipped.len()
-                );
-                for (name, err) in &skipped {
-                    println!("  {name}: {err}");
-                }
-            }
             println!("Re-run `agent-container run` to pick up changes.");
         }
         Outcome::Cancel => {
@@ -293,11 +283,10 @@ async fn fetch_tool_catalog(
     label: &str,
     servers: &[McpServer],
     oauth: &Arc<OAuthStore>,
-) -> (Vec<ToolEntry>, Vec<(String, String)>) {
+) -> Vec<ToolEntry> {
     let mut entries = Vec::new();
-    let mut skipped = Vec::new();
     if servers.is_empty() {
-        return (entries, skipped);
+        return entries;
     }
 
     println!(
@@ -335,8 +324,17 @@ async fn fetch_tool_catalog(
                 }
             }
             Err(e) => {
-                println!("  {label}: {} ({})... FAILED ({e:#})", name, transport);
-                skipped.push((format!("{label}/{name}"), format!("{e:#}")));
+                let reason = format!("{e:#}");
+                println!(
+                    "  {label}: {} ({})... FAILED ({reason}; showing restart tool)",
+                    name, transport
+                );
+                entries.push(ToolEntry {
+                    server_name: name.clone(),
+                    tool_name: mcp_recovery::TOOL_NAME.to_string(),
+                    description: mcp_recovery::tool_description(&name, Some(&reason)),
+                    read_only_hint: Some(false),
+                });
             }
         }
     }
@@ -345,7 +343,7 @@ async fn fetch_tool_catalog(
             .cmp(&b.server_name)
             .then_with(|| a.tool_name.cmp(&b.tool_name))
     });
-    (entries, skipped)
+    entries
 }
 
 async fn fetch_any_with_timeout(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> {

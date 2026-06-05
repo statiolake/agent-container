@@ -22,7 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone)]
 pub struct McpOAuthEntry {
@@ -155,7 +155,7 @@ fn parse_entry(keychain_key: &str, value: &Value) -> Result<McpOAuthEntry> {
 
 /// Live-refresh wrapper over the Keychain snapshot.
 pub struct OAuthStore {
-    entries: HashMap<String, Arc<Mutex<McpOAuthEntry>>>,
+    entries: RwLock<HashMap<String, Arc<Mutex<McpOAuthEntry>>>>,
     http: reqwest::Client,
 }
 
@@ -169,7 +169,10 @@ impl OAuthStore {
             .into_iter()
             .map(|(k, v)| (k, Arc::new(Mutex::new(v))))
             .collect();
-        Self { entries, http }
+        Self {
+            entries: RwLock::new(entries),
+            http,
+        }
     }
 
     /// Return a currently-valid access token for an MCP server, refreshing
@@ -177,7 +180,11 @@ impl OAuthStore {
     /// has no OAuth record and the caller should fall back to static
     /// headers from `.claude.json`.
     pub async fn access_token(&self, server: &str) -> Result<Option<String>> {
-        let Some(slot) = self.entries.get(server) else {
+        let slot = {
+            let entries = self.entries.read().await;
+            entries.get(server).cloned()
+        };
+        let Some(slot) = slot else {
             return Ok(None);
         };
         let mut guard = slot.lock().await;
@@ -185,6 +192,47 @@ impl OAuthStore {
             refresh_entry(&mut guard, &self.http)
                 .await
                 .with_context(|| format!("failed to refresh OAuth token for '{server}'"))?;
+        }
+        Ok(Some(guard.access_token.clone()))
+    }
+
+    /// Force a refresh for a server during MCP recovery. If the in-memory
+    /// refresh path fails, reload Claude Code's current Keychain snapshot
+    /// and use any newer entry it contains.
+    pub async fn refresh_or_reload(&self, server: &str) -> Result<Option<String>> {
+        let slot = {
+            let entries = self.entries.read().await;
+            entries.get(server).cloned()
+        };
+        if let Some(slot) = slot {
+            let mut guard = slot.lock().await;
+            if refresh_entry(&mut guard, &self.http).await.is_ok() {
+                return Ok(Some(guard.access_token.clone()));
+            }
+        }
+
+        let server_name = server.to_string();
+        let loaded = tokio::task::spawn_blocking(load_from_keychain)
+            .await
+            .context("joining Keychain reload task")?
+            .context("failed to reload MCP OAuth entries from Keychain")?;
+        let Some(entry) = loaded.get(&server_name).cloned() else {
+            return Ok(None);
+        };
+
+        let slot = Arc::new(Mutex::new(entry));
+        {
+            let mut entries = self.entries.write().await;
+            entries.insert(server_name.clone(), slot.clone());
+        }
+
+        let mut guard = slot.lock().await;
+        if guard.is_expiring_soon() {
+            refresh_entry(&mut guard, &self.http)
+                .await
+                .with_context(|| {
+                    format!("failed to refresh reloaded OAuth token for '{server}'")
+                })?;
         }
         Ok(Some(guard.access_token.clone()))
     }

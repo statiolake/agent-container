@@ -8,6 +8,7 @@ mod host_fs;
 mod host_kind;
 mod mcp;
 mod mcp_client;
+mod mcp_recovery;
 mod oauth;
 mod paths;
 mod policy;
