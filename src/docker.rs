@@ -318,15 +318,45 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     if !opts.extra_args.is_empty() {
         cmd.args(&opts.extra_args);
     }
-    let status = cmd
-        .status()
-        .await
-        .context("failed to spawn docker compose run");
+    let child = cmd.spawn().context("failed to spawn docker compose run");
+    let status = match child {
+        Ok(child) => wait_agent_or_interrupt(child).await,
+        Err(e) => Err(e),
+    };
     proxy_reload.abort();
-    let status = status?;
+    let exit = status?;
 
     // `_cleanup` runs `compose down` on scope exit.
-    Ok(status.code().unwrap_or(1))
+    Ok(exit)
+}
+
+async fn wait_agent_or_interrupt(mut child: tokio::process::Child) -> Result<i32> {
+    tokio::select! {
+        status = child.wait() => {
+            let status = status.context("failed to wait for docker compose run")?;
+            Ok(status.code().unwrap_or(1))
+        }
+        signal = tokio::signal::ctrl_c() => {
+            if let Err(e) = signal {
+                eprintln!("[agent-container] warning: failed to install Ctrl+C handler: {e}");
+            }
+            eprintln!("[agent-container] interrupt received; cleaning up compose stack...");
+
+            match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+                Ok(Ok(status)) => return Ok(status.code().unwrap_or(130)),
+                Ok(Err(e)) => {
+                    eprintln!("[agent-container] warning: failed to wait for interrupted compose run: {e}");
+                    return Ok(130);
+                }
+                Err(_) => {}
+            }
+
+            if let Err(e) = child.kill().await {
+                eprintln!("[agent-container] warning: failed to stop docker compose run after interrupt: {e}");
+            }
+            Ok(130)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
