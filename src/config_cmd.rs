@@ -314,6 +314,9 @@ async fn fetch_tool_catalog(
                     tools.len()
                 );
                 for tool in tools {
+                    if tool.name == mcp_recovery::TOOL_NAME {
+                        continue;
+                    }
                     let read_only_hint = tool.read_only_hint();
                     entries.push(ToolEntry {
                         server_name: name.clone(),
@@ -322,6 +325,12 @@ async fn fetch_tool_catalog(
                         read_only_hint,
                     });
                 }
+                entries.push(ToolEntry {
+                    server_name: name.clone(),
+                    tool_name: mcp_recovery::TOOL_NAME.to_string(),
+                    description: mcp_recovery::tool_description(&name, None),
+                    read_only_hint: Some(false),
+                });
             }
             Err(e) => {
                 let reason = format!("{e:#}");

@@ -1,4 +1,4 @@
-pub const TOOL_NAME: &str = "agent_container_restart_mcp";
+pub const TOOL_NAME: &str = "__agent_container_restart_mcp_server__";
 
 pub fn tool_description(server_name: &str, reason: Option<&str>) -> String {
     let mut description = format!(

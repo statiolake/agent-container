@@ -1638,7 +1638,7 @@ async fn filter_tools_list_value(
     let mut cache = annotations.lock().await;
     let server_cache = cache.entry(server_name.to_string()).or_default();
 
-    let mut kept = Vec::with_capacity(tools.len());
+    let mut kept = Vec::with_capacity(tools.len() + 1);
     for tool in tools.drain(..) {
         let name = tool.get("name").and_then(Value::as_str).map(String::from);
         let read_only = tool
@@ -1651,10 +1651,15 @@ async fn filter_tools_list_value(
         let Some(n) = name else {
             continue;
         };
+        if n == mcp_recovery::TOOL_NAME {
+            continue;
+        }
         if policy_snapshot.tool_allowed(server_name, &n, read_only) {
             kept.push(tool);
         }
     }
+    server_cache.insert(mcp_recovery::TOOL_NAME.to_string(), Some(false));
+    kept.push(recovery_tool_json(server_name, None));
     *tools = kept;
     true
 }
@@ -1846,11 +1851,15 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["read_file"]);
+        assert_eq!(names, vec!["read_file", mcp_recovery::TOOL_NAME]);
         // annotations cache populated.
         let cache = ann.lock().await;
         assert_eq!(
             cache["srv"].get("delete_file").copied().flatten(),
+            Some(false)
+        );
+        assert_eq!(
+            cache["srv"].get(mcp_recovery::TOOL_NAME).copied().flatten(),
             Some(false)
         );
     }
@@ -1879,7 +1888,10 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["read_file", "delete_file"]);
+        assert_eq!(
+            names,
+            vec!["read_file", "delete_file", mcp_recovery::TOOL_NAME]
+        );
     }
 
     #[tokio::test]
@@ -1903,7 +1915,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["read_file"]);
+        assert_eq!(names, vec!["read_file", mcp_recovery::TOOL_NAME]);
         // Cache populated by the SSE path, so tools/call can decide.
         let cache = ann.lock().await;
         assert_eq!(
@@ -2011,6 +2023,7 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         let arr = v["result"]["tools"].as_array().unwrap();
-        assert!(arr.is_empty());
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], mcp_recovery::TOOL_NAME);
     }
 }
