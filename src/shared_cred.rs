@@ -3,13 +3,15 @@
 //! Several `agent-container` invocations on the same host need to share
 //! a single credential file so that an OAuth refresh inside one
 //! container is visible to the others (and to the host on shutdown).
-//! Each container takes a `flock(LOCK_SH)` on a sidecar lock file for
-//! the lifetime of its `agent-container` process. On exit the process
-//! releases the shared lock and tries to upgrade to `LOCK_EX |
-//! LOCK_NB`; if the upgrade succeeds, no sibling is still alive, so
-//! the process owns the cleanup pass — read the (possibly refreshed)
-//! shared file, write it back to the host (Keychain on macOS, file
-//! elsewhere), then unlink the shared copy.
+//! A sidecar lock file, not the credential file's existence, is the
+//! source of truth: if a new invocation can take `LOCK_EX | LOCK_NB`,
+//! there are no live siblings and any leftover shared credential is
+//! stale, so it is recreated from the host. The invocation then holds
+//! `LOCK_SH` for its lifetime. On exit it tries to upgrade back to
+//! `LOCK_EX | LOCK_NB`; if the upgrade succeeds, no sibling is still
+//! alive, so the process owns the cleanup pass — read the possibly
+//! refreshed shared file, write it back to the host, then unlink the
+//! shared copy.
 //!
 //! The OS releases the shared lock automatically when the FD is closed
 //! (including on `SIGKILL`), so PID-based ref-counting isn't needed.
@@ -36,7 +38,7 @@ pub enum HostSync {
         service: String,
         account: Option<String>,
     },
-    /// Linux (and Codex everywhere): atomically replace the host file.
+    /// Linux: atomically replace the host file.
     File(PathBuf),
 }
 
@@ -50,10 +52,11 @@ pub struct SharedCredFile {
 }
 
 impl SharedCredFile {
-    /// Open the shared credential file (creating it from `loader` when
-    /// no other container has populated it yet) and take a shared lock
-    /// on its sidecar lock file. Returns the handle plus the raw
-    /// credential bytes, so the caller can parse fields like `expires_at`.
+    /// Open the shared credential file and take a shared lock on its
+    /// sidecar lock file. If no live sibling holds the lock, the shared
+    /// file is recreated from `loader` even when an old copy exists.
+    /// Returns the handle plus the raw credential bytes, so the caller
+    /// can parse fields like `expires_at`.
     pub fn open(
         shared_path: PathBuf,
         host_sync: HostSync,
@@ -65,29 +68,40 @@ impl SharedCredFile {
         }
         let lock_path = lock_path_for(&shared_path);
 
-        // The lock file's existence (not the credential file's) decides
-        // ownership. Create-if-missing is fine: it has no secret content.
         let lock_file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("failed to open lock at {}", lock_path.display()))?;
-        flock(&lock_file, FlockOperation::LockShared)
-            .with_context(|| format!("failed to take shared lock on {}", lock_path.display()))?;
 
-        let raw = if shared_file_is_populated(&shared_path) {
+        let owns_fresh_session =
+            flock(&lock_file, FlockOperation::NonBlockingLockExclusive).is_ok();
+
+        let raw = if owns_fresh_session {
+            let raw = loader()?;
+            write_secret_atomic(&shared_path, raw.trim())?;
+            raw
+        } else {
+            flock(&lock_file, FlockOperation::LockShared).with_context(|| {
+                format!("failed to take shared lock on {}", lock_path.display())
+            })?;
             fs::read_to_string(&shared_path).with_context(|| {
                 format!(
                     "failed to read shared credentials at {}",
                     shared_path.display()
                 )
             })?
-        } else {
-            let raw = loader()?;
-            write_secret_atomic(&shared_path, raw.trim())?;
-            raw
         };
+
+        if owns_fresh_session {
+            flock(&lock_file, FlockOperation::LockShared).with_context(|| {
+                format!(
+                    "failed to downgrade lock to shared at {}",
+                    lock_path.display()
+                )
+            })?;
+        }
 
         Ok((
             Self {
@@ -99,10 +113,6 @@ impl SharedCredFile {
             raw,
         ))
     }
-}
-
-fn shared_file_is_populated(p: &Path) -> bool {
-    fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false)
 }
 
 fn lock_path_for(p: &Path) -> PathBuf {
@@ -231,6 +241,22 @@ mod tests {
             assert_eq!(raw2, "payload-v1");
             assert_eq!(calls.get(), 1);
         }
+    }
+
+    #[test]
+    fn stale_shared_file_is_recreated_when_lock_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("creds.json");
+        let dest = dir.path().join("host.json");
+        fs::write(&shared, "stale").unwrap();
+
+        let (_handle, raw) = SharedCredFile::open(shared.clone(), HostSync::File(dest), || {
+            Ok("fresh".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(raw, "fresh");
+        assert_eq!(fs::read_to_string(&shared).unwrap(), "fresh");
     }
 
     #[test]
