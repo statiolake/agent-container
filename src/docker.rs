@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, IsTerminal};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as StdCommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -276,30 +278,25 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     struct Cleanup<'a>(&'a ComposeCtx);
     impl<'a> Drop for Cleanup<'a> {
         fn drop(&mut self) {
-            let ctx = self.0;
-            let status = std::process::Command::new("docker")
-                .args(["compose", "-p", &ctx.project])
-                .args(ctx.compose_file_args())
-                .args(["down", "--remove-orphans", "--timeout", "5"])
-                .envs(&ctx.env)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            if let Err(e) = status {
-                eprintln!("[agent-container] warning: compose down failed: {e}");
+            if let Err(e) = compose_down_sync(self.0) {
+                eprintln!("[agent-container] warning: compose down failed: {e:#}");
             }
         }
     }
     let _cleanup = Cleanup(&ctx);
 
     // 1) Start the forward proxy sidecar in the background.
-    let status = ctx
+    let proxy_up = ctx
         .compose(&["up", "-d", "--no-color", "proxy"])
-        .status()
-        .await
+        .spawn()
         .context("failed to spawn docker compose up")?;
+    let proxy_up =
+        wait_compose_child_or_interrupt(proxy_up, ctx.clone(), "docker compose up").await?;
+    let ChildExit::Exited(status) = proxy_up else {
+        return Ok(130);
+    };
     if !status.success() {
-        bail!("`docker compose up -d proxy` failed");
+        bail!("`docker compose up -d proxy` failed with status {status}");
     }
     let proxy_reload = tokio::spawn(watch_proxy_settings(
         ctx.clone(),
@@ -318,23 +315,32 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     if !opts.extra_args.is_empty() {
         cmd.args(&opts.extra_args);
     }
-    let child = cmd.spawn().context("failed to spawn docker compose run");
-    let status = match child {
-        Ok(child) => wait_agent_or_interrupt(child).await,
-        Err(e) => Err(e),
-    };
+    let child = cmd.spawn().context("failed to spawn docker compose run")?;
+    let status = wait_compose_child_or_interrupt(child, ctx.clone(), "docker compose run").await;
     proxy_reload.abort();
-    let exit = status?;
+    let exit = match status? {
+        ChildExit::Exited(status) => status.code().unwrap_or(1),
+        ChildExit::Interrupted => 130,
+    };
 
     // `_cleanup` runs `compose down` on scope exit.
     Ok(exit)
 }
 
-async fn wait_agent_or_interrupt(mut child: tokio::process::Child) -> Result<i32> {
+enum ChildExit {
+    Exited(std::process::ExitStatus),
+    Interrupted,
+}
+
+async fn wait_compose_child_or_interrupt(
+    mut child: tokio::process::Child,
+    ctx: ComposeCtx,
+    label: &str,
+) -> Result<ChildExit> {
     tokio::select! {
         status = child.wait() => {
-            let status = status.context("failed to wait for docker compose run")?;
-            Ok(status.code().unwrap_or(1))
+            let status = status.with_context(|| format!("failed to wait for {label}"))?;
+            Ok(ChildExit::Exited(status))
         }
         signal = tokio::signal::ctrl_c() => {
             if let Err(e) = signal {
@@ -343,19 +349,53 @@ async fn wait_agent_or_interrupt(mut child: tokio::process::Child) -> Result<i32
             eprintln!("[agent-container] interrupt received; cleaning up compose stack...");
 
             match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
-                Ok(Ok(status)) => return Ok(status.code().unwrap_or(130)),
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    eprintln!("[agent-container] warning: failed to wait for interrupted compose run: {e}");
-                    return Ok(130);
+                    eprintln!("[agent-container] warning: failed to wait for interrupted {label}: {e}");
                 }
-                Err(_) => {}
+                Err(_) => {
+                    match tokio::time::timeout(Duration::from_secs(2), child.kill()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            eprintln!("[agent-container] warning: failed to stop {label} after interrupt: {e}");
+                        }
+                        Err(_) => {
+                            eprintln!("[agent-container] warning: timed out stopping {label} after interrupt");
+                        }
+                    }
+                }
             }
 
-            if let Err(e) = child.kill().await {
-                eprintln!("[agent-container] warning: failed to stop docker compose run after interrupt: {e}");
+            if let Err(e) = compose_down_sync(&ctx) {
+                eprintln!("[agent-container] warning: compose down after interrupt failed: {e:#}");
             }
-            Ok(130)
+            Ok(ChildExit::Interrupted)
         }
+    }
+}
+
+fn compose_down_sync(ctx: &ComposeCtx) -> Result<()> {
+    let mut cmd = std::process::Command::new("docker");
+    cmd.args(["compose", "-p", &ctx.project])
+        .args(ctx.compose_file_args())
+        .args(["down", "--remove-orphans", "--timeout", "5"])
+        .envs(&ctx.env)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    detach_from_terminal_interrupts(&mut cmd);
+    let status = cmd
+        .status()
+        .context("failed to spawn docker compose down")?;
+    if !status.success() {
+        bail!("`docker compose down` failed with status {status}");
+    }
+    Ok(())
+}
+
+fn detach_from_terminal_interrupts(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
     }
 }
 
