@@ -552,18 +552,6 @@ async fn forward_http(
     let mut headers = reqwest::header::HeaderMap::new();
     copy_request_headers(&parts.headers, &mut headers);
     apply_server_auth(&server.headers, &mut headers)?;
-    if let Some(token) = state
-        .oauth
-        .access_token(server_name)
-        .await
-        .with_context(|| format!("refreshing OAuth token for '{server_name}'"))?
-    {
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-                .context("building OAuth Bearer header")?,
-        );
-    }
 
     let body_bytes = axum::body::to_bytes(body, usize::MAX)
         .await
@@ -581,6 +569,32 @@ async fn forward_http(
     let is_tools_list = method_name.as_deref() == Some("tools/list");
     let is_initialize = method_name.as_deref() == Some("initialize");
     let is_recoverable_catalog = is_recoverable_catalog_method(method_name.as_deref());
+
+    match state.oauth.access_token(server_name).await {
+        Ok(Some(token)) => {
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .context("building OAuth Bearer header")?,
+            );
+        }
+        Ok(None) => {}
+        Err(e) if is_recoverable_catalog => {
+            let reason = format!("failed to refresh OAuth token for '{server_name}': {e:#}");
+            mark_mcp_recovery(&state, server_name, reason.clone()).await;
+            if is_initialize {
+                return synthetic_initialize_response(parse_jsonrpc_id(&body_bytes));
+            }
+            return recovery_tools_list_response(
+                parse_jsonrpc_id(&body_bytes),
+                server_name,
+                &reason,
+            );
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("refreshing OAuth token for '{server_name}'"));
+        }
+    }
 
     if !is_initialize {
         if let Some(session) = state.http_sessions.lock().await.get(server_name).cloned() {
