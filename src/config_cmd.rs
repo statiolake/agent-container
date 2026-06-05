@@ -21,7 +21,6 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::mcp::{self, McpServer};
 use crate::mcp_client::{Tool, fetch_tools, fetch_tools_stdio};
-use crate::mcp_recovery;
 use crate::oauth::{OAuthStore, load_from_keychain};
 use crate::paths::HostPaths;
 use crate::policy::McpPolicy;
@@ -314,9 +313,6 @@ async fn fetch_tool_catalog(
                     tools.len()
                 );
                 for tool in tools {
-                    if tool.name == mcp_recovery::TOOL_NAME {
-                        continue;
-                    }
                     let read_only_hint = tool.read_only_hint();
                     entries.push(ToolEntry {
                         server_name: name.clone(),
@@ -325,25 +321,10 @@ async fn fetch_tool_catalog(
                         read_only_hint,
                     });
                 }
-                entries.push(ToolEntry {
-                    server_name: name.clone(),
-                    tool_name: mcp_recovery::TOOL_NAME.to_string(),
-                    description: mcp_recovery::tool_description(&name, None),
-                    read_only_hint: Some(false),
-                });
             }
             Err(e) => {
                 let reason = format!("{e:#}");
-                println!(
-                    "  {label}: {} ({})... FAILED ({reason}; showing restart tool)",
-                    name, transport
-                );
-                entries.push(ToolEntry {
-                    server_name: name.clone(),
-                    tool_name: mcp_recovery::TOOL_NAME.to_string(),
-                    description: mcp_recovery::tool_description(&name, Some(&reason)),
-                    read_only_hint: Some(false),
-                });
+                println!("  {label}: {} ({})... FAILED ({reason})", name, transport);
             }
         }
     }
