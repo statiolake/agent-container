@@ -26,7 +26,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rustix::fs::{FlockOperation, flock};
 
 /// Where to write the credential bytes back to the host when the last
@@ -34,11 +34,13 @@ use rustix::fs::{FlockOperation, flock};
 pub enum HostSync {
     /// macOS: update a `generic-password` Keychain item via `security
     /// add-generic-password -U`.
+    #[cfg(target_os = "macos")]
     Keychain {
         service: String,
         account: Option<String>,
     },
     /// Linux: atomically replace the host file.
+    #[cfg(any(not(target_os = "macos"), test))]
     File(PathBuf),
 }
 
@@ -180,6 +182,7 @@ impl Drop for SharedCredFile {
 impl HostSync {
     fn apply(&self, raw: &str) -> Result<()> {
         match self {
+            #[cfg(target_os = "macos")]
             HostSync::Keychain { service, account } => {
                 let mut cmd = std::process::Command::new("security");
                 cmd.args(["add-generic-password", "-U", "-s", service, "-w", raw]);
@@ -188,10 +191,11 @@ impl HostSync {
                 }
                 let status = cmd.status().context("failed to invoke `security`")?;
                 if !status.success() {
-                    bail!("security add-generic-password exited with {status}");
+                    anyhow::bail!("security add-generic-password exited with {status}");
                 }
                 Ok(())
             }
+            #[cfg(any(not(target_os = "macos"), test))]
             HostSync::File(path) => {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)
