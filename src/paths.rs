@@ -26,18 +26,12 @@ impl HostPaths {
         })
     }
 
-    pub fn host_project_dir(&self) -> PathBuf {
-        self.claude_root
-            .join("projects")
-            .join(encode_project_dir(&self.workspace))
-    }
-
     pub fn container_workspace(&self) -> &Path {
         &self.workspace
     }
 
-    pub fn container_project_dir_name(&self) -> String {
-        encode_project_dir(self.container_workspace())
+    pub fn host_claude_projects_dir(&self) -> PathBuf {
+        self.claude_root.join("projects")
     }
 
     pub fn host_claude_md(&self) -> PathBuf {
@@ -56,33 +50,9 @@ fn detect_container_home() -> Result<PathBuf> {
     Ok(dirs.data_local_dir().join("home"))
 }
 
-/// Convert an absolute path to the directory name Claude Code uses under
-/// `~/.claude/projects/`. Claude Code replaces path separators and `.` with
-/// `-`.
-pub fn encode_project_dir<P: AsRef<Path>>(path: P) -> String {
-    let path = path.as_ref();
-    let s = path.to_string_lossy();
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '/' | '\\' | '.' | ':' => out.push('-'),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn encodes_like_claude_code() {
-        assert_eq!(
-            encode_project_dir("/home/user/projects/agent-container"),
-            "-home-user-projects-agent-container"
-        );
-    }
 
     #[test]
     fn container_workspace_uses_host_path_identity() {
@@ -95,6 +65,9 @@ mod tests {
         };
 
         assert_eq!(paths.container_workspace(), workspace.as_path());
-        assert_eq!(paths.container_project_dir_name(), "-Users-example-repo");
+        assert_eq!(
+            paths.host_claude_projects_dir(),
+            PathBuf::from("/Users/example/.claude/projects")
+        );
     }
 }

@@ -111,9 +111,10 @@ An explicit `--agent` flag always wins over the setting.
 Both agents' auth is bind-mounted regardless of which one is the
 primary, so a Claude session can call `codex exec …` as a shell tool
 and vice versa. In either mode the workspace is the current directory,
-mounted at the same absolute path inside the container, and
-`~/.claude/projects/<cwd-encoded>/` keeps the session history on the
-host. Codex history/resume files under `~/.codex/sessions`,
+mounted at the same absolute path inside the container, and the host
+`~/.claude/projects/` tree keeps Claude Code session history visible
+even if Claude Code changes how it names per-workspace session
+directories. Codex history/resume files under `~/.codex/sessions`,
 `~/.codex/archived_sessions`, `~/.codex/shell_snapshots`,
 `~/.codex/session_index.jsonl`, and `~/.codex/history.jsonl` are mounted from
 the host, so sessions created in the container are visible to host Codex too.

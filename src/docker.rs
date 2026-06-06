@@ -101,11 +101,11 @@ pub struct RunOptions {
 
 /// Orchestrate the compose project: start relay, run agent, always tear down.
 pub async fn run(opts: RunOptions) -> Result<i32> {
-    let host_project_dir = opts.host.host_project_dir();
-    std::fs::create_dir_all(&host_project_dir).with_context(|| {
+    let host_claude_projects_dir = opts.host.host_claude_projects_dir();
+    std::fs::create_dir_all(&host_claude_projects_dir).with_context(|| {
         format!(
-            "failed to prepare session dir {}",
-            host_project_dir.display()
+            "failed to prepare Claude projects dir {}",
+            host_claude_projects_dir.display()
         )
     })?;
     std::fs::create_dir_all(&opts.host.container_home).with_context(|| {
@@ -164,10 +164,9 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
             "CONTAINER_HOME_PATH",
             opts.host.container_home.display().to_string(),
         ),
-        ("HOST_PROJECT_DIR", host_project_dir.display().to_string()),
         (
-            "CONTAINER_PROJECT_DIR_NAME",
-            opts.host.container_project_dir_name(),
+            "HOST_CLAUDE_PROJECTS_DIR",
+            host_claude_projects_dir.display().to_string(),
         ),
         (
             "WORKSPACE_AGENT_CONTAINER_MOUNT_SRC",

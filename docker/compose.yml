@@ -58,7 +58,7 @@ services:
       - "${CONTAINER_HOME_PATH}:/home/agent"
       - "${WORKSPACE_PATH}:${CONTAINER_WORKSPACE_PATH}"
       - "${WORKSPACE_AGENT_CONTAINER_MOUNT_SRC}:${CONTAINER_WORKSPACE_PATH}/.agent-container:ro"
-      - "${HOST_PROJECT_DIR}:/home/agent/.claude/projects/${CONTAINER_PROJECT_DIR_NAME}"
+      - "${HOST_CLAUDE_PROJECTS_DIR}:/home/agent/.claude/projects"
       - "${CREDENTIALS_PATH}:/home/agent/.claude/.credentials.json"
       - "${CLAUDE_MD_MOUNT_SRC}:/home/agent/.claude/CLAUDE.md:ro"
       - "${CODEX_AUTH_PATH}:/home/agent/.codex/auth.json"
