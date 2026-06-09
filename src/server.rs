@@ -462,40 +462,11 @@ fn synthetic_initialize_response(id: Value) -> Result<Response> {
 }
 
 fn recovery_tools_list_response(id: Value, server_name: &str, reason: &str) -> Result<Response> {
-    json_response_value(json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "tools": [recovery_tool_json(server_name, Some(reason))]
-        }
-    }))
+    json_response_value(mcp_recovery::tools_list_response(id, server_name, reason))
 }
 
 fn recovery_tool_result_response(id: Value, message: String, is_error: bool) -> Result<Response> {
-    json_response_value(json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "content": [{"type": "text", "text": message}],
-            "isError": is_error
-        }
-    }))
-}
-
-fn recovery_tool_json(server_name: &str, reason: Option<&str>) -> Value {
-    json!({
-        "name": mcp_recovery::TOOL_NAME,
-        "description": mcp_recovery::tool_description(server_name, reason),
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        },
-        "annotations": {
-            "readOnlyHint": false,
-            "destructiveHint": false
-        }
-    })
+    json_response_value(mcp_recovery::tool_result_response(id, message, is_error))
 }
 
 async fn mark_mcp_recovery(state: &BrokerState, server_name: &str, reason: String) {
@@ -1730,7 +1701,7 @@ async fn filter_tools_list_value(
         }
     }
     server_cache.insert(mcp_recovery::TOOL_NAME.to_string(), Some(false));
-    kept.push(recovery_tool_json(server_name, None));
+    kept.push(mcp_recovery::tool_json(server_name, None));
     *tools = kept;
     true
 }
