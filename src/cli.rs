@@ -76,6 +76,15 @@ pub enum Commands {
         #[arg(long)]
         editor: bool,
     },
+
+    /// Manage MCP server state used by agent-container.
+    Mcp {
+        /// Which agent's MCP server declarations to use.
+        #[arg(long, value_enum)]
+        agent: AgentKind,
+        #[command(subcommand)]
+        command: McpCommands,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -100,6 +109,15 @@ pub enum ConfigCommands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum McpCommands {
+    /// Authenticate an HTTP MCP server with OAuth 2.1 + PKCE.
+    Auth {
+        /// MCP server name as declared in the selected agent's config.
+        server: String,
+    },
+}
+
 const TOP_LEVEL_HELP: &str = r#"Run Claude Code or Codex inside a Docker sandbox around the current workspace.
 
 agent-container keeps the workspace writable, but moves credentials, network
@@ -119,7 +137,8 @@ const TOP_LEVEL_EXAMPLES: &str = r#"Examples:
   agent-container shell
   agent-container shell -- cat /etc/resolv.conf
   agent-container config
-  agent-container config show --workspace"#;
+  agent-container config show --workspace
+  agent-container mcp --agent claude auth notion"#;
 
 const RUN_HELP: &str = r#"Launch a coding agent inside the sandbox container.
 
@@ -296,5 +315,25 @@ mod tests {
 
         assert!(Cli::try_parse_from(["agent-container", "shell", "cat"]).is_err());
         assert!(Cli::try_parse_from(["agent-container", "shell", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn mcp_auth_selects_agent_and_server() {
+        let cli = Cli::try_parse_from([
+            "agent-container",
+            "mcp",
+            "--agent",
+            "claude",
+            "auth",
+            "notion",
+        ])
+        .unwrap();
+
+        let Commands::Mcp { agent, command } = cli.command else {
+            panic!("expected mcp command");
+        };
+        assert_eq!(agent, AgentKind::Claude);
+        let McpCommands::Auth { server } = command;
+        assert_eq!(server, "notion");
     }
 }

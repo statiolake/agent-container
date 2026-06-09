@@ -7,6 +7,7 @@ mod docker;
 mod host_fs;
 mod host_kind;
 mod mcp;
+mod mcp_auth;
 mod mcp_client;
 mod mcp_recovery;
 mod oauth;
@@ -25,10 +26,10 @@ mod tui;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-use crate::cli::{AgentKind, Cli, Commands, ConfigCommands};
+use crate::cli::{AgentKind, Cli, Commands, ConfigCommands, McpCommands};
 
 /// Initialise the tracing subscriber.
 ///
@@ -136,7 +137,32 @@ async fn main() -> Result<()> {
             workspace,
             editor,
         } => dispatch_config(command, global, workspace, editor).await,
+        Commands::Mcp { agent, command } => dispatch_mcp(agent, command).await,
     }
+}
+
+async fn dispatch_mcp(agent: AgentKind, command: McpCommands) -> Result<()> {
+    match command {
+        McpCommands::Auth { server } => mcp_auth_cmd(agent, &server).await,
+    }
+}
+
+async fn mcp_auth_cmd(agent: AgentKind, server_name: &str) -> Result<()> {
+    let host = paths::HostPaths::detect()?;
+    let servers = match agent {
+        AgentKind::Claude => mcp::load_servers(&host.home.join(".claude.json"))
+            .context("failed to load MCP servers from ~/.claude.json")?,
+        AgentKind::Codex => mcp::load_codex_servers(&host.home.join(".codex/config.toml"))
+            .context("failed to load MCP servers from ~/.codex/config.toml")?,
+    };
+    let server = servers
+        .iter()
+        .find(|server| server.name() == server_name)
+        .with_context(|| format!("MCP server '{server_name}' is not declared for {agent:?}"))?;
+    let mcp::McpServer::Http(server) = server else {
+        bail!("MCP server '{server_name}' uses stdio; MCP OAuth applies only to HTTP transports");
+    };
+    mcp_auth::authenticate(server).await
 }
 
 async fn dispatch_config(

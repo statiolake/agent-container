@@ -27,6 +27,7 @@ use tokio::sync::{Mutex, RwLock};
 #[derive(Debug, Clone)]
 pub struct McpOAuthEntry {
     pub server_name: String,
+    pub server_url: Option<String>,
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at_ms: Option<i64>,
@@ -57,6 +58,8 @@ pub fn now_ms() -> i64 {
 struct RawEntry {
     #[serde(default, rename = "serverName")]
     server_name: Option<String>,
+    #[serde(default, rename = "serverUrl")]
+    server_url: Option<String>,
     #[serde(default, rename = "accessToken")]
     access_token: Option<String>,
     #[serde(default, rename = "refreshToken")]
@@ -144,6 +147,7 @@ fn parse_entry(keychain_key: &str, value: &Value) -> Result<McpOAuthEntry> {
 
     Ok(McpOAuthEntry {
         server_name,
+        server_url: raw.server_url,
         access_token,
         refresh_token: raw.refresh_token,
         expires_at_ms: raw.expires_at,
@@ -151,6 +155,150 @@ fn parse_entry(keychain_key: &str, value: &Value) -> Result<McpOAuthEntry> {
         authorization_server_url: raw.discovery_state.and_then(|d| d.authorization_server_url),
         scope: raw.scope,
     })
+}
+
+pub fn save_to_keychain(entry: &McpOAuthEntry) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut cfg = load_raw_keychain_json()?.unwrap_or_else(|| {
+            serde_json::json!({
+                "claudeAiOauth": {},
+                "mcpOAuth": {}
+            })
+        });
+        if !cfg.is_object() {
+            cfg = Value::Object(serde_json::Map::new());
+        }
+        let obj = cfg.as_object_mut().expect("cfg object");
+        let mcp = obj
+            .entry("mcpOAuth".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !mcp.is_object() {
+            *mcp = Value::Object(serde_json::Map::new());
+        }
+        let mcp = mcp.as_object_mut().expect("mcpOAuth object");
+        let key = oauth_key(entry);
+        mcp.insert(key, entry_to_value(entry));
+        write_raw_keychain_json(&cfg)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = entry;
+        bail!("MCP OAuth storage is currently supported only on macOS Keychain")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn load_raw_keychain_json() -> Result<Option<Value>> {
+    let output = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-w",
+            "-s",
+            "Claude Code-credentials",
+        ])
+        .output()
+        .context("failed to invoke `security` command")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let raw = String::from_utf8(output.stdout).context("keychain entry was not valid UTF-8")?;
+    let cfg: Value = serde_json::from_str(raw.trim()).context("keychain JSON parse")?;
+    Ok(Some(cfg))
+}
+
+#[cfg(target_os = "macos")]
+fn write_raw_keychain_json(cfg: &Value) -> Result<()> {
+    let raw = serde_json::to_string(cfg).context("serialising Keychain credentials JSON")?;
+    let account = keychain_account().unwrap_or_else(|| "Claude Code".to_string());
+    let status = std::process::Command::new("security")
+        .args([
+            "add-generic-password",
+            "-U",
+            "-s",
+            "Claude Code-credentials",
+            "-a",
+            &account,
+            "-w",
+            &raw,
+        ])
+        .status()
+        .context("failed to invoke `security` command")?;
+    if !status.success() {
+        bail!("security add-generic-password exited with {status}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_account() -> Option<String> {
+    let output = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-g",
+        ])
+        .output()
+        .ok()?;
+    let stderr = String::from_utf8(output.stderr).ok()?;
+    for line in stderr.lines() {
+        let Some(rest) = line.trim().strip_prefix("\"acct\"<blob>=") else {
+            continue;
+        };
+        return Some(rest.trim_matches('"').to_string());
+    }
+    None
+}
+
+fn oauth_key(entry: &McpOAuthEntry) -> String {
+    match &entry.server_url {
+        Some(url) if !url.is_empty() => format!("{}|{}", entry.server_name, url),
+        _ => entry.server_name.clone(),
+    }
+}
+
+fn entry_to_value(entry: &McpOAuthEntry) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "serverName".to_string(),
+        Value::String(entry.server_name.clone()),
+    );
+    if let Some(server_url) = &entry.server_url {
+        obj.insert("serverUrl".to_string(), Value::String(server_url.clone()));
+    }
+    obj.insert(
+        "accessToken".to_string(),
+        Value::String(entry.access_token.clone()),
+    );
+    if let Some(refresh_token) = &entry.refresh_token {
+        obj.insert(
+            "refreshToken".to_string(),
+            Value::String(refresh_token.clone()),
+        );
+    }
+    if let Some(expires_at_ms) = entry.expires_at_ms {
+        obj.insert(
+            "expiresAt".to_string(),
+            Value::Number(serde_json::Number::from(expires_at_ms)),
+        );
+    }
+    if let Some(client_id) = &entry.client_id {
+        obj.insert("clientId".to_string(), Value::String(client_id.clone()));
+    }
+    if let Some(scope) = &entry.scope {
+        obj.insert("scope".to_string(), Value::String(scope.clone()));
+    }
+    if let Some(as_url) = &entry.authorization_server_url {
+        obj.insert(
+            "discoveryState".to_string(),
+            serde_json::json!({
+                "authorizationServerUrl": as_url,
+                "oauthMetadataFound": true
+            }),
+        );
+    }
+    Value::Object(obj)
 }
 
 /// Live-refresh wrapper over the Keychain snapshot.
@@ -251,11 +399,14 @@ async fn refresh_entry(entry: &mut McpOAuthEntry, http: &reqwest::Client) -> Res
 
     let token_endpoint = discover_token_endpoint(http, &as_url).await?;
 
-    let form: [(&str, &str); 3] = [
+    let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", &refresh_token),
         ("client_id", &client_id),
     ];
+    if let Some(resource) = &entry.server_url {
+        form.push(("resource", resource));
+    }
     let resp = http
         .post(&token_endpoint)
         .form(&form)
@@ -356,6 +507,10 @@ mod tests {
         let out = parse_raw_credentials(raw).unwrap();
         let notion = out.get("notion").unwrap();
         assert_eq!(notion.access_token, "ntn-XYZ");
+        assert_eq!(
+            notion.server_url.as_deref(),
+            Some("https://mcp.notion.com/mcp")
+        );
         assert_eq!(notion.refresh_token.as_deref(), Some("ntn-REFRESH"));
         assert_eq!(notion.expires_at_ms, Some(1776600000000));
         assert_eq!(notion.client_id.as_deref(), Some("client-123"));
@@ -399,6 +554,7 @@ mod tests {
     fn is_expiring_soon_behaves_near_deadline() {
         let mut e = McpOAuthEntry {
             server_name: "n".into(),
+            server_url: None,
             access_token: "a".into(),
             refresh_token: None,
             expires_at_ms: Some(now_ms() + 1_000_000),
