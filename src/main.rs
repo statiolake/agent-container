@@ -24,6 +24,7 @@ mod sync;
 mod task_runner;
 mod tui;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -62,6 +63,21 @@ struct AgentConfigSync<'a> {
     codex_broker_url: &'a str,
     claude_mcp_servers: &'a [mcp::McpServer],
     codex_mcp_servers: &'a [mcp::McpServer],
+    claude_task_runner_enabled: bool,
+    codex_task_runner_enabled: bool,
+    claude_host_fs_enabled: bool,
+    codex_host_fs_enabled: bool,
+}
+
+struct AgentServices {
+    claude_policy: policy::McpPolicy,
+    codex_policy: policy::McpPolicy,
+    proxy_allow: Vec<String>,
+    filesystem: settings::FilesystemPolicy,
+    claude_task_runner: Option<task_runner::TaskRunner>,
+    codex_task_runner: Option<task_runner::TaskRunner>,
+    claude_host_fs: Option<host_fs::HostFs>,
+    codex_host_fs: Option<host_fs::HostFs>,
     claude_task_runner_enabled: bool,
     codex_task_runner_enabled: bool,
     claude_host_fs_enabled: bool,
@@ -329,6 +345,34 @@ fn sync_agent_configs(input: AgentConfigSync<'_>) -> Result<()> {
     Ok(())
 }
 
+fn build_agent_services(
+    host: &paths::HostPaths,
+    settings: &settings::Settings,
+    task_runner_tasks: &BTreeMap<String, task_runner::TaskSpec>,
+    claude_mcp_servers: &[mcp::McpServer],
+    codex_mcp_servers: &[mcp::McpServer],
+) -> AgentServices {
+    let claude_task_runner = build_task_runner(task_runner_tasks, claude_mcp_servers);
+    let codex_task_runner = build_task_runner(task_runner_tasks, codex_mcp_servers);
+    let claude_host_fs = build_host_fs(&host.workspace, claude_mcp_servers);
+    let codex_host_fs = build_host_fs(&host.workspace, codex_mcp_servers);
+
+    AgentServices {
+        claude_policy: settings.claude_code.mcp.clone(),
+        codex_policy: settings.codex.mcp.clone(),
+        proxy_allow: settings.proxy.allow.clone(),
+        filesystem: settings.filesystem.clone(),
+        claude_task_runner_enabled: claude_task_runner.is_some(),
+        codex_task_runner_enabled: codex_task_runner.is_some(),
+        claude_host_fs_enabled: claude_host_fs.is_some(),
+        codex_host_fs_enabled: codex_host_fs.is_some(),
+        claude_task_runner,
+        codex_task_runner,
+        claude_host_fs,
+        codex_host_fs,
+    }
+}
+
 fn should_explain_config_instead_of_tui(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -365,14 +409,14 @@ async fn run_cmd(
         .context("failed to load agent-container settings (global + workspace)")?;
     let agent = agent_override
         .unwrap_or_else(|| agent_kind_from_default(merged_settings.general.default_agent()));
-    let claude_policy = merged_settings.claude_code.mcp.clone();
-    let codex_policy = merged_settings.codex.mcp.clone();
-    let proxy_allow = merged_settings.proxy.allow.clone();
     let task_runner_tasks = task_runner::load_specs_from_settings(&host.workspace)?;
-    let claude_task_runner = build_task_runner(&task_runner_tasks, &claude_mcp_servers);
-    let codex_task_runner = build_task_runner(&task_runner_tasks, &codex_mcp_servers);
-    let claude_host_fs = build_host_fs(&host.workspace, &claude_mcp_servers);
-    let codex_host_fs = build_host_fs(&host.workspace, &codex_mcp_servers);
+    let services = build_agent_services(
+        &host,
+        &merged_settings,
+        &task_runner_tasks,
+        &claude_mcp_servers,
+        &codex_mcp_servers,
+    );
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().context("failed to load MCP OAuth entries from Keychain")?,
     ));
@@ -405,7 +449,7 @@ async fn run_cmd(
             labels.join(", ")
         );
     }
-    if let Some(runner) = &claude_task_runner {
+    if let Some(runner) = &services.claude_task_runner {
         eprintln!(
             "[agent-container] task-runner MCP exposing {} task(s): {}",
             runner.tasks.len(),
@@ -425,24 +469,20 @@ async fn run_cmd(
         .await
         .context("failed to build or locate container images")?;
 
-    let claude_task_runner_enabled = claude_task_runner.is_some();
-    let claude_host_fs_enabled = claude_host_fs.is_some();
-    let codex_task_runner_enabled = codex_task_runner.is_some();
-    let codex_host_fs_enabled = codex_host_fs.is_some();
     let brokers = spawn_agent_brokers(BrokerInputs {
         host: &host,
         bedrock: bedrock.clone().map(|b| (b, refresh.clone())),
         claude_mcp_servers: claude_mcp_servers.clone(),
         codex_mcp_servers: codex_mcp_servers.clone(),
-        claude_policy,
-        codex_policy,
-        claude_task_runner,
-        codex_task_runner,
-        claude_host_fs,
-        codex_host_fs,
+        claude_policy: services.claude_policy.clone(),
+        codex_policy: services.codex_policy.clone(),
+        claude_task_runner: services.claude_task_runner,
+        codex_task_runner: services.codex_task_runner,
+        claude_host_fs: services.claude_host_fs,
+        codex_host_fs: services.codex_host_fs,
         oauth_store: oauth_store.clone(),
-        claude_task_runner_enabled,
-        codex_task_runner_enabled,
+        claude_task_runner_enabled: services.claude_task_runner_enabled,
+        codex_task_runner_enabled: services.codex_task_runner_enabled,
     })
     .await?;
 
@@ -453,10 +493,10 @@ async fn run_cmd(
         codex_broker_url: &brokers.codex_url_from_container,
         claude_mcp_servers: &claude_mcp_servers,
         codex_mcp_servers: &codex_mcp_servers,
-        claude_task_runner_enabled,
-        codex_task_runner_enabled,
-        claude_host_fs_enabled,
-        codex_host_fs_enabled,
+        claude_task_runner_enabled: services.claude_task_runner_enabled,
+        codex_task_runner_enabled: services.codex_task_runner_enabled,
+        claude_host_fs_enabled: services.claude_host_fs_enabled,
+        codex_host_fs_enabled: services.codex_host_fs_enabled,
     })?;
 
     let credentials_path = claude_creds
@@ -481,8 +521,8 @@ async fn run_cmd(
         broker_url_from_container: brokers.claude_url_from_container.clone(),
         agent_command,
         extra_args: passthrough,
-        proxy_allow,
-        filesystem: merged_settings.filesystem,
+        proxy_allow: services.proxy_allow,
+        filesystem: services.filesystem,
     })
     .await?;
 
@@ -581,15 +621,15 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     let codex_mcp_servers =
         mcp::load_codex_servers(&host.home.join(".codex/config.toml")).unwrap_or_default();
     let merged_settings = settings::Settings::load_merged(&host.workspace).unwrap_or_default();
-    let claude_policy = merged_settings.claude_code.mcp.clone();
-    let codex_policy = merged_settings.codex.mcp.clone();
-    let proxy_allow = merged_settings.proxy.allow.clone();
     let task_runner_tasks =
         task_runner::load_specs_from_settings(&host.workspace).unwrap_or_default();
-    let claude_task_runner = build_task_runner(&task_runner_tasks, &claude_mcp_servers);
-    let codex_task_runner = build_task_runner(&task_runner_tasks, &codex_mcp_servers);
-    let claude_host_fs = build_host_fs(&host.workspace, &claude_mcp_servers);
-    let codex_host_fs = build_host_fs(&host.workspace, &codex_mcp_servers);
+    let services = build_agent_services(
+        &host,
+        &merged_settings,
+        &task_runner_tasks,
+        &claude_mcp_servers,
+        &codex_mcp_servers,
+    );
     let oauth_store = Arc::new(oauth::OAuthStore::new(
         oauth::load_from_keychain().unwrap_or_default(),
     ));
@@ -613,24 +653,20 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         .await
         .context("failed to build or locate container images")?;
 
-    let claude_task_runner_enabled = claude_task_runner.is_some();
-    let claude_host_fs_enabled = claude_host_fs.is_some();
-    let codex_task_runner_enabled = codex_task_runner.is_some();
-    let codex_host_fs_enabled = codex_host_fs.is_some();
     let brokers = spawn_agent_brokers(BrokerInputs {
         host: &host,
         bedrock: bedrock.clone().map(|b| (b, refresh.clone())),
         claude_mcp_servers: claude_mcp_servers.clone(),
         codex_mcp_servers: codex_mcp_servers.clone(),
-        claude_policy,
-        codex_policy,
-        claude_task_runner,
-        codex_task_runner,
-        claude_host_fs,
-        codex_host_fs,
+        claude_policy: services.claude_policy.clone(),
+        codex_policy: services.codex_policy.clone(),
+        claude_task_runner: services.claude_task_runner,
+        codex_task_runner: services.codex_task_runner,
+        claude_host_fs: services.claude_host_fs,
+        codex_host_fs: services.codex_host_fs,
         oauth_store,
-        claude_task_runner_enabled,
-        codex_task_runner_enabled,
+        claude_task_runner_enabled: services.claude_task_runner_enabled,
+        codex_task_runner_enabled: services.codex_task_runner_enabled,
     })
     .await?;
 
@@ -641,10 +677,10 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         codex_broker_url: &brokers.codex_url_from_container,
         claude_mcp_servers: &claude_mcp_servers,
         codex_mcp_servers: &codex_mcp_servers,
-        claude_task_runner_enabled,
-        codex_task_runner_enabled,
-        claude_host_fs_enabled,
-        codex_host_fs_enabled,
+        claude_task_runner_enabled: services.claude_task_runner_enabled,
+        codex_task_runner_enabled: services.codex_task_runner_enabled,
+        claude_host_fs_enabled: services.claude_host_fs_enabled,
+        codex_host_fs_enabled: services.codex_host_fs_enabled,
     })?;
 
     let credentials_path = claude_creds
@@ -676,8 +712,8 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         broker_url_from_container: brokers.claude_url_from_container.clone(),
         agent_command,
         extra_args: Vec::new(),
-        proxy_allow,
-        filesystem: merged_settings.filesystem,
+        proxy_allow: services.proxy_allow,
+        filesystem: services.filesystem,
     })
     .await?;
 
