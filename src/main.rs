@@ -31,6 +31,29 @@ use clap::Parser;
 
 use crate::cli::{AgentKind, Cli, Commands, ConfigCommands, McpCommands};
 
+struct AgentBrokerSet {
+    claude: server::RunningServer,
+    codex: server::RunningServer,
+    claude_url_from_container: String,
+    codex_url_from_container: String,
+}
+
+struct BrokerInputs<'a> {
+    host: &'a paths::HostPaths,
+    bedrock: Option<(aws::BedrockSetup, Option<String>)>,
+    claude_mcp_servers: Vec<mcp::McpServer>,
+    codex_mcp_servers: Vec<mcp::McpServer>,
+    claude_policy: policy::McpPolicy,
+    codex_policy: policy::McpPolicy,
+    claude_task_runner: Option<task_runner::TaskRunner>,
+    codex_task_runner: Option<task_runner::TaskRunner>,
+    claude_host_fs: Option<host_fs::HostFs>,
+    codex_host_fs: Option<host_fs::HostFs>,
+    oauth_store: Arc<oauth::OAuthStore>,
+    claude_task_runner_enabled: bool,
+    codex_task_runner_enabled: bool,
+}
+
 /// Initialise the tracing subscriber.
 ///
 /// Logs go to a file by default — `$XDG_STATE_HOME/agent-container/log`
@@ -187,6 +210,86 @@ async fn dispatch_config(
     }
 }
 
+async fn spawn_agent_brokers(inputs: BrokerInputs<'_>) -> Result<AgentBrokerSet> {
+    let BrokerInputs {
+        host,
+        bedrock,
+        claude_mcp_servers,
+        codex_mcp_servers,
+        claude_policy,
+        codex_policy,
+        claude_task_runner,
+        codex_task_runner,
+        claude_host_fs,
+        codex_host_fs,
+        oauth_store,
+        claude_task_runner_enabled,
+        codex_task_runner_enabled,
+    } = inputs;
+
+    let stdio_bridge = stdio_mcp::PathBridge {
+        container_root: host.container_workspace().display().to_string(),
+        host_root: host.workspace.display().to_string(),
+    };
+    let claude = server::spawn(
+        bedrock,
+        claude_mcp_servers,
+        claude_task_runner,
+        claude_host_fs,
+        claude_policy,
+        oauth_store.clone(),
+        Some(stdio_bridge),
+        Some(server::McpReloadConfig {
+            workspace: host.workspace.clone(),
+            task_runner_enabled: claude_task_runner_enabled,
+            policy_scope: server::McpPolicyScope::ClaudeCode,
+        }),
+    )
+    .await?;
+    tracing::info!(addr = %claude.addr, "Claude Code broker listening");
+
+    let codex = server::spawn(
+        None,
+        codex_mcp_servers,
+        codex_task_runner,
+        codex_host_fs,
+        codex_policy,
+        oauth_store,
+        Some(stdio_mcp::PathBridge {
+            container_root: host.container_workspace().display().to_string(),
+            host_root: host.workspace.display().to_string(),
+        }),
+        Some(server::McpReloadConfig {
+            workspace: host.workspace.clone(),
+            task_runner_enabled: codex_task_runner_enabled,
+            policy_scope: server::McpPolicyScope::Codex,
+        }),
+    )
+    .await?;
+    tracing::info!(addr = %codex.addr, "Codex broker listening");
+
+    let host_kind = host_kind::HostKind::detect()
+        .context("failed to detect Docker engine flavour for broker hostname")?;
+    let claude_url_from_container = format!(
+        "http://{}:{}",
+        host_kind.broker_host_name(),
+        claude.addr.port()
+    );
+    let codex_url_from_container = format!(
+        "http://{}:{}",
+        host_kind.broker_host_name(),
+        codex.addr.port()
+    );
+    tracing::info!(?host_kind, broker_url = %claude_url_from_container, "broker URL for container");
+
+    Ok(AgentBrokerSet {
+        claude,
+        codex,
+        claude_url_from_container,
+        codex_url_from_container,
+    })
+}
+
 fn should_explain_config_instead_of_tui(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -283,68 +386,32 @@ async fn run_cmd(
         .await
         .context("failed to build or locate container images")?;
 
-    let stdio_bridge = stdio_mcp::PathBridge {
-        container_root: host.container_workspace().display().to_string(),
-        host_root: host.workspace.display().to_string(),
-    };
     let claude_task_runner_enabled = claude_task_runner.is_some();
     let claude_host_fs_enabled = claude_host_fs.is_some();
     let codex_task_runner_enabled = codex_task_runner.is_some();
     let codex_host_fs_enabled = codex_host_fs.is_some();
-    let claude_broker = server::spawn(
-        bedrock.clone().map(|b| (b, refresh.clone())),
-        claude_mcp_servers.clone(),
-        claude_task_runner,
-        claude_host_fs,
+    let brokers = spawn_agent_brokers(BrokerInputs {
+        host: &host,
+        bedrock: bedrock.clone().map(|b| (b, refresh.clone())),
+        claude_mcp_servers: claude_mcp_servers.clone(),
+        codex_mcp_servers: codex_mcp_servers.clone(),
         claude_policy,
-        oauth_store.clone(),
-        Some(stdio_bridge),
-        Some(server::McpReloadConfig {
-            workspace: host.workspace.clone(),
-            task_runner_enabled: claude_task_runner_enabled,
-            policy_scope: server::McpPolicyScope::ClaudeCode,
-        }),
-    )
-    .await?;
-    tracing::info!(addr = %claude_broker.addr, "Claude Code broker listening");
-    let codex_broker = server::spawn(
-        None,
-        codex_mcp_servers.clone(),
-        codex_task_runner,
-        codex_host_fs,
         codex_policy,
-        oauth_store.clone(),
-        Some(stdio_mcp::PathBridge {
-            container_root: host.container_workspace().display().to_string(),
-            host_root: host.workspace.display().to_string(),
-        }),
-        Some(server::McpReloadConfig {
-            workspace: host.workspace.clone(),
-            task_runner_enabled: codex_task_runner_enabled,
-            policy_scope: server::McpPolicyScope::Codex,
-        }),
-    )
+        claude_task_runner,
+        codex_task_runner,
+        claude_host_fs,
+        codex_host_fs,
+        oauth_store: oauth_store.clone(),
+        claude_task_runner_enabled,
+        codex_task_runner_enabled,
+    })
     .await?;
-    tracing::info!(addr = %codex_broker.addr, "Codex broker listening");
-    let host_kind = host_kind::HostKind::detect()
-        .context("failed to detect Docker engine flavour for broker hostname")?;
-    let broker_url_from_container = format!(
-        "http://{}:{}",
-        host_kind.broker_host_name(),
-        claude_broker.addr.port()
-    );
-    let codex_broker_url_from_container = format!(
-        "http://{}:{}",
-        host_kind.broker_host_name(),
-        codex_broker.addr.port()
-    );
-    tracing::info!(?host_kind, broker_url = %broker_url_from_container, "broker URL for container");
 
     sync::sync_host_state(
         &host,
         sync::SyncOptions {
             bedrock: bedrock.as_ref(),
-            broker_url_from_container: &broker_url_from_container,
+            broker_url_from_container: &brokers.claude_url_from_container,
             mcp_servers: &claude_mcp_servers,
             task_runner_enabled: claude_task_runner_enabled,
             host_fs_enabled: claude_host_fs_enabled,
@@ -355,7 +422,7 @@ async fn run_cmd(
     codex::write_container_config(
         &host.home,
         &host.staged_home,
-        &codex_broker_url_from_container,
+        &brokers.codex_url_from_container,
         &codex_mcp_servers,
         codex_task_runner_enabled,
         codex_host_fs_enabled,
@@ -381,7 +448,7 @@ async fn run_cmd(
         codex_auth_path,
         codex_history,
         bedrock_setup: bedrock,
-        broker_url_from_container,
+        broker_url_from_container: brokers.claude_url_from_container.clone(),
         agent_command,
         extra_args: passthrough,
         proxy_allow,
@@ -389,8 +456,8 @@ async fn run_cmd(
     })
     .await?;
 
-    claude_broker.handle.abort();
-    codex_broker.handle.abort();
+    brokers.claude.handle.abort();
+    brokers.codex.handle.abort();
     drop(claude_creds);
     drop(codex_auth);
     std::process::exit(exit);
@@ -516,65 +583,32 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         .await
         .context("failed to build or locate container images")?;
 
-    let stdio_bridge = stdio_mcp::PathBridge {
-        container_root: host.container_workspace().display().to_string(),
-        host_root: host.workspace.display().to_string(),
-    };
     let claude_task_runner_enabled = claude_task_runner.is_some();
     let claude_host_fs_enabled = claude_host_fs.is_some();
     let codex_task_runner_enabled = codex_task_runner.is_some();
     let codex_host_fs_enabled = codex_host_fs.is_some();
-    let claude_broker = server::spawn(
-        bedrock.clone().map(|b| (b, refresh.clone())),
-        claude_mcp_servers.clone(),
-        claude_task_runner,
-        claude_host_fs,
+    let brokers = spawn_agent_brokers(BrokerInputs {
+        host: &host,
+        bedrock: bedrock.clone().map(|b| (b, refresh.clone())),
+        claude_mcp_servers: claude_mcp_servers.clone(),
+        codex_mcp_servers: codex_mcp_servers.clone(),
         claude_policy,
-        oauth_store.clone(),
-        Some(stdio_bridge),
-        Some(server::McpReloadConfig {
-            workspace: host.workspace.clone(),
-            task_runner_enabled: claude_task_runner_enabled,
-            policy_scope: server::McpPolicyScope::ClaudeCode,
-        }),
-    )
-    .await?;
-    let codex_broker = server::spawn(
-        None,
-        codex_mcp_servers.clone(),
-        codex_task_runner,
-        codex_host_fs,
         codex_policy,
+        claude_task_runner,
+        codex_task_runner,
+        claude_host_fs,
+        codex_host_fs,
         oauth_store,
-        Some(stdio_mcp::PathBridge {
-            container_root: host.container_workspace().display().to_string(),
-            host_root: host.workspace.display().to_string(),
-        }),
-        Some(server::McpReloadConfig {
-            workspace: host.workspace.clone(),
-            task_runner_enabled: codex_task_runner_enabled,
-            policy_scope: server::McpPolicyScope::Codex,
-        }),
-    )
+        claude_task_runner_enabled,
+        codex_task_runner_enabled,
+    })
     .await?;
-    let host_kind = host_kind::HostKind::detect()
-        .context("failed to detect Docker engine flavour for broker hostname")?;
-    let broker_url_from_container = format!(
-        "http://{}:{}",
-        host_kind.broker_host_name(),
-        claude_broker.addr.port()
-    );
-    let codex_broker_url_from_container = format!(
-        "http://{}:{}",
-        host_kind.broker_host_name(),
-        codex_broker.addr.port()
-    );
 
     sync::sync_host_state(
         &host,
         sync::SyncOptions {
             bedrock: bedrock.as_ref(),
-            broker_url_from_container: &broker_url_from_container,
+            broker_url_from_container: &brokers.claude_url_from_container,
             mcp_servers: &claude_mcp_servers,
             task_runner_enabled: claude_task_runner_enabled,
             host_fs_enabled: claude_host_fs_enabled,
@@ -585,7 +619,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     codex::write_container_config(
         &host.home,
         &host.staged_home,
-        &codex_broker_url_from_container,
+        &brokers.codex_url_from_container,
         &codex_mcp_servers,
         codex_task_runner_enabled,
         codex_host_fs_enabled,
@@ -618,7 +652,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         codex_auth_path,
         codex_history,
         bedrock_setup: bedrock,
-        broker_url_from_container,
+        broker_url_from_container: brokers.claude_url_from_container.clone(),
         agent_command,
         extra_args: Vec::new(),
         proxy_allow,
@@ -626,8 +660,8 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     })
     .await?;
 
-    claude_broker.handle.abort();
-    codex_broker.handle.abort();
+    brokers.claude.handle.abort();
+    brokers.codex.handle.abort();
     drop(claude_creds);
     drop(codex_auth);
     std::process::exit(exit);
