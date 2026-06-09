@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -290,7 +290,7 @@ async fn reload_mcp_settings(state: &BrokerState, config: &McpReloadConfig) -> R
     }
 
     if config.task_runner_enabled {
-        let tasks = load_task_runner_tasks_for_reload(&config.workspace)?;
+        let tasks = task_runner::load_specs_from_settings(&config.workspace)?;
         let mut mcp = state.mcp.write().await;
         mcp.insert(
             task_runner::NAME.to_string(),
@@ -300,47 +300,6 @@ async fn reload_mcp_settings(state: &BrokerState, config: &McpReloadConfig) -> R
 
     broadcast_tools_list_changed(state).await;
     Ok(())
-}
-
-fn load_task_runner_tasks_for_reload(
-    workspace: &Path,
-) -> Result<BTreeMap<String, task_runner::TaskSpec>> {
-    let global_path = crate::settings::global_path()?;
-    let global_root = global_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let workspace_path = crate::settings::workspace_path(workspace);
-    let workspace_root = workspace_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| workspace.to_path_buf());
-
-    let global =
-        crate::settings::Settings::load_global().context("failed to load global settings")?;
-    let workspace_settings = crate::settings::Settings::load_workspace(workspace)
-        .context("failed to load workspace settings")?;
-
-    let mut tasks = BTreeMap::new();
-    for (name, command) in global.task_runner.tasks {
-        tasks.insert(
-            name,
-            task_runner::TaskSpec {
-                command,
-                config_root: global_root.clone(),
-            },
-        );
-    }
-    for (name, command) in workspace_settings.task_runner.tasks {
-        tasks.insert(
-            name,
-            task_runner::TaskSpec {
-                command,
-                config_root: workspace_root.clone(),
-            },
-        );
-    }
-    Ok(tasks)
 }
 
 async fn broadcast_tools_list_changed(state: &BrokerState) {

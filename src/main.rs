@@ -226,7 +226,7 @@ async fn run_cmd(
     let claude_policy = merged_settings.claude_code.mcp.clone();
     let codex_policy = merged_settings.codex.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
-    let task_runner_tasks = load_task_runner_tasks(&host)?;
+    let task_runner_tasks = task_runner::load_specs_from_settings(&host.workspace)?;
     let claude_task_runner = build_task_runner(&task_runner_tasks, &claude_mcp_servers);
     let codex_task_runner = build_task_runner(&task_runner_tasks, &codex_mcp_servers);
     let claude_host_fs = build_host_fs(&host.workspace, &claude_mcp_servers);
@@ -487,7 +487,8 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     let claude_policy = merged_settings.claude_code.mcp.clone();
     let codex_policy = merged_settings.codex.mcp.clone();
     let proxy_allow = merged_settings.proxy.allow.clone();
-    let task_runner_tasks = load_task_runner_tasks(&host).unwrap_or_default();
+    let task_runner_tasks =
+        task_runner::load_specs_from_settings(&host.workspace).unwrap_or_default();
     let claude_task_runner = build_task_runner(&task_runner_tasks, &claude_mcp_servers);
     let codex_task_runner = build_task_runner(&task_runner_tasks, &codex_mcp_servers);
     let claude_host_fs = build_host_fs(&host.workspace, &claude_mcp_servers);
@@ -700,59 +701,6 @@ fn build_host_fs(
     Some(host_fs::HostFs::new(workspace.to_path_buf()))
 }
 
-fn load_task_runner_tasks(
-    host: &paths::HostPaths,
-) -> Result<std::collections::BTreeMap<String, task_runner::TaskSpec>> {
-    let global_path = settings::global_path()?;
-    let global_root = global_path
-        .parent()
-        .context("global settings path has no parent")?
-        .to_path_buf();
-    let global = settings::Settings::load_global().context("failed to load global settings")?;
-    let workspace_path = settings::workspace_path(&host.workspace);
-    let workspace_root = workspace_path
-        .parent()
-        .context("workspace settings path has no parent")?
-        .to_path_buf();
-    let workspace = settings::Settings::load_workspace(&host.workspace)
-        .context("failed to load workspace settings")?;
-
-    Ok(task_specs_from_scopes(
-        global.task_runner.tasks,
-        global_root,
-        workspace.task_runner.tasks,
-        workspace_root,
-    ))
-}
-
-fn task_specs_from_scopes(
-    global_tasks: std::collections::BTreeMap<String, String>,
-    global_root: PathBuf,
-    workspace_tasks: std::collections::BTreeMap<String, String>,
-    workspace_root: PathBuf,
-) -> std::collections::BTreeMap<String, task_runner::TaskSpec> {
-    let mut tasks = std::collections::BTreeMap::new();
-    for (name, command) in global_tasks {
-        tasks.insert(
-            name,
-            task_runner::TaskSpec {
-                command,
-                config_root: global_root.clone(),
-            },
-        );
-    }
-    for (name, command) in workspace_tasks {
-        tasks.insert(
-            name,
-            task_runner::TaskSpec {
-                command,
-                config_root: workspace_root.clone(),
-            },
-        );
-    }
-    tasks
-}
-
 fn prepare_codex_auth(
     host: &paths::HostPaths,
     primary: bool,
@@ -774,39 +722,6 @@ fn prepare_codex_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn task_specs_use_host_config_roots_and_workspace_overrides() {
-        let mut global = BTreeMap::new();
-        global.insert(
-            "deploy".to_string(),
-            "$CONFIG_ROOT/scripts/deploy".to_string(),
-        );
-        global.insert("global-only".to_string(), "global".to_string());
-
-        let mut workspace = BTreeMap::new();
-        workspace.insert(
-            "deploy".to_string(),
-            "$CONFIG_ROOT/scripts/deploy-workspace".to_string(),
-        );
-
-        let specs = task_specs_from_scopes(
-            global,
-            PathBuf::from("/Users/example/.config/agent-container"),
-            workspace,
-            PathBuf::from("/Users/example/repo/.agent-container"),
-        );
-
-        assert_eq!(
-            specs["deploy"].config_root,
-            PathBuf::from("/Users/example/repo/.agent-container")
-        );
-        assert_eq!(
-            specs["global-only"].config_root,
-            PathBuf::from("/Users/example/.config/agent-container")
-        );
-    }
 
     #[test]
     fn claude_runs_directly_by_default() {

@@ -19,7 +19,7 @@
 //!   lands in a single JSON-RPC response.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -41,6 +41,59 @@ pub struct TaskRunner {
 pub struct TaskSpec {
     pub command: String,
     pub config_root: PathBuf,
+}
+
+pub fn load_specs_from_settings(workspace: &Path) -> Result<BTreeMap<String, TaskSpec>> {
+    let global_path = crate::settings::global_path()?;
+    let global_root = global_path
+        .parent()
+        .context("global settings path has no parent")?
+        .to_path_buf();
+    let global =
+        crate::settings::Settings::load_global().context("failed to load global settings")?;
+
+    let workspace_path = crate::settings::workspace_path(workspace);
+    let workspace_root = workspace_path
+        .parent()
+        .context("workspace settings path has no parent")?
+        .to_path_buf();
+    let workspace_settings = crate::settings::Settings::load_workspace(workspace)
+        .context("failed to load workspace settings")?;
+
+    Ok(specs_from_scopes(
+        global.task_runner.tasks,
+        global_root,
+        workspace_settings.task_runner.tasks,
+        workspace_root,
+    ))
+}
+
+fn specs_from_scopes(
+    global_tasks: BTreeMap<String, String>,
+    global_root: PathBuf,
+    workspace_tasks: BTreeMap<String, String>,
+    workspace_root: PathBuf,
+) -> BTreeMap<String, TaskSpec> {
+    let mut tasks = BTreeMap::new();
+    for (name, command) in global_tasks {
+        tasks.insert(
+            name,
+            TaskSpec {
+                command,
+                config_root: global_root.clone(),
+            },
+        );
+    }
+    for (name, command) in workspace_tasks {
+        tasks.insert(
+            name,
+            TaskSpec {
+                command,
+                config_root: workspace_root.clone(),
+            },
+        );
+    }
+    tasks
 }
 
 impl TaskRunner {
@@ -329,6 +382,38 @@ mod tests {
         tasks.insert("succeed".into(), task("true", "/tmp/agent-container-test"));
         tasks.insert("fail".into(), task("false", "/tmp/agent-container-test"));
         TaskRunner::new(tasks)
+    }
+
+    #[test]
+    fn specs_use_host_config_roots_and_workspace_overrides() {
+        let mut global = BTreeMap::new();
+        global.insert(
+            "deploy".to_string(),
+            "$CONFIG_ROOT/scripts/deploy".to_string(),
+        );
+        global.insert("global-only".to_string(), "global".to_string());
+
+        let mut workspace = BTreeMap::new();
+        workspace.insert(
+            "deploy".to_string(),
+            "$CONFIG_ROOT/scripts/deploy-workspace".to_string(),
+        );
+
+        let specs = specs_from_scopes(
+            global,
+            PathBuf::from("/Users/example/.config/agent-container"),
+            workspace,
+            PathBuf::from("/Users/example/repo/.agent-container"),
+        );
+
+        assert_eq!(
+            specs["deploy"].config_root,
+            PathBuf::from("/Users/example/repo/.agent-container")
+        );
+        assert_eq!(
+            specs["global-only"].config_root,
+            PathBuf::from("/Users/example/.config/agent-container")
+        );
     }
 
     #[tokio::test]
