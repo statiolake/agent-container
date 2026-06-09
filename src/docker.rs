@@ -377,13 +377,13 @@ enum ChildExit {
 
 async fn compose_service_container_id(ctx: &ComposeCtx, service: &str) -> Result<String> {
     let output = ctx
-        .compose(&["ps", "-q", service])
+        .compose(&["ps", "-a", "-q", service])
         .output()
         .await
         .with_context(|| format!("failed to spawn docker compose ps for {service}"))?;
     if !output.status.success() {
         bail!(
-            "`docker compose ps -q {service}` failed with {}",
+            "`docker compose ps -a -q {service}` failed with {}",
             output.status
         );
     }
