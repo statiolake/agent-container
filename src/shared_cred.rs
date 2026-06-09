@@ -184,16 +184,7 @@ impl HostSync {
         match self {
             #[cfg(target_os = "macos")]
             HostSync::Keychain { service, account } => {
-                let mut cmd = std::process::Command::new("security");
-                cmd.args(["add-generic-password", "-U", "-s", service, "-w", raw]);
-                if let Some(a) = account {
-                    cmd.args(["-a", a]);
-                }
-                let status = cmd.status().context("failed to invoke `security`")?;
-                if !status.success() {
-                    anyhow::bail!("security add-generic-password exited with {status}");
-                }
-                Ok(())
+                crate::keychain::write_generic_password(service, account.as_deref(), raw)
             }
             #[cfg(any(not(target_os = "macos"), test))]
             HostSync::File(path) => {

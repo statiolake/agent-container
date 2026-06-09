@@ -23,6 +23,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::keychain::CLAUDE_CODE_CREDENTIALS_SERVICE;
+
 #[derive(Debug, Clone)]
 pub struct McpOAuthEntry {
     pub server_name: String,
@@ -88,19 +90,10 @@ struct DiscoveryState {
 pub fn load_from_keychain() -> Result<HashMap<String, McpOAuthEntry>> {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("security")
-            .args([
-                "find-generic-password",
-                "-w",
-                "-s",
-                "Claude Code-credentials",
-            ])
-            .output()
-            .context("failed to invoke `security` command")?;
-        if !output.status.success() {
+        let Some(raw) = crate::keychain::read_generic_password(CLAUDE_CODE_CREDENTIALS_SERVICE)?
+        else {
             return Ok(HashMap::new());
-        }
-        let raw = String::from_utf8(output.stdout).context("keychain entry was not valid UTF-8")?;
+        };
         parse_raw_credentials(raw.trim())
     }
     #[cfg(not(target_os = "macos"))]
@@ -189,19 +182,9 @@ pub fn save_to_keychain(entry: &McpOAuthEntry) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn load_raw_keychain_json() -> Result<Option<Value>> {
-    let output = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-w",
-            "-s",
-            "Claude Code-credentials",
-        ])
-        .output()
-        .context("failed to invoke `security` command")?;
-    if !output.status.success() {
+    let Some(raw) = crate::keychain::read_generic_password(CLAUDE_CODE_CREDENTIALS_SERVICE)? else {
         return Ok(None);
-    }
-    let raw = String::from_utf8(output.stdout).context("keychain entry was not valid UTF-8")?;
+    };
     let cfg: Value = serde_json::from_str(raw.trim()).context("keychain JSON parse")?;
     Ok(Some(cfg))
 }
@@ -209,45 +192,9 @@ fn load_raw_keychain_json() -> Result<Option<Value>> {
 #[cfg(target_os = "macos")]
 fn write_raw_keychain_json(cfg: &Value) -> Result<()> {
     let raw = serde_json::to_string(cfg).context("serialising Keychain credentials JSON")?;
-    let account = keychain_account().unwrap_or_else(|| "Claude Code".to_string());
-    let status = std::process::Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-s",
-            "Claude Code-credentials",
-            "-a",
-            &account,
-            "-w",
-            &raw,
-        ])
-        .status()
-        .context("failed to invoke `security` command")?;
-    if !status.success() {
-        bail!("security add-generic-password exited with {status}");
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_account() -> Option<String> {
-    let output = std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-g",
-        ])
-        .output()
-        .ok()?;
-    let stderr = String::from_utf8(output.stderr).ok()?;
-    for line in stderr.lines() {
-        let Some(rest) = line.trim().strip_prefix("\"acct\"<blob>=") else {
-            continue;
-        };
-        return Some(rest.trim_matches('"').to_string());
-    }
-    None
+    let account = crate::keychain::read_generic_password_account(CLAUDE_CODE_CREDENTIALS_SERVICE)?
+        .unwrap_or_else(|| "Claude Code".to_string());
+    crate::keychain::write_generic_password(CLAUDE_CODE_CREDENTIALS_SERVICE, Some(&account), &raw)
 }
 
 fn oauth_key(entry: &McpOAuthEntry) -> String {

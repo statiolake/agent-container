@@ -9,12 +9,11 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::keychain::CLAUDE_CODE_CREDENTIALS_SERVICE;
 use crate::shared_cred::{HostSync, SharedCredFile, shared_dir};
-
-const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
 pub struct CredentialFile {
     pub path: PathBuf,
@@ -58,8 +57,10 @@ pub fn prepare(claude_root: &Path) -> Result<CredentialFile> {
 #[cfg(target_os = "macos")]
 fn host_sync_target(_claude_root: &Path) -> HostSync {
     HostSync::Keychain {
-        service: KEYCHAIN_SERVICE.to_string(),
-        account: read_keychain_account().ok(),
+        service: CLAUDE_CODE_CREDENTIALS_SERVICE.to_string(),
+        account: crate::keychain::read_generic_password_account(CLAUDE_CODE_CREDENTIALS_SERVICE)
+            .ok()
+            .flatten(),
     }
 }
 
@@ -83,45 +84,8 @@ fn read_raw_credentials_from_host(claude_root: &Path) -> Result<String> {
 
 #[cfg(target_os = "macos")]
 fn read_from_keychain() -> Result<String> {
-    let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-w", "-s", KEYCHAIN_SERVICE])
-        .output()
-        .context("failed to invoke `security` command")?;
-    if !output.status.success() {
-        bail!(
-            "security command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    String::from_utf8(output.stdout).context("keychain entry was not valid UTF-8")
-}
-
-/// Read the `acct` (account) field from the Keychain entry so the
-/// write-back path can target the same item with `security
-/// add-generic-password -U`.
-#[cfg(target_os = "macos")]
-fn read_keychain_account() -> Result<String> {
-    let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE])
-        .output()
-        .context("failed to invoke `security`")?;
-    if !output.status.success() {
-        bail!(
-            "security find-generic-password failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let stdout = String::from_utf8(output.stdout).context("keychain entry not utf-8")?;
-    for line in stdout.lines() {
-        // Format: `    "acct"<blob>="me@example.com"`
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(r#""acct"<blob>=""#) {
-            if let Some(end) = rest.rfind('"') {
-                return Ok(rest[..end].to_string());
-            }
-        }
-    }
-    bail!("acct attribute not found in keychain entry");
+    crate::keychain::read_generic_password(CLAUDE_CODE_CREDENTIALS_SERVICE)?
+        .context("Claude Code credentials not found in Keychain")
 }
 
 #[derive(Deserialize)]

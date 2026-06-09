@@ -6,6 +6,7 @@ mod creds;
 mod docker;
 mod host_fs;
 mod host_kind;
+mod keychain;
 mod mcp;
 mod mcp_auth;
 mod mcp_client;
