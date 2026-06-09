@@ -100,72 +100,30 @@ pub struct RunOptions {
     pub filesystem: crate::settings::FilesystemPolicy,
 }
 
+struct RunArtifacts {
+    host_claude_projects_dir: PathBuf,
+    workspace_agent_container_mount_src: PathBuf,
+    allowlist_path: PathBuf,
+    compose_files: Vec<PathBuf>,
+    cleanup_paths: Vec<PathBuf>,
+}
+
 /// Orchestrate the compose project: start relay, run agent, always tear down.
 pub async fn run(opts: RunOptions) -> Result<i32> {
     let pid = std::process::id();
-    let staged_root = opts.host.staged_root();
-    opts.host.prepare_staged_root()?;
-    let host_claude_projects_dir = opts.host.host_claude_projects_dir();
-    std::fs::create_dir_all(&host_claude_projects_dir).with_context(|| {
-        format!(
-            "failed to prepare Claude projects dir {}",
-            host_claude_projects_dir.display()
-        )
-    })?;
-    std::fs::create_dir_all(&opts.host.staged_home).with_context(|| {
-        format!(
-            "failed to prepare staged agent home at {}",
-            opts.host.staged_home.display()
-        )
-    })?;
-    // The workspace is intentionally writable, but its agent-container
-    // settings directory controls host-side behavior. Overlay it read-only
-    // inside the container; if the workspace has no such directory, mount
-    // an empty read-only directory so the agent cannot create one from
-    // inside the container.
-    let workspace_agent_container_dir = opts.host.workspace.join(".agent-container");
-    let (workspace_agent_container_mount_src, empty_workspace_agent_container_mount) =
-        if workspace_agent_container_dir.is_dir() {
-            (workspace_agent_container_dir, None)
-        } else {
-            let path = empty_workspace_agent_container_dir(pid)?;
-            (path.clone(), Some(path))
-        };
-    let secret_shadow_root_path = secret_shadow_root(pid);
-    let secret_shadows = prepare_secret_shadow_mounts(
-        &opts.host.workspace,
-        &opts.host.container_workspace(),
-        pid,
-        &opts.filesystem,
-    )?;
-
     let project = format!("agent-container-{pid}");
-    let compose_file = default_compose_file();
-    let shadow_compose_file = write_secret_shadow_compose_override(pid, &secret_shadows)?;
     let mut agent_argv = opts.agent_command.clone();
     agent_argv.extend(opts.extra_args.clone());
-    let command_compose_file =
-        write_agent_command_compose_override(pid, &agent_argv, is_stdin_tty())?;
+    let RunArtifacts {
+        host_claude_projects_dir,
+        workspace_agent_container_mount_src,
+        allowlist_path,
+        compose_files,
+        cleanup_paths,
+    } = prepare_run_artifacts(pid, &opts, &agent_argv)?;
 
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
-
-    let allowlist_path = crate::proxy_allowlist::cache_path_for(pid)?;
-    crate::proxy_allowlist::generate(&opts.proxy_allow, &allowlist_path)
-        .context("failed to materialise proxy allowlist for tinyproxy")?;
-
-    let mut cleanup_paths = vec![
-        staged_root.clone(),
-        allowlist_path.clone(),
-        secret_shadow_root_path.clone(),
-        command_compose_file.clone(),
-    ];
-    if let Some(path) = &empty_workspace_agent_container_mount {
-        cleanup_paths.push(path.clone());
-    }
-    if let Some(path) = &shadow_compose_file {
-        cleanup_paths.push(path.clone());
-    }
 
     let mut env: HashMap<String, String> = [
         ("WORKSPACE_PATH", opts.host.workspace.display().to_string()),
@@ -271,13 +229,7 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
 
     let ctx = ComposeCtx {
         project: project.clone(),
-        compose_files: {
-            let mut files = vec![compose_file.clone(), command_compose_file];
-            if let Some(file) = shadow_compose_file {
-                files.push(file);
-            }
-            files
-        },
+        compose_files,
         env: env.clone(),
     };
 
@@ -368,6 +320,79 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
 
     // `_cleanup` runs `compose down` on scope exit.
     Ok(exit)
+}
+
+fn prepare_run_artifacts(
+    pid: u32,
+    opts: &RunOptions,
+    agent_argv: &[String],
+) -> Result<RunArtifacts> {
+    let staged_root = opts.host.staged_root();
+    opts.host.prepare_staged_root()?;
+
+    let host_claude_projects_dir = opts.host.host_claude_projects_dir();
+    std::fs::create_dir_all(&host_claude_projects_dir).with_context(|| {
+        format!(
+            "failed to prepare Claude projects dir {}",
+            host_claude_projects_dir.display()
+        )
+    })?;
+    std::fs::create_dir_all(&opts.host.staged_home).with_context(|| {
+        format!(
+            "failed to prepare staged agent home at {}",
+            opts.host.staged_home.display()
+        )
+    })?;
+
+    let workspace_agent_container_dir = opts.host.workspace.join(".agent-container");
+    let (workspace_agent_container_mount_src, empty_workspace_agent_container_mount) =
+        if workspace_agent_container_dir.is_dir() {
+            (workspace_agent_container_dir, None)
+        } else {
+            let path = empty_workspace_agent_container_dir(pid)?;
+            (path.clone(), Some(path))
+        };
+
+    let secret_shadow_root_path = secret_shadow_root(pid);
+    let secret_shadows = prepare_secret_shadow_mounts(
+        &opts.host.workspace,
+        &opts.host.container_workspace(),
+        pid,
+        &opts.filesystem,
+    )?;
+    let shadow_compose_file = write_secret_shadow_compose_override(pid, &secret_shadows)?;
+
+    let command_compose_file =
+        write_agent_command_compose_override(pid, agent_argv, is_stdin_tty())?;
+    let allowlist_path = crate::proxy_allowlist::cache_path_for(pid)?;
+    crate::proxy_allowlist::generate(&opts.proxy_allow, &allowlist_path)
+        .context("failed to materialise proxy allowlist for tinyproxy")?;
+
+    let mut compose_files = vec![default_compose_file(), command_compose_file.clone()];
+    if let Some(file) = shadow_compose_file.clone() {
+        compose_files.push(file);
+    }
+
+    let mut cleanup_paths = vec![
+        staged_root,
+        allowlist_path.clone(),
+        secret_shadow_root_path,
+        command_compose_file,
+    ];
+    if let Some(path) = empty_workspace_agent_container_mount {
+        cleanup_paths.push(path);
+    }
+    if let Some(path) = shadow_compose_file {
+        cleanup_paths.push(path);
+    }
+
+    Ok(RunArtifacts {
+        host_claude_projects_dir,
+        workspace_agent_container_mount_src,
+        allowlist_path,
+        compose_files,
+        cleanup_paths,
+    })
 }
 
 enum ChildExit {
