@@ -55,6 +55,19 @@ struct BrokerInputs<'a> {
     codex_task_runner_enabled: bool,
 }
 
+struct AgentConfigSync<'a> {
+    host: &'a paths::HostPaths,
+    bedrock: Option<&'a aws::BedrockSetup>,
+    claude_broker_url: &'a str,
+    codex_broker_url: &'a str,
+    claude_mcp_servers: &'a [mcp::McpServer],
+    codex_mcp_servers: &'a [mcp::McpServer],
+    claude_task_runner_enabled: bool,
+    codex_task_runner_enabled: bool,
+    claude_host_fs_enabled: bool,
+    codex_host_fs_enabled: bool,
+}
+
 /// Initialise the tracing subscriber.
 ///
 /// Logs go to a file by default — `$XDG_STATE_HOME/agent-container/log`
@@ -291,6 +304,31 @@ async fn spawn_agent_brokers(inputs: BrokerInputs<'_>) -> Result<AgentBrokerSet>
     })
 }
 
+fn sync_agent_configs(input: AgentConfigSync<'_>) -> Result<()> {
+    sync::sync_host_state(
+        input.host,
+        sync::SyncOptions {
+            bedrock: input.bedrock,
+            broker_url_from_container: input.claude_broker_url,
+            mcp_servers: input.claude_mcp_servers,
+            task_runner_enabled: input.claude_task_runner_enabled,
+            host_fs_enabled: input.claude_host_fs_enabled,
+        },
+    )
+    .context("failed to sync host Claude Code state into container")?;
+
+    codex::write_container_config(
+        &input.host.home,
+        &input.host.staged_home,
+        input.codex_broker_url,
+        input.codex_mcp_servers,
+        input.codex_task_runner_enabled,
+        input.codex_host_fs_enabled,
+    )
+    .context("failed to write codex config.toml into container home")?;
+    Ok(())
+}
+
 fn should_explain_config_instead_of_tui(cli: &Cli) -> bool {
     matches!(
         &cli.command,
@@ -408,27 +446,18 @@ async fn run_cmd(
     })
     .await?;
 
-    sync::sync_host_state(
-        &host,
-        sync::SyncOptions {
-            bedrock: bedrock.as_ref(),
-            broker_url_from_container: &brokers.claude_url_from_container,
-            mcp_servers: &claude_mcp_servers,
-            task_runner_enabled: claude_task_runner_enabled,
-            host_fs_enabled: claude_host_fs_enabled,
-        },
-    )
-    .context("failed to sync host Claude Code state into container")?;
-
-    codex::write_container_config(
-        &host.home,
-        &host.staged_home,
-        &brokers.codex_url_from_container,
-        &codex_mcp_servers,
+    sync_agent_configs(AgentConfigSync {
+        host: &host,
+        bedrock: bedrock.as_ref(),
+        claude_broker_url: &brokers.claude_url_from_container,
+        codex_broker_url: &brokers.codex_url_from_container,
+        claude_mcp_servers: &claude_mcp_servers,
+        codex_mcp_servers: &codex_mcp_servers,
+        claude_task_runner_enabled,
         codex_task_runner_enabled,
+        claude_host_fs_enabled,
         codex_host_fs_enabled,
-    )
-    .context("failed to write codex config.toml into container home")?;
+    })?;
 
     let credentials_path = claude_creds
         .as_ref()
@@ -605,27 +634,18 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     })
     .await?;
 
-    sync::sync_host_state(
-        &host,
-        sync::SyncOptions {
-            bedrock: bedrock.as_ref(),
-            broker_url_from_container: &brokers.claude_url_from_container,
-            mcp_servers: &claude_mcp_servers,
-            task_runner_enabled: claude_task_runner_enabled,
-            host_fs_enabled: claude_host_fs_enabled,
-        },
-    )
-    .context("failed to sync host Claude Code state into container")?;
-
-    codex::write_container_config(
-        &host.home,
-        &host.staged_home,
-        &brokers.codex_url_from_container,
-        &codex_mcp_servers,
+    sync_agent_configs(AgentConfigSync {
+        host: &host,
+        bedrock: bedrock.as_ref(),
+        claude_broker_url: &brokers.claude_url_from_container,
+        codex_broker_url: &brokers.codex_url_from_container,
+        claude_mcp_servers: &claude_mcp_servers,
+        codex_mcp_servers: &codex_mcp_servers,
+        claude_task_runner_enabled,
         codex_task_runner_enabled,
+        claude_host_fs_enabled,
         codex_host_fs_enabled,
-    )
-    .context("failed to write codex config.toml into container home")?;
+    })?;
 
     let credentials_path = claude_creds
         .as_ref()
