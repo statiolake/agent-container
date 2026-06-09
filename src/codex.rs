@@ -91,7 +91,8 @@ const INHERITED_SCALAR_KEYS: &[&str] = &[
     "personality",
 ];
 
-/// Write `~/.codex/config.toml` into the container's persistent home.
+/// Write `~/.codex/config.toml` into the staged config tree that will be
+/// mounted into the container.
 ///
 /// The file is composed from two sources:
 /// - Carry over the user's model / reasoning-effort / personality choices

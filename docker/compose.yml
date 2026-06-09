@@ -52,15 +52,13 @@ services:
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-}
       - AGENT_CONTAINER_HOST_ENDPOINT=${AGENT_CONTAINER_HOST_ENDPOINT}
     volumes:
-      # Persistent $HOME so onboarding, login, settings, and Claude Code's
-      # ~/.claude.json survive across runs. Specific sub-mounts below
-      # override individual paths that must stay ephemeral or workspace-scoped.
-      - "${CONTAINER_HOME_PATH}:/home/agent"
+      # /home/agent is the container image's ephemeral home. Only explicit
+      # host state is mounted directly; generated config is copied into the
+      # created container before the agent starts.
       - "${WORKSPACE_PATH}:${CONTAINER_WORKSPACE_PATH}"
       - "${WORKSPACE_AGENT_CONTAINER_MOUNT_SRC}:${CONTAINER_WORKSPACE_PATH}/.agent-container:ro"
       - "${HOST_CLAUDE_PROJECTS_DIR}:/home/agent/.claude/projects"
       - "${CREDENTIALS_PATH}:/home/agent/.claude/.credentials.json"
-      - "${CLAUDE_MD_MOUNT_SRC}:/home/agent/.claude/CLAUDE.md:ro"
       - "${CODEX_AUTH_PATH}:/home/agent/.codex/auth.json"
       - "${CODEX_SESSIONS_DIR}:/home/agent/.codex/sessions"
       - "${CODEX_ARCHIVED_SESSIONS_DIR}:/home/agent/.codex/archived_sessions"

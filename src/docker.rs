@@ -7,6 +7,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::aws::BedrockSetup;
@@ -101,6 +102,9 @@ pub struct RunOptions {
 
 /// Orchestrate the compose project: start relay, run agent, always tear down.
 pub async fn run(opts: RunOptions) -> Result<i32> {
+    let pid = std::process::id();
+    let staged_root = opts.host.staged_root();
+    opts.host.prepare_staged_root()?;
     let host_claude_projects_dir = opts.host.host_claude_projects_dir();
     std::fs::create_dir_all(&host_claude_projects_dir).with_context(|| {
         format!(
@@ -108,61 +112,66 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
             host_claude_projects_dir.display()
         )
     })?;
-    std::fs::create_dir_all(&opts.host.container_home).with_context(|| {
+    std::fs::create_dir_all(&opts.host.staged_home).with_context(|| {
         format!(
-            "failed to prepare persistent claude-home at {}",
-            opts.host.container_home.display()
+            "failed to prepare staged agent home at {}",
+            opts.host.staged_home.display()
         )
     })?;
-
-    // Use /dev/null as the CLAUDE.md mount source when the host lacks one, so
-    // compose always has a concrete path to bind.
-    let claude_md = opts.host.host_claude_md();
-    let claude_md_src = if claude_md.is_file() {
-        claude_md
-    } else {
-        PathBuf::from("/dev/null")
-    };
-
     // The workspace is intentionally writable, but its agent-container
     // settings directory controls host-side behavior. Overlay it read-only
     // inside the container; if the workspace has no such directory, mount
     // an empty read-only directory so the agent cannot create one from
     // inside the container.
     let workspace_agent_container_dir = opts.host.workspace.join(".agent-container");
-    let workspace_agent_container_mount_src = if workspace_agent_container_dir.is_dir() {
-        workspace_agent_container_dir
-    } else {
-        empty_workspace_agent_container_dir(std::process::id())?
-    };
+    let (workspace_agent_container_mount_src, empty_workspace_agent_container_mount) =
+        if workspace_agent_container_dir.is_dir() {
+            (workspace_agent_container_dir, None)
+        } else {
+            let path = empty_workspace_agent_container_dir(pid)?;
+            (path.clone(), Some(path))
+        };
+    let secret_shadow_root_path = secret_shadow_root(pid);
     let secret_shadows = prepare_secret_shadow_mounts(
         &opts.host.workspace,
         &opts.host.container_workspace(),
-        std::process::id(),
+        pid,
         &opts.filesystem,
     )?;
 
-    let project = format!("agent-container-{}", std::process::id());
+    let project = format!("agent-container-{pid}");
     let compose_file = default_compose_file();
-    let shadow_compose_file =
-        write_secret_shadow_compose_override(std::process::id(), &secret_shadows)?;
+    let shadow_compose_file = write_secret_shadow_compose_override(pid, &secret_shadows)?;
+    let mut agent_argv = opts.agent_command.clone();
+    agent_argv.extend(opts.extra_args.clone());
+    let command_compose_file =
+        write_agent_command_compose_override(pid, &agent_argv, is_stdin_tty())?;
 
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
 
-    let allowlist_path = crate::proxy_allowlist::cache_path_for(std::process::id())?;
+    let allowlist_path = crate::proxy_allowlist::cache_path_for(pid)?;
     crate::proxy_allowlist::generate(&opts.proxy_allow, &allowlist_path)
         .context("failed to materialise proxy allowlist for tinyproxy")?;
+
+    let mut cleanup_paths = vec![
+        staged_root.clone(),
+        allowlist_path.clone(),
+        secret_shadow_root_path.clone(),
+        command_compose_file.clone(),
+    ];
+    if let Some(path) = &empty_workspace_agent_container_mount {
+        cleanup_paths.push(path.clone());
+    }
+    if let Some(path) = &shadow_compose_file {
+        cleanup_paths.push(path.clone());
+    }
 
     let mut env: HashMap<String, String> = [
         ("WORKSPACE_PATH", opts.host.workspace.display().to_string()),
         (
             "CONTAINER_WORKSPACE_PATH",
             opts.host.container_workspace().display().to_string(),
-        ),
-        (
-            "CONTAINER_HOME_PATH",
-            opts.host.container_home.display().to_string(),
         ),
         (
             "HOST_CLAUDE_PROJECTS_DIR",
@@ -176,7 +185,6 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
             "CREDENTIALS_PATH",
             opts.credentials_path.display().to_string(),
         ),
-        ("CLAUDE_MD_MOUNT_SRC", claude_md_src.display().to_string()),
         (
             "CODEX_AUTH_PATH",
             opts.codex_auth_path.display().to_string(),
@@ -263,26 +271,43 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
 
     let ctx = ComposeCtx {
         project: project.clone(),
-        compose_files: shadow_compose_file.into_iter().fold(
-            vec![compose_file.clone()],
-            |mut files, file| {
+        compose_files: {
+            let mut files = vec![compose_file.clone(), command_compose_file];
+            if let Some(file) = shadow_compose_file {
                 files.push(file);
-                files
-            },
-        ),
+            }
+            files
+        },
         env: env.clone(),
     };
 
-    // Guarantees `compose down` on any exit path (panic/error/normal).
-    struct Cleanup<'a>(&'a ComposeCtx);
+    // Guarantees `compose down` and staging cleanup on any exit path
+    // (panic/error/normal).
+    struct Cleanup<'a> {
+        compose: &'a ComposeCtx,
+        paths: Vec<PathBuf>,
+    }
     impl<'a> Drop for Cleanup<'a> {
         fn drop(&mut self) {
-            if let Err(e) = compose_down_sync(self.0) {
+            if let Err(e) = compose_down_sync(self.compose) {
                 eprintln!("[agent-container] warning: compose down failed: {e:#}");
+            }
+            for path in &self.paths {
+                if let Err(e) = remove_path_any(path)
+                    && e.kind() != ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "[agent-container] warning: failed to remove temporary path {}: {e}",
+                        path.display()
+                    );
+                }
             }
         }
     }
-    let _cleanup = Cleanup(&ctx);
+    let _cleanup = Cleanup {
+        compose: &ctx,
+        paths: cleanup_paths,
+    };
 
     // 1) Start the forward proxy sidecar in the background.
     let proxy_up = ctx
@@ -304,18 +329,37 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         crate::proxy_allowlist::render(&opts.proxy_allow),
     ));
 
-    // 2) Run the agent in the foreground, inheriting stdio for the TUI.
-    let mut cmd = ctx.compose(&["run", "--rm", "--name", &format!("{project}-agent")]);
-    if !is_stdin_tty() {
-        cmd.arg("-T");
+    // 2) Create the agent container without starting it, copy the generated
+    // home files into its writable layer, then attach-start it.
+    let create = ctx
+        .compose(&["create", "--no-build", "agent"])
+        .spawn()
+        .context("failed to spawn docker compose create")?;
+    let create =
+        wait_compose_child_or_interrupt(create, ctx.clone(), "docker compose create").await?;
+    let ChildExit::Exited(status) = create else {
+        proxy_reload.abort();
+        return Ok(130);
+    };
+    if !status.success() {
+        bail!("`docker compose create agent` failed with status {status}");
     }
-    cmd.arg("agent");
-    cmd.args(&opts.agent_command);
-    if !opts.extra_args.is_empty() {
-        cmd.args(&opts.extra_args);
+
+    let agent_container_id = compose_service_container_id(&ctx, "agent")
+        .await
+        .context("failed to resolve created agent container id")?;
+    copy_staged_home_into_container(&opts.host.staged_home, &agent_container_id)
+        .await
+        .context("failed to copy staged home into agent container")?;
+
+    let mut cmd = Command::new("docker");
+    cmd.args(["start", "-a"]);
+    if is_stdin_tty() {
+        cmd.arg("-i");
     }
-    let child = cmd.spawn().context("failed to spawn docker compose run")?;
-    let status = wait_compose_child_or_interrupt(child, ctx.clone(), "docker compose run").await;
+    cmd.arg(&agent_container_id);
+    let child = cmd.spawn().context("failed to spawn docker start")?;
+    let status = wait_compose_child_or_interrupt(child, ctx.clone(), "docker start").await;
     proxy_reload.abort();
     let exit = match status? {
         ChildExit::Exited(status) => status.code().unwrap_or(1),
@@ -329,6 +373,61 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
 enum ChildExit {
     Exited(std::process::ExitStatus),
     Interrupted,
+}
+
+async fn compose_service_container_id(ctx: &ComposeCtx, service: &str) -> Result<String> {
+    let output = ctx
+        .compose(&["ps", "-q", service])
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn docker compose ps for {service}"))?;
+    if !output.status.success() {
+        bail!(
+            "`docker compose ps -q {service}` failed with {}",
+            output.status
+        );
+    }
+    let id = String::from_utf8(output.stdout).context("docker compose ps emitted non-utf8 id")?;
+    let id = id.trim();
+    if id.is_empty() {
+        bail!("docker compose did not report a container id for service {service}");
+    }
+    Ok(id.to_string())
+}
+
+async fn copy_staged_home_into_container(staged_home: &Path, container_id: &str) -> Result<()> {
+    let mut tar = Vec::new();
+    crate::staging_archive::write_tar(staged_home, &mut tar)
+        .context("failed to build staged home tar stream")?;
+
+    let mut child = Command::new("docker")
+        .args(["cp", "-", &format!("{container_id}:/home/agent")])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .context("failed to spawn docker cp")?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to open docker cp stdin")?;
+        stdin
+            .write_all(&tar)
+            .await
+            .context("failed to stream staged home tar")?;
+        stdin
+            .shutdown()
+            .await
+            .context("failed to close docker cp stdin")?;
+    }
+    drop(child.stdin.take());
+
+    let status = child.wait().await.context("failed to wait for docker cp")?;
+    if !status.success() {
+        bail!("`docker cp - {container_id}:/home/agent` failed with {status}");
+    }
+    Ok(())
 }
 
 async fn wait_compose_child_or_interrupt(
@@ -411,7 +510,7 @@ fn prepare_secret_shadow_mounts(
     pid: u32,
     filesystem: &crate::settings::FilesystemPolicy,
 ) -> Result<Vec<SecretShadowMount>> {
-    let shadow_root = std::env::temp_dir().join(format!("agent-container-secret-shadows-{pid}"));
+    let shadow_root = secret_shadow_root(pid);
     std::fs::create_dir_all(&shadow_root)
         .with_context(|| format!("failed to prepare {}", shadow_root.display()))?;
 
@@ -565,6 +664,29 @@ fn write_secret_shadow_compose_override(
     Ok(Some(path))
 }
 
+fn write_agent_command_compose_override(pid: u32, argv: &[String], tty: bool) -> Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!("agent-container-command-{pid}.yml"));
+    let mut out = String::from("services:\n  agent:\n    command:\n");
+    for arg in argv {
+        out.push_str(&format!("      - '{}'\n", yaml_single_quote(arg)));
+    }
+    out.push_str(&format!(
+        "    stdin_open: {}\n",
+        if tty { "true" } else { "false" }
+    ));
+    out.push_str(&format!(
+        "    tty: {}\n",
+        if tty { "true" } else { "false" }
+    ));
+    std::fs::write(&path, out)
+        .with_context(|| format!("failed to write compose override {}", path.display()))?;
+    Ok(path)
+}
+
+fn secret_shadow_root(pid: u32) -> PathBuf {
+    std::env::temp_dir().join(format!("agent-container-secret-shadows-{pid}"))
+}
+
 fn yaml_single_quote(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -632,6 +754,14 @@ fn empty_workspace_agent_container_dir(pid: u32) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to prepare empty config mount {}", dir.display()))?;
     Ok(dir)
+}
+
+fn remove_path_any(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) => Err(e),
+    }
 }
 
 #[derive(Clone)]

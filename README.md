@@ -241,9 +241,10 @@ Then `tail -f /tmp/agent-container.log` in another terminal.
 
 ## Host configuration inheritance
 
-Each `agent-container run` copies a curated slice of host state into the
-container's persistent `$HOME` (kept at
-`$XDG_DATA/agent-container/home`, separate from your real `~`):
+Each `agent-container run` builds a per-run staging tree from a curated slice
+of host state, streams it through the built-in Rust tar writer into the
+created agent container with `docker cp -`, and bind-mounts only the explicit
+host history/auth paths into the container's ephemeral `$HOME`:
 
 - `~/.claude.json` — top-level preferences and the current workspace's
   project entry, with `mcpServers` / `env` / `hooks` / `permissions` /
@@ -268,9 +269,9 @@ container's persistent `$HOME` (kept at
   at Codex's normal history paths. Container-created sessions are written
   back to the host history.
 
-Everything else your agents need is left to the container itself. The
-persistent home survives across runs, so onboarding prompts and login
-state do not recur.
+Everything else your agents need is left to the container itself and is
+discarded with the container. Host-visible state only persists when it is
+listed above or otherwise explicitly bind-mounted.
 
 ## Host task runner
 

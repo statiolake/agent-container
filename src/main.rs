@@ -16,6 +16,7 @@ mod proxy_allowlist;
 mod server;
 mod settings;
 mod shared_cred;
+mod staging_archive;
 mod stdio_mcp;
 mod sync;
 mod task_runner;
@@ -327,7 +328,7 @@ async fn run_cmd(
 
     codex::write_container_config(
         &host.home,
-        &host.container_home,
+        &host.staged_home,
         &codex_broker_url_from_container,
         &codex_mcp_servers,
         codex_task_runner_enabled,
@@ -556,7 +557,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
 
     codex::write_container_config(
         &host.home,
-        &host.container_home,
+        &host.staged_home,
         &codex_broker_url_from_container,
         &codex_mcp_servers,
         codex_task_runner_enabled,

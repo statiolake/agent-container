@@ -1,5 +1,5 @@
 //! Sync a filtered subset of the host's Claude Code state into the
-//! container's persistent `$HOME` before each run.
+//! a per-run staging tree before each container start.
 //!
 //! What moves across:
 //! - `~/.claude.json` — top-level preferences, onboarding flags, per-project
@@ -78,15 +78,16 @@ impl SyncOptions<'_> {
 }
 
 pub fn sync_host_state(host: &HostPaths, opts: SyncOptions<'_>) -> Result<()> {
-    fs::create_dir_all(&host.container_home).with_context(|| {
+    fs::create_dir_all(&host.staged_home).with_context(|| {
         format!(
-            "failed to ensure container home {}",
-            host.container_home.display()
+            "failed to ensure staged home {}",
+            host.staged_home.display()
         )
     })?;
 
     sync_claude_json(host, &opts).context("failed to sync .claude.json")?;
     sync_settings_json(host, &opts).context("failed to sync .claude/settings.json")?;
+    sync_claude_md(host).context("failed to sync .claude/CLAUDE.md")?;
     sync_claude_extensions(host).context("failed to sync Claude skills/commands/agents")?;
     sync_git_identity(host).context("failed to sync git identity")?;
     Ok(())
@@ -104,7 +105,7 @@ pub fn sync_host_state(host: &HostPaths, opts: SyncOptions<'_>) -> Result<()> {
 fn sync_git_identity(host: &HostPaths) -> Result<()> {
     let name = host_git_config(&host.workspace, "user.name");
     let email = host_git_config(&host.workspace, "user.email");
-    write_container_gitconfig(&host.container_home, name.as_deref(), email.as_deref())
+    write_container_gitconfig(&host.staged_home, name.as_deref(), email.as_deref())
 }
 
 fn write_container_gitconfig(
@@ -120,9 +121,8 @@ fn write_container_gitconfig(
                 .with_context(|| format!("failed to write {}", dest.display()))?;
         }
         _ => {
-            if dest.exists() {
-                let _ = fs::remove_file(&dest);
-            }
+            fs::write(&dest, "")
+                .with_context(|| format!("failed to write empty {}", dest.display()))?;
             eprintln!(
                 "[agent-container] warning: host has no git user.name / user.email configured for this workspace; `git commit` inside the container will fail until you set them."
             );
@@ -189,8 +189,7 @@ fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
         } else {
             obj.remove("awsCredentialExport");
         }
-        // Always strip the older awsAuthRefresh key we used to inject in
-        // case a stale persistent home still has it.
+        // Always strip the older awsAuthRefresh key we used to inject.
         obj.remove("awsAuthRefresh");
         inject_agent_teams_env(obj);
 
@@ -207,7 +206,7 @@ fn sync_claude_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
         }
     }
 
-    let dest = host.container_home.join(".claude.json");
+    let dest = host.staged_home.join(".claude.json");
     let pretty = serde_json::to_string_pretty(&cfg)?;
     fs::write(&dest, pretty).with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
@@ -325,7 +324,7 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
         obj.remove("awsAuthRefresh");
         inject_agent_teams_env(obj);
     }
-    let dest_dir = host.container_home.join(".claude");
+    let dest_dir = host.staged_home.join(".claude");
     fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join("settings.json");
     let pretty = serde_json::to_string_pretty(&settings)?;
@@ -375,6 +374,22 @@ fn inject_agent_teams_env(obj: &mut serde_json::Map<String, Value>) {
     );
 }
 
+fn sync_claude_md(host: &HostPaths) -> Result<()> {
+    let src = host.host_claude_md();
+    let dest = host.staged_home.join(".claude/CLAUDE.md");
+    clear_path(&dest)?;
+    if !src.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::copy(&src, &dest)
+        .with_context(|| format!("failed to copy {} to {}", src.display(), dest.display()))?;
+    Ok(())
+}
+
 fn sync_claude_extensions(host: &HostPaths) -> Result<()> {
     // User-authored extensions keep their native top-level shape. Plugin
     // marketplaces are a different ownership model: Claude Code manages
@@ -382,19 +397,19 @@ fn sync_claude_extensions(host: &HostPaths) -> Result<()> {
     // skills/commands payloads merged into the top-level extension dirs.
     for name in ["skills", "commands"] {
         let src = host.claude_root.join(name);
-        let dest = host.container_home.join(".claude").join(name);
+        let dest = host.staged_home.join(".claude").join(name);
         mirror_or_clear(&src, &dest)?;
         merge_plugin_extension_dirs(host, name)
             .with_context(|| format!("failed to merge plugin {name}"))?;
     }
 
     let src = host.claude_root.join("agents");
-    let dest = host.container_home.join(".claude").join("agents");
+    let dest = host.staged_home.join(".claude").join("agents");
     mirror_or_clear(&src, &dest)?;
 
-    // Remove stale copies from older agent-container versions. Leaving this
-    // tree in persistent home reintroduces marketplace refresh behavior.
-    let plugin_dest = host.container_home.join(".claude").join("plugins");
+    // Never stage the plugin marketplace/cache tree; only flattened portable
+    // commands and skills belong in the container.
+    let plugin_dest = host.staged_home.join(".claude").join("plugins");
     clear_path(&plugin_dest)?;
     Ok(())
 }
@@ -403,6 +418,8 @@ fn sync_claude_extensions(host: &HostPaths) -> Result<()> {
 fn mirror_or_clear(src: &Path, dest: &Path) -> Result<()> {
     clear_path(dest)?;
     if !src.is_dir() {
+        fs::create_dir_all(dest)
+            .with_context(|| format!("failed to create empty {}", dest.display()))?;
         return Ok(());
     }
     copy_dir_recursive(src, dest)
@@ -416,7 +433,7 @@ fn merge_plugin_extension_dirs(host: &HostPaths, name: &str) -> Result<()> {
     collect_extension_dirs(&plugin_root, name, &mut extension_dirs)?;
     extension_dirs.sort();
 
-    let dest = host.container_home.join(".claude").join(name);
+    let dest = host.staged_home.join(".claude").join(name);
     for src in extension_dirs {
         copy_children_without_overwrite(&src, &dest)?;
     }
@@ -556,7 +573,7 @@ mod tests {
             home: tmp_home.path().to_path_buf(),
             claude_root: tmp_home.path().join(".claude"),
             workspace,
-            container_home: container_home.path().to_path_buf(),
+            staged_home: container_home.path().to_path_buf(),
         };
 
         sync_claude_json(
@@ -608,8 +625,8 @@ mod tests {
         let container_home = tempfile::tempdir().unwrap();
         let workspace = tmp_home.path().join("work");
         fs::create_dir_all(&workspace).unwrap();
-        // A stale persistent home may carry the legacy key from an older
-        // agent-container version — sync should remove it unconditionally.
+        // A stale host config may carry the legacy key from an older
+        // agent-container version; sync should remove it unconditionally.
         fs::write(
             tmp_home.path().join(".claude.json"),
             r#"{"awsAuthRefresh": "stale"}"#,
@@ -620,7 +637,7 @@ mod tests {
             home: tmp_home.path().to_path_buf(),
             claude_root: tmp_home.path().join(".claude"),
             workspace,
-            container_home: container_home.path().to_path_buf(),
+            staged_home: container_home.path().to_path_buf(),
         };
         sync_claude_json(
             &host,
@@ -665,7 +682,7 @@ mod tests {
             home: tmp_home.path().to_path_buf(),
             claude_root: tmp_home.path().join(".claude"),
             workspace,
-            container_home: container_home.path().to_path_buf(),
+            staged_home: container_home.path().to_path_buf(),
         };
         use crate::mcp::HttpMcpServer;
         let servers = vec![
@@ -735,7 +752,7 @@ mod tests {
             home: tmp_home.path().to_path_buf(),
             claude_root,
             workspace,
-            container_home: container_home.path().to_path_buf(),
+            staged_home: container_home.path().to_path_buf(),
         };
         sync_claude_json(
             &host,
@@ -775,7 +792,7 @@ mod tests {
             home: tmp_home.path().to_path_buf(),
             claude_root,
             workspace,
-            container_home: container_home.path().to_path_buf(),
+            staged_home: container_home.path().to_path_buf(),
         };
         sync_claude_json(
             &host,
@@ -826,7 +843,7 @@ mod tests {
             home: tmp_home.path().to_path_buf(),
             claude_root,
             workspace,
-            container_home: container_home.path().to_path_buf(),
+            staged_home: container_home.path().to_path_buf(),
         };
         sync_settings_json(
             &host,
@@ -878,7 +895,7 @@ mod tests {
             home: tmp_home.path().to_path_buf(),
             claude_root,
             workspace,
-            container_home: container_home.path().to_path_buf(),
+            staged_home: container_home.path().to_path_buf(),
         };
         sync_settings_json(
             &host,
@@ -916,6 +933,30 @@ mod tests {
     }
 
     #[test]
+    fn claude_md_is_staged_as_a_copied_file() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = tmp_home.path().join("work");
+        let claude_root = tmp_home.path().join(".claude");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&claude_root).unwrap();
+        fs::write(claude_root.join("CLAUDE.md"), "host instructions").unwrap();
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root,
+            workspace,
+            staged_home: container_home.path().to_path_buf(),
+        };
+
+        sync_claude_md(&host).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(container_home.path().join(".claude/CLAUDE.md")).unwrap(),
+            "host instructions"
+        );
+    }
+
+    #[test]
     fn claude_extensions_flatten_plugin_skills_and_commands_without_plugins_tree() {
         let tmp_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
@@ -947,7 +988,7 @@ mod tests {
             home: tmp_home.path().to_path_buf(),
             claude_root,
             workspace,
-            container_home: container_home.path().to_path_buf(),
+            staged_home: container_home.path().to_path_buf(),
         };
         sync_claude_extensions(&host).unwrap();
 
@@ -996,7 +1037,7 @@ mod tests {
             home: tmp_home.path().to_path_buf(),
             claude_root,
             workspace,
-            container_home: container_home.path().to_path_buf(),
+            staged_home: container_home.path().to_path_buf(),
         };
         sync_claude_extensions(&host).unwrap();
 
@@ -1022,12 +1063,16 @@ mod tests {
     }
 
     #[test]
-    fn gitconfig_removed_when_values_missing() {
+    fn gitconfig_emptied_when_values_missing() {
         let container_home = tempfile::tempdir().unwrap();
         let dest = container_home.path().join(".gitconfig");
         fs::write(&dest, "[user]\n\tname = stale\n").unwrap();
 
         write_container_gitconfig(container_home.path(), None, Some("only@example.com")).unwrap();
-        assert!(!dest.exists(), "stale gitconfig should be removed");
+        assert_eq!(
+            fs::read_to_string(&dest).unwrap(),
+            "",
+            "stale gitconfig should be emptied"
+        );
     }
 }

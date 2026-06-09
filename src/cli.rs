@@ -125,9 +125,10 @@ const RUN_HELP: &str = r#"Launch a coding agent inside the sandbox container.
 
 The current directory is mounted at the same absolute path inside the
 container, so Claude Code resume state stays compatible with native host
-runs. The container gets a persistent home under agent-container's data
-directory, plus filtered Claude Code and Codex auth/config state from the
-host. Network egress goes through the bundled proxy allowlist. Host-only
+runs. The container home is ephemeral; explicit host state is mounted, while
+filtered Claude Code / Codex config generated for this run is streamed into
+the created container before startup. Network egress goes through the bundled
+proxy allowlist. Host-only
 operations should be exposed through `[task_runner.tasks]` instead of relying
 on ordinary container shell access.
 
