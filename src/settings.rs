@@ -27,7 +27,7 @@
 //! build = "cargo build --release"
 //!
 //! [filesystem]
-//! mounts = ["/Users/me/project-notes"]
+//! mounts = [{ path = "/Users/me/project-notes", readonly = true }]
 //! hide = ["(^|/)\\.env(\\..*)?$"]
 //! readonly = ["(^|/)\\.claude(/|$)"]
 //!
@@ -131,13 +131,13 @@ impl TaskRunnerPolicy {
 
 /// Host filesystem roots and filters shared by bind mounts and the
 /// built-in `host-fs` MCP server. The current workspace is always a
-/// mounted root; `mounts` adds more absolute host directories. `hide`
-/// and `readonly` are regular expressions matched against paths
-/// relative to each root.
+/// mounted root; `mounts` adds more host directories. `hide` and
+/// `readonly` are regular expressions matched against paths relative to
+/// each root.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesystemPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mounts: Vec<String>,
+    pub mounts: Vec<FilesystemMount>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hide: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -148,6 +148,47 @@ impl FilesystemPolicy {
     pub fn is_empty(&self) -> bool {
         self.mounts.is_empty() && self.hide.is_empty() && self.readonly.is_empty()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "FilesystemMountRepr")]
+pub struct FilesystemMount {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub readonly: bool,
+}
+
+impl FilesystemMount {
+    pub fn new(path: String, readonly: bool) -> Self {
+        Self { path, readonly }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FilesystemMountRepr {
+    Legacy(String),
+    Detailed {
+        path: String,
+        #[serde(default)]
+        readonly: bool,
+    },
+}
+
+impl From<FilesystemMountRepr> for FilesystemMount {
+    fn from(value: FilesystemMountRepr) -> Self {
+        match value {
+            FilesystemMountRepr::Legacy(path) => Self {
+                path,
+                readonly: false,
+            },
+            FilesystemMountRepr::Detailed { path, readonly } => Self { path, readonly },
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub fn default_filesystem_hide() -> Vec<String> {
@@ -389,7 +430,7 @@ impl Settings {
     }
 }
 
-fn append_unique(target: &mut Vec<String>, overlay: Vec<String>) {
+fn append_unique<T: PartialEq>(target: &mut Vec<T>, overlay: Vec<T>) {
     for value in overlay {
         if !target.contains(&value) {
             target.push(value);
@@ -464,6 +505,22 @@ mod tests {
             "existing file should not be padded with bundled defaults"
         );
         assert!(s.claude_code.mcp.servers.contains_key("gh"));
+    }
+
+    #[test]
+    fn filesystem_mounts_accept_legacy_strings() {
+        let settings: Settings = toml::from_str(
+            r#"
+[filesystem]
+mounts = ["/tmp/notes"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings.filesystem.mounts,
+            vec![FilesystemMount::new("/tmp/notes".to_string(), false)]
+        );
     }
 
     #[test]

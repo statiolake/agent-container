@@ -547,18 +547,18 @@ fn prepare_secret_shadow_mounts(
     let mut mounts = Vec::new();
     let matcher = crate::host_fs::FilesystemMatcher::new(workspace, filesystem)?;
     let canonical_workspace = std::fs::canonicalize(workspace)?;
-    for root in matcher.roots() {
-        let is_workspace_root = root == &canonical_workspace;
+    for root in matcher.root_paths() {
+        let is_workspace_root = root == canonical_workspace.as_path();
         let target_root = if is_workspace_root {
             container_workspace.to_path_buf()
         } else {
-            root.clone()
+            root.to_path_buf()
         };
         if !is_workspace_root {
             mounts.push(SecretShadowMount {
-                source: root.clone(),
+                source: root.to_path_buf(),
                 target: target_root.clone(),
-                read_only: false,
+                read_only: matcher.root_readonly(root),
             });
         }
         collect_secret_shadow_mounts(
@@ -592,7 +592,7 @@ fn collect_secret_shadow_mounts(
         }
         Err(e) => return Err(e).with_context(|| format!("failed to stat {}", path.display())),
     };
-    match matcher.classify_resolved(path)? {
+    match matcher.classify_resolved_for_shadow(path)? {
         crate::host_fs::FilesystemAccess::Hidden => {
             let relative = path
                 .strip_prefix(root)

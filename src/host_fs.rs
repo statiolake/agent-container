@@ -435,9 +435,15 @@ pub enum FilesystemAccess {
 }
 
 pub struct FilesystemMatcher {
-    roots: Vec<PathBuf>,
+    roots: Vec<MountedRoot>,
     hide: Vec<Regex>,
     readonly: Vec<Regex>,
+}
+
+#[derive(Debug, Clone)]
+struct MountedRoot {
+    path: PathBuf,
+    readonly: bool,
 }
 
 impl FilesystemMatcher {
@@ -452,8 +458,14 @@ impl FilesystemMatcher {
         })
     }
 
-    pub fn roots(&self) -> &[PathBuf] {
-        &self.roots
+    pub fn root_paths(&self) -> impl Iterator<Item = &Path> {
+        self.roots.iter().map(|root| root.path.as_path())
+    }
+
+    pub fn root_readonly(&self, path: &Path) -> bool {
+        self.roots
+            .iter()
+            .any(|root| root.path == path && root.readonly)
     }
 
     pub fn classify_existing_or_absolute(&self, path: &Path) -> Result<FilesystemAccess> {
@@ -467,19 +479,33 @@ impl FilesystemMatcher {
     }
 
     pub fn classify_resolved(&self, path: &Path) -> Result<FilesystemAccess> {
+        self.classify_resolved_inner(path, true)
+    }
+
+    pub fn classify_resolved_for_shadow(&self, path: &Path) -> Result<FilesystemAccess> {
+        self.classify_resolved_inner(path, false)
+    }
+
+    fn classify_resolved_inner(
+        &self,
+        path: &Path,
+        include_mount_readonly: bool,
+    ) -> Result<FilesystemAccess> {
         for root in &self.roots {
-            if !path.starts_with(root) {
+            if !path.starts_with(&root.path) {
                 continue;
             }
             let rel = path
-                .strip_prefix(root)
+                .strip_prefix(&root.path)
                 .unwrap_or(Path::new(""))
                 .to_string_lossy()
                 .replace('\\', "/");
             if matches_any_compiled_regex(&self.hide, &rel) {
                 return Ok(FilesystemAccess::Hidden);
             }
-            if matches_any_compiled_regex(&self.readonly, &rel) {
+            if (include_mount_readonly && root.readonly)
+                || matches_any_compiled_regex(&self.readonly, &rel)
+            {
                 return Ok(FilesystemAccess::Readonly);
             }
             return Ok(FilesystemAccess::Readwrite);
@@ -490,27 +516,31 @@ impl FilesystemMatcher {
     pub fn has_visible_descendant_root(&self, path: &Path) -> bool {
         self.roots
             .iter()
-            .any(|root| root != path && root.starts_with(path))
+            .any(|root| root.path != path && root.path.starts_with(path))
     }
 }
 
-pub fn mounted_roots(
+fn mounted_roots(
     workspace: &Path,
     policy: &crate::settings::FilesystemPolicy,
-) -> Result<Vec<PathBuf>> {
-    let mut roots = vec![
-        std::fs::canonicalize(workspace)
+) -> Result<Vec<MountedRoot>> {
+    let mut roots = vec![MountedRoot {
+        path: std::fs::canonicalize(workspace)
             .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?,
-    ];
+        readonly: false,
+    }];
     for mount in &policy.mounts {
-        if mount.trim().is_empty() {
+        if mount.path.trim().is_empty() {
             continue;
         }
-        let path = normalize_absolute(Path::new(mount))?;
+        let path = normalize_absolute(Path::new(&mount.path))?;
         let path = std::fs::canonicalize(&path)
             .with_context(|| format!("failed to resolve filesystem mount {}", path.display()))?;
-        if !roots.contains(&path) {
-            roots.push(path);
+        if !roots.iter().any(|root| root.path == path) {
+            roots.push(MountedRoot {
+                path,
+                readonly: mount.readonly,
+            });
         }
     }
     Ok(roots)
@@ -715,7 +745,10 @@ mod tests {
         std::fs::create_dir_all(&hidden_sibling).unwrap();
 
         let policy = crate::settings::FilesystemPolicy {
-            mounts: vec![mounted.display().to_string()],
+            mounts: vec![crate::settings::FilesystemMount::new(
+                mounted.display().to_string(),
+                false,
+            )],
             hide: Vec::new(),
             readonly: Vec::new(),
         };
@@ -730,6 +763,31 @@ mod tests {
         collect_list_entries(&matcher, &root, 2, 0, &mut depth_two).unwrap();
         assert_eq!(entry_names(&depth_two), vec!["b", "c"]);
         assert_eq!(entry_depths(&depth_two), vec![1, 2]);
+    }
+
+    #[test]
+    fn readonly_mount_classifies_descendants_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let mounted = dir.path().join("notes");
+        let file = mounted.join("note.md");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&mounted).unwrap();
+        std::fs::write(&file, "note").unwrap();
+
+        let policy = crate::settings::FilesystemPolicy {
+            mounts: vec![crate::settings::FilesystemMount::new(
+                mounted.display().to_string(),
+                true,
+            )],
+            hide: Vec::new(),
+            readonly: Vec::new(),
+        };
+
+        assert_eq!(
+            classify_path(&workspace, &policy, &file).unwrap(),
+            FilesystemAccess::Readonly
+        );
     }
 
     #[test]

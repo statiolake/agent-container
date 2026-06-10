@@ -221,7 +221,7 @@ Supported TOML shape:
   deploy = "\"$CONFIG_ROOT/scripts/deploy\" \"$env\""
 
   [filesystem]
-  mounts = ["/Users/me/project-notes"]
+  mounts = [{ path = "/Users/me/project-notes", readonly = true }]
   hide = ["(^|/)\\.env(\\..*)?$"]
   readonly = ["(^|/)\\.claude(/|$)"]
 
@@ -241,7 +241,7 @@ workspace task scripts can use the same command shape.
 
 `filesystem` controls both container bind mounts and the built-in host-fs MCP
 server. The current workspace is always mounted. `filesystem.mounts` adds more
-absolute host directories. `filesystem.hide` and `filesystem.readonly` are
+host directories and can mark each one readonly. `filesystem.hide` and `filesystem.readonly` are
 regular expressions matched against paths relative to each mounted root:
 hidden paths are shadowed so the agent cannot see them, while readonly paths
 are visible but overlaid as read-only. Global defaults hide common secret file

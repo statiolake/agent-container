@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -44,7 +45,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs};
 
 use crate::policy::McpPolicy;
-use crate::settings::{DefaultAgent, FilesystemPolicy, GeneralPolicy, Scope};
+use crate::settings::{DefaultAgent, FilesystemMount, FilesystemPolicy, GeneralPolicy, Scope};
 
 /// Single-line text buffer with readline-style editing primitives.
 ///
@@ -218,6 +219,7 @@ pub struct ToolEntry {
 }
 
 pub struct TuiInput {
+    pub workspace: PathBuf,
     /// Scope the editor starts on. `t` flips it to the other scope.
     pub initial_scope: Scope,
     /// Each scope's current `proxy.allow` list as it lives on disk. Both
@@ -366,6 +368,8 @@ enum Mode {
     FilesystemInput {
         field: FilesystemField,
         buffer: TextField,
+        mount_readonly: bool,
+        error: Option<String>,
         editing: Option<FilesystemRow>,
     },
     TaskInput {
@@ -634,6 +638,7 @@ struct FilesystemRow {
     origin: ProxyOrigin,
     field: FilesystemField,
     value: String,
+    mount_readonly: bool,
     idx_within_scope: usize,
 }
 
@@ -659,17 +664,17 @@ impl FilesystemState {
         }
     }
 
-    fn list(policy: &FilesystemPolicy, field: FilesystemField) -> &Vec<String> {
+    fn filter_list(policy: &FilesystemPolicy, field: FilesystemField) -> &Vec<String> {
         match field {
-            FilesystemField::Mount => &policy.mounts,
+            FilesystemField::Mount => unreachable!("mounts are not regex filter lists"),
             FilesystemField::Hide => &policy.hide,
             FilesystemField::Readonly => &policy.readonly,
         }
     }
 
-    fn list_mut(policy: &mut FilesystemPolicy, field: FilesystemField) -> &mut Vec<String> {
+    fn filter_list_mut(policy: &mut FilesystemPolicy, field: FilesystemField) -> &mut Vec<String> {
         match field {
-            FilesystemField::Mount => &mut policy.mounts,
+            FilesystemField::Mount => unreachable!("mounts are not regex filter lists"),
             FilesystemField::Hide => &mut policy.hide,
             FilesystemField::Readonly => &mut policy.readonly,
         }
@@ -684,16 +689,22 @@ impl FilesystemState {
 
     fn rows_for(policy: &FilesystemPolicy, origin: ProxyOrigin) -> Vec<FilesystemRow> {
         let mut rows = Vec::new();
-        for field in [
-            FilesystemField::Mount,
-            FilesystemField::Hide,
-            FilesystemField::Readonly,
-        ] {
-            for (i, value) in Self::list(policy, field).iter().enumerate() {
+        for (i, mount) in policy.mounts.iter().enumerate() {
+            rows.push(FilesystemRow {
+                origin,
+                field: FilesystemField::Mount,
+                value: mount.path.clone(),
+                mount_readonly: mount.readonly,
+                idx_within_scope: i,
+            });
+        }
+        for field in [FilesystemField::Hide, FilesystemField::Readonly] {
+            for (i, value) in Self::filter_list(policy, field).iter().enumerate() {
                 rows.push(FilesystemRow {
                     origin,
                     field,
                     value: value.clone(),
+                    mount_readonly: false,
                     idx_within_scope: i,
                 });
             }
@@ -763,6 +774,7 @@ impl FilesystemState {
         scope: Scope,
         field: FilesystemField,
         value: String,
+        mount_readonly: bool,
         editing: Option<FilesystemRow>,
     ) {
         let trimmed = value.trim();
@@ -774,17 +786,30 @@ impl FilesystemState {
         match editing {
             Some(row) if row.origin == active => {
                 let policy = self.policy_mut(active);
-                let list = Self::list_mut(policy, row.field);
-                if row.idx_within_scope < list.len() {
-                    list[row.idx_within_scope] = v;
+                if row.field == FilesystemField::Mount {
+                    if row.idx_within_scope < policy.mounts.len() {
+                        policy.mounts[row.idx_within_scope] =
+                            FilesystemMount::new(v, mount_readonly);
+                    }
+                } else {
+                    let list = Self::filter_list_mut(policy, row.field);
+                    if row.idx_within_scope < list.len() {
+                        list[row.idx_within_scope] = v;
+                    }
                 }
             }
             Some(_) => {}
             None => {
                 let policy = self.policy_mut(active);
-                let list = Self::list_mut(policy, field);
-                if !list.contains(&v) {
-                    list.push(v);
+                if field == FilesystemField::Mount {
+                    if !policy.mounts.iter().any(|mount| mount.path == v) {
+                        policy.mounts.push(FilesystemMount::new(v, mount_readonly));
+                    }
+                } else {
+                    let list = Self::filter_list_mut(policy, field);
+                    if !list.contains(&v) {
+                        list.push(v);
+                    }
                 }
                 let len = self.entry_rows(scope).len();
                 self.cursor = len.saturating_sub(1);
@@ -798,9 +823,15 @@ impl FilesystemState {
             return;
         }
         let policy = self.policy_mut(active);
-        let list = Self::list_mut(policy, row.field);
-        if row.idx_within_scope < list.len() {
-            list.remove(row.idx_within_scope);
+        if row.field == FilesystemField::Mount {
+            if row.idx_within_scope < policy.mounts.len() {
+                policy.mounts.remove(row.idx_within_scope);
+            }
+        } else {
+            let list = Self::filter_list_mut(policy, row.field);
+            if row.idx_within_scope < list.len() {
+                list.remove(row.idx_within_scope);
+            }
         }
         let len = self.visible_rows(scope).len();
         if self.cursor >= len {
@@ -1211,6 +1242,7 @@ struct Snapshot {
 }
 
 struct App {
+    workspace: PathBuf,
     scope: Scope,
     tab: TopTab,
     general: GeneralState,
@@ -1248,6 +1280,7 @@ impl App {
         let tasks_global = input.tasks_global;
         let tasks_workspace = input.tasks_workspace;
         Self {
+            workspace: input.workspace,
             scope: input.initial_scope,
             tab: TopTab::General,
             general: GeneralState::new(input.general_global, input.general_workspace),
@@ -1413,7 +1446,9 @@ fn handle_filesystem_input_key(app: &mut App, code: KeyCode, modifiers: KeyModif
     let Mode::FilesystemInput {
         field,
         mut buffer,
+        mut mount_readonly,
         editing,
+        ..
     } = std::mem::replace(&mut app.mode, Mode::Normal)
     else {
         return;
@@ -1423,9 +1458,29 @@ fn handle_filesystem_input_key(app: &mut App, code: KeyCode, modifiers: KeyModif
     match code {
         KeyCode::Esc => return,
         KeyCode::Char('c') if ctrl => return,
+        KeyCode::Char(' ') if field == FilesystemField::Mount => {
+            mount_readonly = !mount_readonly;
+        }
         KeyCode::Enter => {
+            let value = if field == FilesystemField::Mount {
+                match resolve_existing_mount_path(&app.workspace, &buffer.value()) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        app.mode = Mode::FilesystemInput {
+                            field,
+                            buffer,
+                            mount_readonly,
+                            error: Some(e),
+                            editing,
+                        };
+                        return;
+                    }
+                }
+            } else {
+                buffer.value()
+            };
             app.filesystem
-                .upsert(app.scope, field, buffer.value(), editing);
+                .upsert(app.scope, field, value, mount_readonly, editing);
             return;
         }
         _ => {
@@ -1436,8 +1491,29 @@ fn handle_filesystem_input_key(app: &mut App, code: KeyCode, modifiers: KeyModif
     app.mode = Mode::FilesystemInput {
         field,
         buffer,
+        mount_readonly,
+        error: None,
         editing,
     };
+}
+
+fn resolve_existing_mount_path(workspace: &Path, raw: &str) -> std::result::Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Path is required.".to_string());
+    }
+    let input = Path::new(trimmed);
+    let path = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        workspace.join(input)
+    };
+    let resolved = std::fs::canonicalize(&path)
+        .map_err(|e| format!("Path does not exist: {} ({e})", path.display()))?;
+    if !resolved.is_dir() {
+        return Err(format!("Path is not a directory: {}", resolved.display()));
+    }
+    Ok(resolved.display().to_string())
 }
 
 fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
@@ -1575,9 +1651,12 @@ fn start_item_edit(app: &mut App, target: ItemActionTarget) {
             };
         }
         ItemActionTarget::Filesystem(row) => {
+            let mount_readonly = row.field == FilesystemField::Mount && row.mount_readonly;
             app.mode = Mode::FilesystemInput {
                 field: row.field,
                 buffer: TextField::from_str(&row.value),
+                mount_readonly,
+                error: None,
                 editing: Some(row),
             };
         }
@@ -1814,6 +1893,8 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                         app.mode = Mode::FilesystemInput {
                             field,
                             buffer: TextField::default(),
+                            mount_readonly: field == FilesystemField::Mount,
+                            error: None,
                             editing: None,
                         };
                     }
@@ -1884,10 +1965,20 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     if let Mode::FilesystemInput {
         field,
         ref buffer,
+        mount_readonly,
+        ref error,
         ref editing,
     } = app.mode
     {
-        render_filesystem_input_modal(f, area, field, buffer, editing.is_some());
+        render_filesystem_input_modal(
+            f,
+            area,
+            field,
+            buffer,
+            mount_readonly,
+            error.as_deref(),
+            editing.is_some(),
+        );
     }
 
     if let Mode::DefaultAgentSelect { cursor } = app.mode {
@@ -2081,6 +2172,11 @@ fn render_filesystem(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     Style::default()
                 };
                 let overlay = app.scope == Scope::Workspace && row.origin == ProxyOrigin::Workspace;
+                let readonly = if row.field == FilesystemField::Mount {
+                    if row.mount_readonly { "[x] " } else { "[ ] " }
+                } else {
+                    ""
+                };
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         if overlay { "* " } else { "  " }.to_string(),
@@ -2093,6 +2189,7 @@ fn render_filesystem(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                         Style::default().fg(Color::Cyan),
                     ),
                     Span::raw(" "),
+                    Span::styled(readonly, Style::default().fg(Color::Cyan)),
                     Span::styled(row.value.clone(), style),
                 ]))
             }
@@ -2371,10 +2468,16 @@ fn render_filesystem_input_modal(
     parent: Rect,
     field: FilesystemField,
     buffer: &TextField,
+    mount_readonly: bool,
+    error: Option<&str>,
     is_edit: bool,
 ) {
     let w = parent.width.clamp(46, 84);
-    let h: u16 = 5;
+    let h: u16 = if field == FilesystemField::Mount {
+        8
+    } else {
+        5
+    };
     let x = parent.x + (parent.width.saturating_sub(w)) / 2;
     let y = parent.y + (parent.height.saturating_sub(h)) / 2;
     let area = Rect::new(x, y, w, h);
@@ -2391,7 +2494,7 @@ fn render_filesystem_input_modal(
 
     let hint_text = match field {
         FilesystemField::Mount => {
-            "Absolute host directory path. The current workspace is always mounted."
+            "Host directory path. Relative paths are resolved from the current workspace."
         }
         FilesystemField::Hide => {
             "Regex matched against paths relative to each mounted root; matching paths are hidden."
@@ -2405,7 +2508,22 @@ fn render_filesystem_input_modal(
         Style::default().fg(Color::DarkGray),
     )]);
     let body = Line::from(vec![Span::raw("> "), Span::raw(buffer.value())]);
-    let para = Paragraph::new(vec![hint, Line::from(""), body]);
+    let mut lines = vec![hint, Line::from(""), body];
+    if field == FilesystemField::Mount {
+        let checkbox = if mount_readonly { "[x]" } else { "[ ]" };
+        lines.push(Line::from(vec![
+            Span::styled(checkbox, Style::default().fg(Color::Cyan)),
+            Span::raw(" Readonly"),
+            Span::styled("  Space toggle", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    if let Some(error) = error {
+        lines.push(Line::from(Span::styled(
+            error.to_string(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    let para = Paragraph::new(lines);
     f.render_widget(para, inner);
 
     let cursor_x = inner.x + 2 + buffer.prefix_width();
@@ -2931,6 +3049,7 @@ mod tests {
 
     fn fresh_input() -> TuiInput {
         TuiInput {
+            workspace: PathBuf::from("/tmp"),
             initial_scope: Scope::Workspace,
             general_global: GeneralPolicy {
                 default_agent: Some(DefaultAgent::Claude),
@@ -2939,7 +3058,7 @@ mod tests {
             proxy_allow_global: vec!["g".into()],
             proxy_allow_workspace: vec!["w".into()],
             filesystem_global: FilesystemPolicy {
-                mounts: vec!["/tmp/shared".into()],
+                mounts: vec![FilesystemMount::new("/tmp/shared".into(), false)],
                 hide: vec![r"(^|/)\.env$".into()],
                 readonly: vec![r"(^|/)\.claude(/|$)".into()],
             },
@@ -3068,7 +3187,10 @@ mod tests {
     #[test]
     fn has_unsaved_changes_detects_filesystem_edit() {
         let mut app = App::new(fresh_input());
-        app.filesystem.workspace.mounts.push("/tmp/other".into());
+        app.filesystem
+            .workspace
+            .mounts
+            .push(FilesystemMount::new("/tmp/other".into(), false));
         assert!(app.has_unsaved_changes());
     }
 
@@ -3173,7 +3295,7 @@ mod tests {
     fn filesystem_visible_rows_group_paths_and_filters() {
         let state = FilesystemState::new(
             FilesystemPolicy {
-                mounts: vec!["/tmp/shared".into()],
+                mounts: vec![FilesystemMount::new("/tmp/shared".into(), true)],
                 hide: vec!["secret".into()],
                 readonly: vec!["readonly".into()],
             },
@@ -3223,6 +3345,62 @@ mod tests {
 
         assert!(app.filesystem.workspace.hide.is_empty());
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn filesystem_mount_input_resolves_relative_path_and_defaults_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let notes = workspace.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+
+        let mut input = fresh_input();
+        input.workspace = workspace.clone();
+        let mut app = App::new(input);
+        app.mode = Mode::FilesystemInput {
+            field: FilesystemField::Mount,
+            buffer: TextField::from_str("notes"),
+            mount_readonly: true,
+            error: None,
+            editing: None,
+        };
+
+        handle_filesystem_input_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+
+        assert_eq!(
+            app.filesystem.workspace.mounts,
+            vec![FilesystemMount::new(
+                std::fs::canonicalize(notes).unwrap().display().to_string(),
+                true,
+            )]
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn filesystem_mount_input_rejects_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let mut input = fresh_input();
+        input.workspace = workspace;
+        let mut app = App::new(input);
+        app.mode = Mode::FilesystemInput {
+            field: FilesystemField::Mount,
+            buffer: TextField::from_str("missing"),
+            mount_readonly: true,
+            error: None,
+            editing: None,
+        };
+
+        handle_filesystem_input_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+
+        assert!(app.filesystem.workspace.mounts.is_empty());
+        assert!(matches!(
+            app.mode,
+            Mode::FilesystemInput { error: Some(_), .. }
+        ));
     }
 
     #[test]
