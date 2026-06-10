@@ -237,19 +237,22 @@ async fn mcp_list_cmd(host: &paths::HostPaths, agent: AgentKind) -> Result<()> {
         return Ok(());
     }
 
-    let mut probes = FuturesUnordered::new();
-    for server in servers.iter().cloned() {
-        let oauth_store = oauth_store.clone();
-        probes.push(async move {
-            let name = server.name().to_string();
-            let result = probe_mcp_server(&server, &oauth_store).await;
-            (name, result)
-        });
-    }
-    let mut probe_results = std::collections::BTreeMap::new();
-    while let Some((name, result)) = probes.next().await {
-        probe_results.insert(name, result);
-    }
+    let mut probe_results = {
+        let mut probes = FuturesUnordered::new();
+        for server in &servers {
+            let oauth_store = oauth_store.clone();
+            probes.push(async move {
+                let name = server.name().to_string();
+                let result = probe_mcp_server(server, &oauth_store).await;
+                (name, result)
+            });
+        }
+        let mut results = std::collections::BTreeMap::new();
+        while let Some((name, result)) = probes.next().await {
+            results.insert(name, result);
+        }
+        results
+    };
 
     for server in servers {
         println!("  {}", server.name());
@@ -423,40 +426,40 @@ async fn spawn_agent_brokers(inputs: BrokerInputs<'_>) -> Result<AgentBrokerSet>
         container_root: host.container_workspace().display().to_string(),
         host_root: host.workspace.display().to_string(),
     };
-    let claude = server::spawn(
+    let claude = server::spawn(server::SpawnConfig {
         bedrock,
-        claude_mcp_servers,
-        claude_task_runner,
-        claude_host_fs,
-        claude_policy,
-        oauth_store.clone(),
-        Some(stdio_bridge),
-        Some(server::McpReloadConfig {
+        mcp_servers: claude_mcp_servers,
+        task_runner: claude_task_runner,
+        host_fs: claude_host_fs,
+        policy: claude_policy,
+        oauth: oauth_store.clone(),
+        stdio_bridge: Some(stdio_bridge),
+        reload: Some(server::McpReloadConfig {
             workspace: host.workspace.clone(),
             task_runner_enabled: claude_task_runner_enabled,
             policy_scope: server::McpPolicyScope::ClaudeCode,
         }),
-    )
+    })
     .await?;
     tracing::info!(addr = %claude.addr, "Claude Code broker listening");
 
-    let codex = server::spawn(
-        None,
-        codex_mcp_servers,
-        codex_task_runner,
-        codex_host_fs,
-        codex_policy,
-        oauth_store,
-        Some(stdio_mcp::PathBridge {
+    let codex = server::spawn(server::SpawnConfig {
+        bedrock: None,
+        mcp_servers: codex_mcp_servers,
+        task_runner: codex_task_runner,
+        host_fs: codex_host_fs,
+        policy: codex_policy,
+        oauth: oauth_store,
+        stdio_bridge: Some(stdio_mcp::PathBridge {
             container_root: host.container_workspace().display().to_string(),
             host_root: host.workspace.display().to_string(),
         }),
-        Some(server::McpReloadConfig {
+        reload: Some(server::McpReloadConfig {
             workspace: host.workspace.clone(),
             task_runner_enabled: codex_task_runner_enabled,
             policy_scope: server::McpPolicyScope::Codex,
         }),
-    )
+    })
     .await?;
     tracing::info!(addr = %codex.addr, "Codex broker listening");
 

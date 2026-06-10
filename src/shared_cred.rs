@@ -165,13 +165,13 @@ impl Drop for SharedCredFile {
             return;
         }
 
-        if let Ok(raw) = fs::read_to_string(&self.path) {
-            if let Err(e) = self.host_sync.apply(raw.trim()) {
-                tracing::warn!(
-                    %e,
-                    "failed to write credentials back to host; discarding shared copy",
-                );
-            }
+        if let Ok(raw) = fs::read_to_string(&self.path)
+            && let Err(e) = self.host_sync.apply(raw.trim())
+        {
+            tracing::warn!(
+                %e,
+                "failed to write credentials back to host; discarding shared copy",
+            );
         }
         let _ = fs::remove_file(&self.path);
         drop(lock);

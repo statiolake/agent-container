@@ -367,6 +367,8 @@ enum Direction {
     ServerToClient,
 }
 
+type UriMapper = dyn Fn(&str) -> Option<String>;
+
 /// Apply MCP-spec-aware URI translation. Only touches the specific fields
 /// that the specification says carry `uri` / `uriTemplate`, never a blind
 /// substring replace over the whole message.
@@ -375,7 +377,7 @@ fn rewrite_known_uris(v: &mut Value, method: &str, dir: Direction, bridge: &Path
     // container root onto the host root; the reverse direction undoes it.
     let container_root = bridge.container_root.clone();
     let host_root = bridge.host_root.clone();
-    let map_owned: Box<dyn Fn(&str) -> Option<String>> = match dir {
+    let map_owned: Box<UriMapper> = match dir {
         Direction::ClientToServer => {
             Box::new(move |s: &str| rewrite_root(s, &container_root, &host_root))
         }
@@ -418,10 +420,10 @@ fn rewrite_known_uris(v: &mut Value, method: &str, dir: Direction, bridge: &Path
 }
 
 fn map_single_uri(slot: Option<&mut Value>, map: &dyn Fn(&str) -> Option<String>) {
-    if let Some(Value::String(s)) = slot {
-        if let Some(replaced) = map(s) {
-            *s = replaced;
-        }
+    if let Some(Value::String(s)) = slot
+        && let Some(replaced) = map(s)
+    {
+        *s = replaced;
     }
 }
 
@@ -430,12 +432,11 @@ fn map_each_uri(array: Option<&mut Value>, field: &str, map: &dyn Fn(&str) -> Op
         return;
     };
     for item in items.iter_mut() {
-        if let Value::Object(obj) = item {
-            if let Some(Value::String(s)) = obj.get_mut(field) {
-                if let Some(replaced) = map(s) {
-                    *s = replaced;
-                }
-            }
+        if let Value::Object(obj) = item
+            && let Some(Value::String(s)) = obj.get_mut(field)
+            && let Some(replaced) = map(s)
+        {
+            *s = replaced;
         }
     }
 }
@@ -451,20 +452,20 @@ fn rewrite_root(s: &str, from: &str, to: &str) -> Option<String> {
     if s == from {
         return Some(to.to_string());
     }
-    if let Some(rest) = s.strip_prefix(from) {
-        if rest.starts_with('/') {
-            return Some(format!("{to}{rest}"));
-        }
+    if let Some(rest) = s.strip_prefix(from)
+        && rest.starts_with('/')
+    {
+        return Some(format!("{to}{rest}"));
     }
     // file:// URI form.
     let file_prefix = format!("file://{from}");
     if s == file_prefix {
         return Some(format!("file://{to}"));
     }
-    if let Some(rest) = s.strip_prefix(&file_prefix) {
-        if rest.starts_with('/') {
-            return Some(format!("file://{to}{rest}"));
-        }
+    if let Some(rest) = s.strip_prefix(&file_prefix)
+        && rest.starts_with('/')
+    {
+        return Some(format!("file://{to}{rest}"));
     }
     None
 }

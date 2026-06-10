@@ -224,7 +224,7 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
     ] {
-        env.entry(key.to_string()).or_insert_with(String::new);
+        env.entry(key.to_string()).or_default();
     }
 
     let ctx = ComposeCtx {
@@ -356,7 +356,7 @@ fn prepare_run_artifacts(
     let secret_shadow_root_path = secret_shadow_root(pid);
     let secret_shadows = prepare_secret_shadow_mounts(
         &opts.host.workspace,
-        &opts.host.container_workspace(),
+        opts.host.container_workspace(),
         pid,
         &opts.filesystem,
     )?;
@@ -562,8 +562,8 @@ fn prepare_secret_shadow_mounts(
             });
         }
         collect_secret_shadow_mounts(
-            &root,
-            &root,
+            root,
+            root,
             &target_root,
             &shadow_root,
             &matcher,

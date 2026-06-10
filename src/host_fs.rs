@@ -38,9 +38,7 @@ impl HostFs {
         };
         let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
         let id = parsed.get("id").cloned();
-        let Some(id) = id else {
-            return None;
-        };
+        let id = id?;
 
         match method {
             "initialize" => Some(self.initialize(id)),
@@ -217,11 +215,9 @@ impl HostFs {
         let create_parents = optional_bool(arguments, "createParents").unwrap_or(false);
         let path = resolve_write_path(path)?;
         self.ensure_writable(&path)?;
-        if create_parents {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
-            }
+        if create_parents && let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         std::fs::write(&path, content)
             .with_context(|| format!("failed to write {}", path.display()))?;

@@ -3,7 +3,7 @@
 //! - `config show [--global|--workspace]` prints TOML.
 //! - `config [--global|--workspace]` opens the ratatui editor.
 //! - `config [--global|--workspace] --editor` opens `$EDITOR` on the
-//!    settings file directly.
+//!   settings file directly.
 //!
 //! Scope flags select the file to *write* (or, for `show`, the file to
 //! read in isolation). Without flags, writes default to workspace and
@@ -115,6 +115,7 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
 
     match tui::run_selection(input)? {
         Outcome::Save(out) => {
+            let out = *out;
             let saved_scope = out.saved_scope;
             // Base for MCP/task minimisation is the *other* scope. For
             // Global there is no lower layer, so base falls back to the
@@ -279,13 +280,13 @@ async fn fetch_tool_catalog(
         servers.len()
     );
     let mut fetches = FuturesUnordered::new();
-    for server in servers.iter().cloned() {
+    for server in servers {
         let oauth = oauth.clone();
         fetches.push(async move {
             let name = server.name().to_string();
             let transport = server.transport_label().to_string();
             let result = crate::mcp_client::fetch_tools_any_with_timeout(
-                &server,
+                server,
                 &oauth,
                 crate::mcp_client::DEFAULT_FETCH_TIMEOUT,
             )

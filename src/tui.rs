@@ -4,27 +4,24 @@
 //!
 //! - **General** — simple runtime defaults such as which agent
 //!   `agent-container run` starts when `--agent` is omitted.
-//! - **Proxy** — a scope-local list of tinyproxy allow regex patterns
-//!   (the ones that will be appended to the bundled base allowlist at
-//!   runtime). `i`/`+` appends, `e`/`Enter` edits, `d` removes.
+//! - **Proxy** — a scope-local list of tinyproxy allow regex patterns.
+//! - **Filesystem** — a tree of host path mounts and filter patterns.
 //! - **MCP (Claude Code)** and **MCP (Codex)** — collapsible trees of
-//!   servers → tools. `Space` toggles the
-//!   highlighted item (collapse on a server row, enable/disable on a
-//!   tool row). `a`/`A` bulk-toggles every tool in the focused server.
+//!   task-runner commands and servers → tools. `Enter` activates the
+//!   highlighted row (expand/collapse, edit, add, or toggle).
 //!   The built-in `task-runner` always sits at the top of the tree; its
 //!   children are editable `name = command` entries that become MCP
-//!   tools for host-side command execution. `i`/`+` adds, `e`/`Enter`
-//!   edits, `d` removes.
+//!   tools for host-side command execution.
 //!
 //! Cross-tab:
 //!
-//! - `h`/`l` (or ←/→, Tab/Shift+Tab) switch tabs.
-//! - `j`/`k` (or ↑/↓) move within the current tab.
+//! - ←/→ or `h`/`l` (or Tab/Shift+Tab) switch tabs.
+//! - ↑/↓ or `j`/`k` move within the current tab.
+//! - `Enter` activates the highlighted row.
 //! - `t` toggles the scope target between Global and Workspace (the save
 //!   destination). Each scope keeps its own in-memory proxy allow list so
 //!   switching back and forth preserves edits.
-//! - `s` saves to the currently-active scope.
-//! - `q`, `Esc`, or `Ctrl+C` cancels.
+//! - `q` opens the save/discard/continue exit dialog.
 //!
 //! The alternate screen is entered so the prior terminal contents come
 //! back untouched on exit.
@@ -268,7 +265,7 @@ pub struct TuiOutput {
 }
 
 pub enum Outcome {
-    Save(TuiOutput),
+    Save(Box<TuiOutput>),
     Cancel,
 }
 
@@ -335,11 +332,25 @@ enum FilesystemField {
 impl FilesystemField {
     fn label(self) -> &'static str {
         match self {
-            FilesystemField::Mount => "mount",
+            FilesystemField::Mount => "path",
             FilesystemField::Hide => "hide",
             FilesystemField::Readonly => "readonly",
         }
     }
+
+    fn add_label(self) -> &'static str {
+        match self {
+            FilesystemField::Mount => "+ Add Path...",
+            FilesystemField::Hide => "+ Add Hidden Filter...",
+            FilesystemField::Readonly => "+ Add Readonly Filter...",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FilesystemSection {
+    Path,
+    Filter,
 }
 
 enum Mode {
@@ -366,11 +377,47 @@ enum Mode {
         /// happens.
         editing: Option<String>,
     },
-    /// Confirmation prompt before discarding unsaved edits. Displayed
-    /// when the user hits `q`/Esc/^C while [`App::has_unsaved_changes`]
-    /// is true.
-    ConfirmQuit,
+    DefaultAgentSelect {
+        cursor: usize,
+    },
+    ItemAction {
+        target: ItemActionTarget,
+        cursor: usize,
+    },
+    /// Confirmation prompt before leaving the settings editor. Displayed
+    /// when the user hits `q` or ^C.
+    ConfirmQuit {
+        cursor: usize,
+    },
 }
+
+#[derive(Clone)]
+enum ItemActionTarget {
+    Proxy(ProxyRow),
+    Filesystem(FilesystemRow),
+    Task(String),
+}
+
+#[derive(Clone, Copy)]
+enum ItemAction {
+    Edit,
+    Remove,
+}
+
+const ITEM_ACTION_CHOICES: [ItemAction; 2] = [ItemAction::Edit, ItemAction::Remove];
+
+#[derive(Clone, Copy)]
+enum QuitAction {
+    SaveAndQuit,
+    KeepEditing,
+    DiscardAndQuit,
+}
+
+const QUIT_ACTION_CHOICES: [QuitAction; 3] = [
+    QuitAction::SaveAndQuit,
+    QuitAction::KeepEditing,
+    QuitAction::DiscardAndQuit,
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TaskField {
@@ -385,6 +432,16 @@ impl TaskField {
             TaskField::Command => TaskField::Name,
         }
     }
+}
+
+const DEFAULT_AGENT_CHOICES: [Option<DefaultAgent>; 3] =
+    [None, Some(DefaultAgent::Claude), Some(DefaultAgent::Codex)];
+
+fn default_agent_index(agent: Option<DefaultAgent>) -> usize {
+    DEFAULT_AGENT_CHOICES
+        .iter()
+        .position(|candidate| *candidate == agent)
+        .unwrap_or(0)
 }
 
 /// Origin scope of a proxy row in the merged display.
@@ -413,6 +470,12 @@ struct ProxyRow {
     idx_within_scope: usize,
 }
 
+#[derive(Clone, Debug)]
+enum ProxyViewRow {
+    Entry(ProxyRow),
+    Add,
+}
+
 struct ProxyState {
     /// Each scope's allow patterns. Workspace view shows a tool-level
     /// (here, pattern-level) merge: every global pattern, then any
@@ -439,7 +502,7 @@ impl ProxyState {
         }
     }
 
-    fn visible_rows(&self, scope: Scope) -> Vec<ProxyRow> {
+    fn entry_rows(&self, scope: Scope) -> Vec<ProxyRow> {
         let mut rows: Vec<ProxyRow> = self
             .global
             .iter()
@@ -464,6 +527,15 @@ impl ProxyState {
         rows
     }
 
+    fn visible_rows(&self, scope: Scope) -> Vec<ProxyViewRow> {
+        let mut rows = Vec::new();
+        for row in self.entry_rows(scope) {
+            rows.push(ProxyViewRow::Entry(row));
+        }
+        rows.push(ProxyViewRow::Add);
+        rows
+    }
+
     fn move_up(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
@@ -484,18 +556,31 @@ impl ProxyState {
         self.cursor = len.saturating_sub(1);
     }
 
-    fn current_row(&self, scope: Scope) -> Option<ProxyRow> {
+    fn current_row(&self, scope: Scope) -> Option<ProxyViewRow> {
         self.visible_rows(scope).into_iter().nth(self.cursor)
     }
 
+    #[cfg(test)]
+    fn current_entry(&self, scope: Scope) -> Option<ProxyRow> {
+        match self.current_row(scope) {
+            Some(ProxyViewRow::Entry(row)) => Some(row),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
     /// Remove the cursor's row, but only if it lives in the active
     /// scope. Global rows shown in the workspace view are inherited and
     /// cannot be deleted from here — the user has to switch to Global
     /// with `t` to remove them.
     fn remove_current(&mut self, scope: Scope) {
-        let Some(row) = self.current_row(scope) else {
+        let Some(row) = self.current_entry(scope) else {
             return;
         };
+        self.remove_row(scope, row);
+    }
+
+    fn remove_row(&mut self, scope: Scope, row: ProxyRow) {
         if row.origin != ProxyOrigin::from_scope(scope) {
             return;
         }
@@ -511,10 +596,9 @@ impl ProxyState {
 
     /// Apply an upsert at the active scope. When `editing` points at a
     /// row owned by the active scope, replace it. When it points at a
-    /// foreign-scope row (the user pressed `e` on an inherited global
-    /// pattern while editing Workspace), do nothing — that case is
-    /// blocked at the call site, and treating it as an add would
-    /// silently fork the entry.
+    /// foreign-scope row (an inherited global pattern visible while
+    /// editing Workspace), do nothing — that case is blocked at the call
+    /// site, and treating it as an add would silently fork the entry.
     fn upsert(&mut self, scope: Scope, value: String, editing: Option<ProxyRow>) {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -538,7 +622,7 @@ impl ProxyState {
                     list.push(v);
                 }
                 // Move cursor onto the freshly-appended row.
-                let len = self.visible_rows(scope).len();
+                let len = self.entry_rows(scope).len();
                 self.cursor = len.saturating_sub(1);
             }
         }
@@ -551,6 +635,13 @@ struct FilesystemRow {
     field: FilesystemField,
     value: String,
     idx_within_scope: usize,
+}
+
+#[derive(Clone, Debug)]
+enum FilesystemViewRow {
+    Section(FilesystemSection),
+    Entry(FilesystemRow),
+    Add(FilesystemField),
 }
 
 struct FilesystemState {
@@ -610,11 +701,36 @@ impl FilesystemState {
         rows
     }
 
-    fn visible_rows(&self, scope: Scope) -> Vec<FilesystemRow> {
+    fn entry_rows(&self, scope: Scope) -> Vec<FilesystemRow> {
         let mut rows = Self::rows_for(&self.global, ProxyOrigin::Global);
         if scope == Scope::Workspace {
             rows.extend(Self::rows_for(&self.workspace, ProxyOrigin::Workspace));
         }
+        rows
+    }
+
+    fn visible_rows(&self, scope: Scope) -> Vec<FilesystemViewRow> {
+        let entries = self.entry_rows(scope);
+        let mut rows = Vec::new();
+        rows.push(FilesystemViewRow::Section(FilesystemSection::Path));
+        rows.extend(
+            entries
+                .iter()
+                .filter(|row| row.field == FilesystemField::Mount)
+                .cloned()
+                .map(FilesystemViewRow::Entry),
+        );
+        rows.push(FilesystemViewRow::Add(FilesystemField::Mount));
+        rows.push(FilesystemViewRow::Section(FilesystemSection::Filter));
+        rows.extend(
+            entries
+                .iter()
+                .filter(|row| row.field != FilesystemField::Mount)
+                .cloned()
+                .map(FilesystemViewRow::Entry),
+        );
+        rows.push(FilesystemViewRow::Add(FilesystemField::Hide));
+        rows.push(FilesystemViewRow::Add(FilesystemField::Readonly));
         rows
     }
 
@@ -638,7 +754,7 @@ impl FilesystemState {
         self.cursor = len.saturating_sub(1);
     }
 
-    fn current_row(&self, scope: Scope) -> Option<FilesystemRow> {
+    fn current_row(&self, scope: Scope) -> Option<FilesystemViewRow> {
         self.visible_rows(scope).into_iter().nth(self.cursor)
     }
 
@@ -670,16 +786,13 @@ impl FilesystemState {
                 if !list.contains(&v) {
                     list.push(v);
                 }
-                let len = self.visible_rows(scope).len();
+                let len = self.entry_rows(scope).len();
                 self.cursor = len.saturating_sub(1);
             }
         }
     }
 
-    fn remove_current(&mut self, scope: Scope) {
-        let Some(row) = self.current_row(scope) else {
-            return;
-        };
+    fn remove_row(&mut self, scope: Scope, row: FilesystemRow) {
         let active = ProxyOrigin::from_scope(scope);
         if row.origin != active {
             return;
@@ -696,14 +809,24 @@ impl FilesystemState {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GeneralRow {
+    DefaultAgent,
+}
+
 struct GeneralState {
     global: GeneralPolicy,
     workspace: GeneralPolicy,
+    cursor: usize,
 }
 
 impl GeneralState {
     fn new(global: GeneralPolicy, workspace: GeneralPolicy) -> Self {
-        Self { global, workspace }
+        Self {
+            global,
+            workspace,
+            cursor: 0,
+        }
     }
 
     fn active_policy_mut(&mut self, scope: Scope) -> &mut GeneralPolicy {
@@ -732,13 +855,50 @@ impl GeneralState {
         }
     }
 
-    fn toggle(&mut self, scope: Scope) {
-        let next = self.effective_agent(scope).toggle();
-        self.active_policy_mut(scope).default_agent = Some(next);
+    fn set_agent(&mut self, scope: Scope, agent: Option<DefaultAgent>) {
+        self.active_policy_mut(scope).default_agent = agent;
     }
 
-    fn clear(&mut self, scope: Scope) {
-        self.active_policy_mut(scope).default_agent = None;
+    fn configured_agent(&self, scope: Scope) -> Option<DefaultAgent> {
+        match scope {
+            Scope::Global => self.global.default_agent,
+            Scope::Workspace => self.workspace.default_agent,
+        }
+    }
+
+    fn visible_rows(&self, _scope: Scope) -> Vec<GeneralRow> {
+        vec![GeneralRow::DefaultAgent]
+    }
+
+    fn current_row(&self, scope: Scope) -> Option<GeneralRow> {
+        self.visible_rows(scope).get(self.cursor).copied()
+    }
+
+    fn move_up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_down(&mut self, scope: Scope) {
+        let len = self.visible_rows(scope).len();
+        if self.cursor + 1 < len {
+            self.cursor += 1;
+        }
+    }
+
+    fn jump_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn jump_end(&mut self, scope: Scope) {
+        let len = self.visible_rows(scope).len();
+        self.cursor = len.saturating_sub(1);
+    }
+
+    fn clamp_cursor(&mut self, scope: Scope) {
+        let len = self.visible_rows(scope).len();
+        if self.cursor >= len {
+            self.cursor = len.saturating_sub(1);
+        }
     }
 }
 
@@ -764,8 +924,8 @@ struct McpState {
     mcp_workspace: McpPolicy,
     task_runner_expanded: bool,
     server_names: Vec<String>,
-    /// Per-server collapse state. Initially expanded when a server has
-    /// any overrides visible so the user can immediately see them.
+    /// Per-server collapse state. The config UI starts with only
+    /// top-level MCP rows visible; `Enter` expands the focused server.
     expanded: Vec<bool>,
     /// Static catalog of (server, tool, hint, description) tuples — the
     /// tool inventory itself doesn't change between scopes.
@@ -802,13 +962,13 @@ impl McpState {
             }
         }
 
-        let expanded = vec![true; server_names.len()];
+        let expanded = vec![false; server_names.len()];
         Self {
             tasks_global,
             tasks_workspace,
             mcp_global,
             mcp_workspace,
-            task_runner_expanded: true,
+            task_runner_expanded: false,
             server_names,
             expanded,
             catalog,
@@ -909,11 +1069,11 @@ impl McpState {
         }
         for (si, name) in self.server_names.iter().enumerate() {
             rows.push(McpRow::Server(si));
-            if self.expanded[si] {
-                if let Some((start, count)) = self.server_ranges.get(name).copied() {
-                    for t in 0..count {
-                        rows.push(McpRow::Tool(start + t));
-                    }
+            if self.expanded[si]
+                && let Some((start, count)) = self.server_ranges.get(name).copied()
+            {
+                for t in 0..count {
+                    rows.push(McpRow::Tool(start + t));
                 }
             }
         }
@@ -968,40 +1128,17 @@ impl McpState {
         }
     }
 
-    fn toggle_all_in_focused_server(&mut self, scope: Scope, enable: bool) {
-        let server_idx = match self.current_row(scope) {
-            Some(McpRow::Server(si)) => si,
-            Some(McpRow::Tool(ti)) => self
-                .server_names
-                .iter()
-                .position(|n| n == &self.catalog[ti].server_name)
-                .unwrap_or(0),
-            _ => return,
-        };
-        let Some(name) = self.server_names.get(server_idx).cloned() else {
-            return;
-        };
-        if let Some((start, count)) = self.server_ranges.get(&name).copied() {
-            for i in start..(start + count) {
-                self.set_tool_for(scope, i, enable);
-            }
-        }
-    }
-
     /// Delete the task focused by the cursor under `scope`. Workspace
     /// only deletes the workspace-side entry — a global-only task stays
     /// visible (the user has to switch to Global to remove it). Visible
     /// for the user via the `[W]` annotation in the row.
-    fn delete_task_at_cursor(&mut self, scope: Scope) {
-        let Some(McpRow::TaskRow(name)) = self.current_row(scope) else {
-            return;
-        };
+    fn delete_task(&mut self, scope: Scope, name: &str) {
         match scope {
             Scope::Global => {
-                self.tasks_global.remove(&name);
+                self.tasks_global.remove(name);
             }
             Scope::Workspace => {
-                self.tasks_workspace.remove(&name);
+                self.tasks_workspace.remove(name);
             }
         };
         let len = self.visible_rows(scope).len();
@@ -1056,6 +1193,7 @@ enum RowAction {
 
 /// Frozen snapshot of every editable buffer at TUI launch. Used to
 /// decide whether `q` should pop a confirm-quit dialog.
+#[cfg(test)]
 #[derive(Clone)]
 struct Snapshot {
     general_global: GeneralPolicy,
@@ -1084,6 +1222,7 @@ struct App {
     mcp_codex: McpState,
     mode: Mode,
     list_state: ListState,
+    #[cfg(test)]
     initial: Snapshot,
 }
 
@@ -1091,6 +1230,7 @@ impl App {
     fn new(input: TuiInput) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+        #[cfg(test)]
         let initial = Snapshot {
             general_global: input.general_global.clone(),
             general_workspace: input.general_workspace.clone(),
@@ -1129,10 +1269,12 @@ impl App {
             ),
             mode: Mode::Normal,
             list_state,
+            #[cfg(test)]
             initial,
         }
     }
 
+    #[cfg(test)]
     fn has_unsaved_changes(&self) -> bool {
         self.proxy.global != self.initial.proxy_global
             || self.general.global != self.initial.general_global
@@ -1157,7 +1299,9 @@ impl App {
         // panel happens to be active. The MCP cursor is naturally bounded
         // by visible_rows(); for the proxy panel we re-clamp here so an
         // out-of-range cursor doesn't render off-list.
-        if self.tab == TopTab::Proxy {
+        if self.tab == TopTab::General {
+            self.general.clamp_cursor(self.scope);
+        } else if self.tab == TopTab::Proxy {
             let len = self.proxy.visible_rows(self.scope).len();
             if self.proxy.cursor >= len {
                 self.proxy.cursor = len.saturating_sub(1);
@@ -1172,7 +1316,7 @@ impl App {
 
     fn sync_list_state(&mut self) {
         let cur = match self.tab {
-            TopTab::General => 0,
+            TopTab::General => self.general.cursor,
             TopTab::Proxy => self.proxy.cursor,
             TopTab::HostFs => self.filesystem.cursor,
             TopTab::McpClaude => self.mcp_claude.cursor,
@@ -1326,15 +1470,15 @@ fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) 
                 // Rename clears the old key in the active scope's map.
                 // (A workspace rename never touches the global map — the
                 // global definition stays put as the inheritance fallback.)
-                if let Some(orig) = &editing {
-                    if orig != &name_tr {
-                        match scope {
-                            Scope::Global => {
-                                app.active_mcp_mut().tasks_global.remove(orig);
-                            }
-                            Scope::Workspace => {
-                                app.active_mcp_mut().tasks_workspace.remove(orig);
-                            }
+                if let Some(orig) = &editing
+                    && orig != &name_tr
+                {
+                    match scope {
+                        Scope::Global => {
+                            app.active_mcp_mut().tasks_global.remove(orig);
+                        }
+                        Scope::Workspace => {
+                            app.active_mcp_mut().tasks_workspace.remove(orig);
                         }
                     }
                 }
@@ -1388,6 +1532,116 @@ fn start_task_add(app: &mut App) {
     };
 }
 
+fn handle_default_agent_select_key(app: &mut App, code: KeyCode) {
+    let Mode::DefaultAgentSelect { mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => return,
+        KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
+            cursor = cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Right | KeyCode::Tab | KeyCode::Char('j')
+            if cursor + 1 < DEFAULT_AGENT_CHOICES.len() =>
+        {
+            cursor += 1;
+        }
+        KeyCode::Home => {
+            cursor = 0;
+        }
+        KeyCode::End => {
+            cursor = DEFAULT_AGENT_CHOICES.len().saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            let agent = DEFAULT_AGENT_CHOICES.get(cursor).copied().unwrap_or(None);
+            app.general.set_agent(app.scope, agent);
+            return;
+        }
+        _ => {}
+    }
+
+    app.mode = Mode::DefaultAgentSelect { cursor };
+}
+
+fn start_item_edit(app: &mut App, target: ItemActionTarget) {
+    match target {
+        ItemActionTarget::Proxy(row) => {
+            app.mode = Mode::ProxyInput {
+                target: PatternTarget::Proxy,
+                buffer: TextField::from_str(&row.pattern),
+                editing: Some(row),
+            };
+        }
+        ItemActionTarget::Filesystem(row) => {
+            app.mode = Mode::FilesystemInput {
+                field: row.field,
+                buffer: TextField::from_str(&row.value),
+                editing: Some(row),
+            };
+        }
+        ItemActionTarget::Task(name) => {
+            start_task_edit(app, name);
+        }
+    }
+}
+
+fn remove_item(app: &mut App, target: ItemActionTarget) {
+    let scope = app.scope;
+    match target {
+        ItemActionTarget::Proxy(row) => {
+            app.proxy.remove_row(scope, row);
+        }
+        ItemActionTarget::Filesystem(row) => {
+            app.filesystem.remove_row(scope, row);
+        }
+        ItemActionTarget::Task(name) => {
+            app.active_mcp_mut().delete_task(scope, &name);
+            app.sync_tasks_from_active();
+        }
+    }
+}
+
+fn handle_item_action_key(app: &mut App, code: KeyCode) {
+    let Mode::ItemAction { target, mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => return,
+        KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
+            cursor = cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Right | KeyCode::Tab | KeyCode::Char('j')
+            if cursor + 1 < ITEM_ACTION_CHOICES.len() =>
+        {
+            cursor += 1;
+        }
+        KeyCode::Home => {
+            cursor = 0;
+        }
+        KeyCode::End => {
+            cursor = ITEM_ACTION_CHOICES.len().saturating_sub(1);
+        }
+        KeyCode::Enter => match ITEM_ACTION_CHOICES.get(cursor).copied() {
+            Some(ItemAction::Edit) => {
+                start_item_edit(app, target);
+                return;
+            }
+            Some(ItemAction::Remove) => {
+                remove_item(app, target);
+                return;
+            }
+            None => {}
+        },
+        _ => {}
+    }
+
+    app.mode = Mode::ItemAction { target, cursor };
+}
+
 pub fn run_selection(input: TuiInput) -> Result<Outcome> {
     enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = io::stdout();
@@ -1430,190 +1684,152 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             handle_task_input_key(&mut app, key.code, key.modifiers);
             continue;
         }
-        if matches!(app.mode, Mode::ConfirmQuit) {
+        if matches!(app.mode, Mode::DefaultAgentSelect { .. }) {
+            handle_default_agent_select_key(&mut app, key.code);
+            continue;
+        }
+        if matches!(app.mode, Mode::ItemAction { .. }) {
+            handle_item_action_key(&mut app, key.code);
+            continue;
+        }
+        if let Mode::ConfirmQuit { mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal) {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => break Outcome::Cancel,
-                KeyCode::Char('s') | KeyCode::Char('S') => {
-                    break Outcome::Save(app.into_output());
+                KeyCode::Esc | KeyCode::Char('q') => {}
+                KeyCode::Up | KeyCode::Char('k') => {
+                    cursor = cursor.saturating_sub(1);
+                    app.mode = Mode::ConfirmQuit { cursor };
                 }
-                KeyCode::Char('n')
-                | KeyCode::Char('N')
-                | KeyCode::Esc
-                | KeyCode::Enter
-                | KeyCode::Char('q') => {
-                    app.mode = Mode::Normal;
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    if cursor + 1 < QUIT_ACTION_CHOICES.len() {
+                        cursor += 1;
+                    }
+                    app.mode = Mode::ConfirmQuit { cursor };
                 }
-                _ => {}
+                KeyCode::Home => {
+                    app.mode = Mode::ConfirmQuit { cursor: 0 };
+                }
+                KeyCode::End => {
+                    app.mode = Mode::ConfirmQuit {
+                        cursor: QUIT_ACTION_CHOICES.len().saturating_sub(1),
+                    };
+                }
+                KeyCode::Enter => match QUIT_ACTION_CHOICES.get(cursor).copied() {
+                    Some(QuitAction::SaveAndQuit) => {
+                        break Outcome::Save(Box::new(app.into_output()));
+                    }
+                    Some(QuitAction::KeepEditing) | None => {}
+                    Some(QuitAction::DiscardAndQuit) => break Outcome::Cancel,
+                },
+                _ => {
+                    app.mode = Mode::ConfirmQuit { cursor };
+                }
             }
             continue;
         }
 
         let want_quit = match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => true,
+            KeyCode::Char('q') => true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
             _ => false,
         };
         if want_quit {
-            if app.has_unsaved_changes() {
-                app.mode = Mode::ConfirmQuit;
-                continue;
-            }
-            break Outcome::Cancel;
+            app.mode = Mode::ConfirmQuit { cursor: 0 };
+            continue;
         }
 
         let scope = app.scope;
         match key.code {
-            KeyCode::Char('s') => break Outcome::Save(app.into_output()),
             KeyCode::Tab => app.tab = app.tab.next(),
             KeyCode::BackTab => app.tab = app.tab.prev(),
             KeyCode::Left | KeyCode::Char('h') => app.tab = app.tab.prev(),
             KeyCode::Right | KeyCode::Char('l') => app.tab = app.tab.next(),
             KeyCode::Char('t') => app.toggle_scope(),
             KeyCode::Up | KeyCode::Char('k') => match app.tab {
-                TopTab::General => {}
+                TopTab::General => app.general.move_up(),
                 TopTab::Proxy => app.proxy.move_up(),
                 TopTab::HostFs => app.filesystem.move_up(),
                 TopTab::McpClaude | TopTab::McpCodex => app.active_mcp_mut().move_up(),
             },
             KeyCode::Down | KeyCode::Char('j') => match app.tab {
-                TopTab::General => {}
+                TopTab::General => app.general.move_down(scope),
                 TopTab::Proxy => app.proxy.move_down(scope),
                 TopTab::HostFs => app.filesystem.move_down(scope),
                 TopTab::McpClaude | TopTab::McpCodex => app.active_mcp_mut().move_down(scope),
             },
-            KeyCode::Home | KeyCode::Char('g') => match app.tab {
-                TopTab::General => {}
+            KeyCode::Home => match app.tab {
+                TopTab::General => app.general.jump_home(),
                 TopTab::Proxy => app.proxy.jump_home(),
                 TopTab::HostFs => app.filesystem.jump_home(),
                 TopTab::McpClaude | TopTab::McpCodex => app.active_mcp_mut().jump_home(),
             },
-            KeyCode::End | KeyCode::Char('G') => match app.tab {
-                TopTab::General => {}
+            KeyCode::End => match app.tab {
+                TopTab::General => app.general.jump_end(scope),
                 TopTab::Proxy => app.proxy.jump_end(scope),
                 TopTab::HostFs => app.filesystem.jump_end(scope),
                 TopTab::McpClaude | TopTab::McpCodex => app.active_mcp_mut().jump_end(scope),
             },
-            KeyCode::Char(' ') | KeyCode::Enter => match app.tab {
-                TopTab::General => app.general.toggle(scope),
+            KeyCode::Enter => match app.tab {
+                TopTab::General => match app.general.current_row(scope) {
+                    Some(GeneralRow::DefaultAgent) => {
+                        app.mode = Mode::DefaultAgentSelect {
+                            cursor: default_agent_index(app.general.configured_agent(scope)),
+                        };
+                    }
+                    None => {}
+                },
                 TopTab::Proxy => {
-                    if let Some(row) = app.proxy.current_row(scope) {
-                        // Inherited (global) rows shown in the workspace
-                        // view are read-only here — `t` to switch scope
-                        // first.
-                        if row.origin == ProxyOrigin::from_scope(scope) {
+                    match app.proxy.current_row(scope) {
+                        Some(ProxyViewRow::Entry(row))
+                            if row.origin == ProxyOrigin::from_scope(scope) =>
+                        {
+                            // Inherited (global) rows shown in the workspace
+                            // view are read-only here — `t` to switch scope
+                            // first.
+                            app.mode = Mode::ItemAction {
+                                target: ItemActionTarget::Proxy(row),
+                                cursor: 0,
+                            };
+                        }
+                        Some(ProxyViewRow::Add) => {
                             app.mode = Mode::ProxyInput {
                                 target: PatternTarget::Proxy,
-                                buffer: TextField::from_str(&row.pattern),
-                                editing: Some(row),
+                                buffer: TextField::default(),
+                                editing: None,
                             };
                         }
+                        Some(ProxyViewRow::Entry(_)) => {}
+                        None => {}
                     }
                 }
-                TopTab::HostFs => {
-                    if let Some(row) = app.filesystem.current_row(scope) {
+                TopTab::HostFs => match app.filesystem.current_row(scope) {
+                    Some(FilesystemViewRow::Entry(row)) => {
                         if row.origin == ProxyOrigin::from_scope(scope) {
-                            app.mode = Mode::FilesystemInput {
-                                field: row.field,
-                                buffer: TextField::from_str(&row.value),
-                                editing: Some(row),
+                            app.mode = Mode::ItemAction {
+                                target: ItemActionTarget::Filesystem(row),
+                                cursor: 0,
                             };
                         }
                     }
-                }
+                    Some(FilesystemViewRow::Add(field)) => {
+                        app.mode = Mode::FilesystemInput {
+                            field,
+                            buffer: TextField::default(),
+                            editing: None,
+                        };
+                    }
+                    Some(FilesystemViewRow::Section(_)) | None => {}
+                },
                 TopTab::McpClaude | TopTab::McpCodex => match app.active_mcp_mut().toggle(scope) {
-                    RowAction::Handled => {}
-                    RowAction::EditTask(name) => start_task_edit(&mut app, name),
+                    RowAction::Handled => app.sync_tasks_from_active(),
+                    RowAction::EditTask(name) => {
+                        app.mode = Mode::ItemAction {
+                            target: ItemActionTarget::Task(name),
+                            cursor: 0,
+                        };
+                    }
                     RowAction::AddTask => start_task_add(&mut app),
                 },
             },
-            KeyCode::Char('i') | KeyCode::Char('+') if app.tab == TopTab::Proxy => {
-                app.mode = Mode::ProxyInput {
-                    target: PatternTarget::Proxy,
-                    buffer: TextField::default(),
-                    editing: None,
-                };
-            }
-            KeyCode::Char('i') | KeyCode::Char('+') if app.tab == TopTab::HostFs => {
-                app.mode = Mode::FilesystemInput {
-                    field: FilesystemField::Mount,
-                    buffer: TextField::default(),
-                    editing: None,
-                };
-            }
-            KeyCode::Char('m') if app.tab == TopTab::HostFs => {
-                app.mode = Mode::FilesystemInput {
-                    field: FilesystemField::Mount,
-                    buffer: TextField::default(),
-                    editing: None,
-                };
-            }
-            KeyCode::Char('x') if app.tab == TopTab::HostFs => {
-                app.mode = Mode::FilesystemInput {
-                    field: FilesystemField::Hide,
-                    buffer: TextField::default(),
-                    editing: None,
-                };
-            }
-            KeyCode::Char('r') if app.tab == TopTab::HostFs => {
-                app.mode = Mode::FilesystemInput {
-                    field: FilesystemField::Readonly,
-                    buffer: TextField::default(),
-                    editing: None,
-                };
-            }
-            KeyCode::Char('i') | KeyCode::Char('+')
-                if matches!(app.tab, TopTab::McpClaude | TopTab::McpCodex) =>
-            {
-                start_task_add(&mut app);
-            }
-            KeyCode::Char('e') if app.tab == TopTab::Proxy => {
-                if let Some(row) = app.proxy.current_row(scope) {
-                    if row.origin == ProxyOrigin::from_scope(scope) {
-                        app.mode = Mode::ProxyInput {
-                            target: PatternTarget::Proxy,
-                            buffer: TextField::from_str(&row.pattern),
-                            editing: Some(row),
-                        };
-                    }
-                }
-            }
-            KeyCode::Char('e') if app.tab == TopTab::HostFs => {
-                if let Some(row) = app.filesystem.current_row(scope) {
-                    if row.origin == ProxyOrigin::from_scope(scope) {
-                        app.mode = Mode::FilesystemInput {
-                            field: row.field,
-                            buffer: TextField::from_str(&row.value),
-                            editing: Some(row),
-                        };
-                    }
-                }
-            }
-            KeyCode::Char('e') if matches!(app.tab, TopTab::McpClaude | TopTab::McpCodex) => {
-                if let Some(McpRow::TaskRow(name)) = app.active_mcp().current_row(scope) {
-                    start_task_edit(&mut app, name);
-                }
-            }
-            KeyCode::Char('d') if app.tab == TopTab::Proxy => {
-                app.proxy.remove_current(scope);
-            }
-            KeyCode::Char('d') if app.tab == TopTab::General => {
-                app.general.clear(scope);
-            }
-            KeyCode::Char('d') if app.tab == TopTab::HostFs => {
-                app.filesystem.remove_current(scope);
-            }
-            KeyCode::Char('d') if matches!(app.tab, TopTab::McpClaude | TopTab::McpCodex) => {
-                app.active_mcp_mut().delete_task_at_cursor(scope);
-                app.sync_tasks_from_active();
-            }
-            KeyCode::Char('a') if matches!(app.tab, TopTab::McpClaude | TopTab::McpCodex) => {
-                app.active_mcp_mut()
-                    .toggle_all_in_focused_server(scope, true);
-            }
-            KeyCode::Char('A') if matches!(app.tab, TopTab::McpClaude | TopTab::McpCodex) => {
-                app.active_mcp_mut()
-                    .toggle_all_in_focused_server(scope, false);
-            }
             _ => {}
         }
     };
@@ -1674,8 +1890,16 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         render_filesystem_input_modal(f, area, field, buffer, editing.is_some());
     }
 
-    if matches!(app.mode, Mode::ConfirmQuit) {
-        render_confirm_quit_modal(f, area);
+    if let Mode::DefaultAgentSelect { cursor } = app.mode {
+        render_default_agent_select_modal(f, area, cursor);
+    }
+
+    if let Mode::ItemAction { ref target, cursor } = app.mode {
+        render_item_action_modal(f, area, target, cursor);
+    }
+
+    if let Mode::ConfirmQuit { cursor } = app.mode {
+        render_confirm_quit_modal(f, area, cursor);
     }
 }
 
@@ -1732,25 +1956,33 @@ fn render_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_general(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
-    let agent = app.general.effective_agent(app.scope);
-    let origin = app.general.origin(app.scope);
-    let inherited = app.scope == Scope::Workspace && origin == ProxyOrigin::Global;
-    let value_style = if inherited {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default().fg(Color::Cyan)
-    };
-    let item = ListItem::new(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("default agent", Style::default().fg(Color::White)),
-        Span::raw("  "),
-        Span::styled(agent.label(), value_style.add_modifier(Modifier::BOLD)),
-        Span::styled(
-            if inherited { "  inherited" } else { "" },
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
-    let list = List::new(vec![item])
+    let rows = app.general.visible_rows(app.scope);
+    let items: Vec<ListItem> = rows
+        .into_iter()
+        .map(|row| match row {
+            GeneralRow::DefaultAgent => {
+                let agent = app.general.effective_agent(app.scope);
+                let origin = app.general.origin(app.scope);
+                let inherited = app.scope == Scope::Workspace && origin == ProxyOrigin::Global;
+                let value_style = if inherited {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("Change Default Agent", Style::default().fg(Color::White)),
+                    Span::raw("  "),
+                    Span::styled(agent.label(), value_style.add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        if inherited { "  inherited" } else { "" },
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            }
+        })
+        .collect();
+    let list = List::new(items)
         .block(Block::default().borders(Borders::NONE))
         .highlight_style(
             Style::default()
@@ -1778,18 +2010,10 @@ fn render_pattern_list(
 ) {
     let rows = state.visible_rows(scope);
     let active = ProxyOrigin::from_scope(scope);
-    let items: Vec<ListItem> = if rows.is_empty() {
-        let hint = match scope {
-            Scope::Global => "  (no global allow patterns; press `i` to add)",
-            Scope::Workspace => "  (no allow patterns inherited or set here; press `i` to add)",
-        };
-        vec![ListItem::new(Line::from(Span::styled(
-            hint,
-            Style::default().fg(Color::DarkGray),
-        )))]
-    } else {
-        rows.iter()
-            .map(|row| {
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| match row {
+            ProxyViewRow::Entry(row) => {
                 let overlay = scope == Scope::Workspace && row.origin == ProxyOrigin::Workspace;
                 let is_inherited = row.origin != active;
                 let pattern_style = if is_inherited {
@@ -1808,9 +2032,18 @@ fn render_pattern_list(
                     ),
                     Span::styled(row.pattern.clone(), pattern_style),
                 ]))
-            })
-            .collect()
-    };
+            }
+            ProxyViewRow::Add => ListItem::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "+ Add Allow Pattern...",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ])),
+        })
+        .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::NONE))
         .highlight_style(
@@ -1825,14 +2058,22 @@ fn render_pattern_list(
 fn render_filesystem(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let rows = app.filesystem.visible_rows(app.scope);
     let active = ProxyOrigin::from_scope(app.scope);
-    let items: Vec<ListItem> = if rows.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
-            "  (workspace is mounted by default; press `i`/`m` to add another mount)",
-            Style::default().fg(Color::DarkGray),
-        )))]
-    } else {
-        rows.iter()
-            .map(|row| {
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| match row {
+            FilesystemViewRow::Section(section) => {
+                let title = match section {
+                    FilesystemSection::Path => "▾ Path",
+                    FilesystemSection::Filter => "▾ Filter",
+                };
+                ListItem::new(Line::from(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                )))
+            }
+            FilesystemViewRow::Entry(row) => {
                 let is_inherited = row.origin != active;
                 let style = if is_inherited {
                     Style::default().fg(Color::DarkGray)
@@ -1854,9 +2095,18 @@ fn render_filesystem(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     Span::raw(" "),
                     Span::styled(row.value.clone(), style),
                 ]))
-            })
-            .collect()
-    };
+            }
+            FilesystemViewRow::Add(field) => ListItem::new(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    field.add_label(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ])),
+        })
+        .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::NONE))
         .highlight_style(
@@ -1919,9 +2169,9 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             McpRow::TaskAddHint => ListItem::new(Line::from(vec![
                 Span::raw("      "),
                 Span::styled(
-                    "+ add task (i)",
+                    "+ Add Task...",
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(Color::Cyan)
                         .add_modifier(Modifier::ITALIC),
                 ),
             ])),
@@ -2008,76 +2258,18 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         )
     };
 
-    let help = match app.tab {
-        TopTab::General => Line::from(vec![
-            key("h/l", Color::Cyan),
-            Span::raw(" tabs · "),
-            key("space", Color::Cyan),
-            Span::raw(" toggle default agent · "),
-            key("d", Color::Cyan),
-            Span::raw(" clear override · "),
-            key("t", Color::Yellow),
-            Span::raw(" scope · "),
-            key("s", Color::Green),
-            Span::raw(" save · "),
-            key("q", Color::Red),
-            Span::raw(" cancel"),
-        ]),
-        TopTab::Proxy => Line::from(vec![
-            key("h/l", Color::Cyan),
-            Span::raw(" tabs · "),
-            key("j/k", Color::Cyan),
-            Span::raw(" move · "),
-            key("i", Color::Cyan),
-            Span::raw(" add · "),
-            key("e/Enter", Color::Cyan),
-            Span::raw(" edit · "),
-            key("d", Color::Cyan),
-            Span::raw(" delete · "),
-            key("t", Color::Yellow),
-            Span::raw(" scope · "),
-            key("s", Color::Green),
-            Span::raw(" save · "),
-            key("q", Color::Red),
-            Span::raw(" cancel"),
-        ]),
-        TopTab::HostFs => Line::from(vec![
-            key("h/l", Color::Cyan),
-            Span::raw(" tabs · "),
-            key("j/k", Color::Cyan),
-            Span::raw(" move · "),
-            key("m/i", Color::Cyan),
-            Span::raw(" mount · "),
-            key("x", Color::Cyan),
-            Span::raw(" hide regex · "),
-            key("r", Color::Cyan),
-            Span::raw(" readonly regex · "),
-            key("e/d", Color::Cyan),
-            Span::raw(" edit/delete · "),
-            key("t", Color::Yellow),
-            Span::raw(" scope · "),
-            key("s", Color::Green),
-            Span::raw(" save"),
-        ]),
-        TopTab::McpClaude | TopTab::McpCodex => Line::from(vec![
-            key("h/l", Color::Cyan),
-            Span::raw(" tabs · "),
-            key("j/k", Color::Cyan),
-            Span::raw(" move · "),
-            key("space", Color::Cyan),
-            Span::raw(" toggle · "),
-            key("i/e/d", Color::Cyan),
-            Span::raw(" task add/edit/del · "),
-            key("a/A", Color::Cyan),
-            Span::raw(" bulk · "),
-            key("t", Color::Yellow),
-            Span::raw(" scope · "),
-            key("s", Color::Green),
-            Span::raw(" save · "),
-            key("q", Color::Red),
-            Span::raw(" cancel"),
-        ]),
-    };
+    let help = Line::from(vec![
+        key("←/→ h/l", Color::Cyan),
+        Span::raw(" tabs · "),
+        key("↑/↓ j/k", Color::Cyan),
+        Span::raw(" move · "),
+        key("Enter", Color::Cyan),
+        Span::raw(" activate row · "),
+        key("t", Color::Yellow),
+        Span::raw(" scope · "),
+        key("q", Color::Red),
+        Span::raw(" finish"),
+    ]);
 
     let status = match app.tab {
         TopTab::General => Line::from(vec![Span::styled(
@@ -2141,7 +2333,7 @@ fn render_proxy_input_modal(
     is_edit: bool,
 ) {
     // Centered 60-char-wide 5-line modal.
-    let w = parent.width.min(72).max(40);
+    let w = parent.width.clamp(40, 72);
     let h: u16 = 5;
     let x = parent.x + (parent.width.saturating_sub(w)) / 2;
     let y = parent.y + (parent.height.saturating_sub(h)) / 2;
@@ -2181,7 +2373,7 @@ fn render_filesystem_input_modal(
     buffer: &TextField,
     is_edit: bool,
 ) {
-    let w = parent.width.min(84).max(46);
+    let w = parent.width.clamp(46, 84);
     let h: u16 = 5;
     let x = parent.x + (parent.width.saturating_sub(w)) / 2;
     let y = parent.y + (parent.height.saturating_sub(h)) / 2;
@@ -2221,9 +2413,9 @@ fn render_filesystem_input_modal(
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
-fn render_confirm_quit_modal(f: &mut ratatui::Frame<'_>, parent: Rect) {
-    let w = parent.width.min(56).max(40);
-    let h: u16 = 7;
+fn render_confirm_quit_modal(f: &mut ratatui::Frame<'_>, parent: Rect, cursor: usize) {
+    let w = parent.width.clamp(40, 56);
+    let h: u16 = 9;
     let x = parent.x + (parent.width.saturating_sub(w)) / 2;
     let y = parent.y + (parent.height.saturating_sub(h)) / 2;
     let area = Rect::new(x, y, w, h);
@@ -2231,27 +2423,158 @@ fn render_confirm_quit_modal(f: &mut ratatui::Frame<'_>, parent: Rect) {
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Discard unsaved changes? ")
+        .title(" Exit settings? ")
         .style(Style::default().fg(Color::Yellow));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let key_style = |c: Color| Style::default().fg(c).add_modifier(Modifier::BOLD);
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
-            "You have edits that haven't been saved.",
+            "Choose how to leave the settings editor.",
             Style::default().fg(Color::White),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("y", key_style(Color::Red)),
-            Span::raw(" discard and quit  ·  "),
-            Span::styled("n", key_style(Color::Cyan)),
-            Span::raw(" keep editing  ·  "),
-            Span::styled("s", key_style(Color::Green)),
-            Span::raw(" save and quit"),
-        ]),
     ];
+    for (idx, action) in QUIT_ACTION_CHOICES.iter().copied().enumerate() {
+        let selected = idx == cursor;
+        let marker = if selected { ">" } else { " " };
+        let (label, color) = match action {
+            QuitAction::SaveAndQuit => ("Save and Quit", Color::Green),
+            QuitAction::KeepEditing => ("Keep Editing", Color::Cyan),
+            QuitAction::DiscardAndQuit => ("Discard and Quit", Color::Red),
+        };
+        let style = if selected {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::raw(" "),
+            Span::styled(label, style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ j/k move · Enter select · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_default_agent_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, cursor: usize) {
+    let w = parent.width.clamp(36, 48);
+    let h: u16 = 9;
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    let y = parent.y + (parent.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Select default agent ")
+        .style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![Line::from(Span::styled(
+        "Choose the agent for this scope.",
+        Style::default().fg(Color::DarkGray),
+    ))];
+    for (idx, agent) in DEFAULT_AGENT_CHOICES.iter().copied().enumerate() {
+        let selected = idx == cursor;
+        let marker = if selected { ">" } else { " " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::raw(" "),
+            Span::styled(agent.map(DefaultAgent::label).unwrap_or("(unset)"), style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ j/k move · Enter select · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn item_action_title(target: &ItemActionTarget) -> &'static str {
+    match target {
+        ItemActionTarget::Proxy(_) => " Proxy allow pattern ",
+        ItemActionTarget::Filesystem(row) => match row.field {
+            FilesystemField::Mount => " Filesystem path ",
+            FilesystemField::Hide => " Hidden filter ",
+            FilesystemField::Readonly => " Readonly filter ",
+        },
+        ItemActionTarget::Task(_) => " Task runner command ",
+    }
+}
+
+fn item_action_value(target: &ItemActionTarget) -> String {
+    match target {
+        ItemActionTarget::Proxy(row) => row.pattern.clone(),
+        ItemActionTarget::Filesystem(row) => row.value.clone(),
+        ItemActionTarget::Task(name) => name.clone(),
+    }
+}
+
+fn render_item_action_modal(
+    f: &mut ratatui::Frame<'_>,
+    parent: Rect,
+    target: &ItemActionTarget,
+    cursor: usize,
+) {
+    let w = parent.width.clamp(40, 56);
+    let h: u16 = 8;
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    let y = parent.y + (parent.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(item_action_title(target))
+        .style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            item_action_value(target),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+    ];
+    for (idx, action) in ITEM_ACTION_CHOICES.iter().copied().enumerate() {
+        let selected = idx == cursor;
+        let marker = if selected { ">" } else { " " };
+        let (label, color) = match action {
+            ItemAction::Edit => ("Edit", Color::Cyan),
+            ItemAction::Remove => ("Remove", Color::Red),
+        };
+        let style = if selected {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::raw(" "),
+            Span::styled(label, style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ j/k move · Enter select · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -2263,7 +2586,7 @@ fn render_task_input_modal(
     focus: TaskField,
     is_edit: bool,
 ) {
-    let w = parent.width.min(80).max(50);
+    let w = parent.width.clamp(50, 80);
     let h: u16 = 8;
     let x = parent.x + (parent.width.saturating_sub(w)) / 2;
     let y = parent.y + (parent.height.saturating_sub(h)) / 2;
@@ -2513,6 +2836,27 @@ mod tests {
     }
 
     #[test]
+    fn mcp_rows_start_collapsed() {
+        let mut tasks_global = BTreeMap::new();
+        tasks_global.insert("build".to_string(), "cargo build".to_string());
+        let state = make_state(
+            vec![entry("server", "tool", Some(true))],
+            McpPolicy::default(),
+            McpPolicy::default(),
+            tasks_global,
+            BTreeMap::new(),
+        );
+
+        assert!(!state.task_runner_expanded);
+        assert_eq!(state.expanded, vec![false]);
+        let rows = state.visible_rows(Scope::Global);
+        assert!(matches!(
+            rows.as_slice(),
+            [McpRow::TaskRunnerHeader, McpRow::Server(0)]
+        ));
+    }
+
+    #[test]
     fn effective_tool_allowed_workspace_override_wins() {
         // Global says enabled; workspace explicitly turns it off.
         let mut g = McpPolicy::default();
@@ -2631,7 +2975,8 @@ mod tests {
     #[test]
     fn has_unsaved_changes_detects_default_agent_edit() {
         let mut app = App::new(fresh_input());
-        app.general.toggle(Scope::Workspace);
+        app.general
+            .set_agent(Scope::Workspace, Some(DefaultAgent::Codex));
         assert!(app.has_unsaved_changes());
     }
 
@@ -2649,12 +2994,75 @@ mod tests {
         );
         assert_eq!(general.origin(Scope::Workspace), ProxyOrigin::Global);
 
-        general.toggle(Scope::Workspace);
+        general.set_agent(Scope::Workspace, Some(DefaultAgent::Claude));
         assert_eq!(
             general.effective_agent(Scope::Workspace),
             DefaultAgent::Claude
         );
         assert_eq!(general.origin(Scope::Workspace), ProxyOrigin::Workspace);
+    }
+
+    #[test]
+    fn general_default_agent_row_is_the_only_general_action() {
+        let mut general = GeneralState::new(
+            GeneralPolicy {
+                default_agent: Some(DefaultAgent::Codex),
+            },
+            GeneralPolicy::default(),
+        );
+        assert_eq!(
+            general.visible_rows(Scope::Workspace),
+            vec![GeneralRow::DefaultAgent]
+        );
+
+        general.set_agent(Scope::Workspace, Some(DefaultAgent::Claude));
+        assert_eq!(
+            general.visible_rows(Scope::Workspace),
+            vec![GeneralRow::DefaultAgent]
+        );
+    }
+
+    #[test]
+    fn default_agent_select_modal_commits_explicit_choice() {
+        let mut app = App::new(fresh_input());
+        app.mode = Mode::DefaultAgentSelect {
+            cursor: default_agent_index(Some(DefaultAgent::Codex)),
+        };
+
+        handle_default_agent_select_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.general.workspace.default_agent,
+            Some(DefaultAgent::Codex)
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn default_agent_select_modal_can_unset_scope_value() {
+        let mut app = App::new(fresh_input());
+        app.general
+            .set_agent(Scope::Workspace, Some(DefaultAgent::Codex));
+        app.mode = Mode::DefaultAgentSelect {
+            cursor: default_agent_index(None),
+        };
+
+        handle_default_agent_select_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.general.workspace.default_agent, None);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn quit_menu_choices_are_menu_ordered() {
+        assert!(matches!(
+            QUIT_ACTION_CHOICES,
+            [
+                QuitAction::SaveAndQuit,
+                QuitAction::KeepEditing,
+                QuitAction::DiscardAndQuit
+            ]
+        ));
     }
 
     #[test]
@@ -2684,7 +3092,7 @@ mod tests {
     #[test]
     fn proxy_visible_rows_global_view_shows_only_global() {
         let p = ProxyState::new(vec!["g1".into(), "g2".into()], vec!["w1".into()]);
-        let rows = p.visible_rows(Scope::Global);
+        let rows = p.entry_rows(Scope::Global);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.origin == ProxyOrigin::Global));
         let patterns: Vec<&str> = rows.iter().map(|r| r.pattern.as_str()).collect();
@@ -2699,7 +3107,7 @@ mod tests {
             vec!["g1".into(), "g2".into()],
             vec!["g1".into(), "w1".into()],
         );
-        let rows = p.visible_rows(Scope::Workspace);
+        let rows = p.entry_rows(Scope::Workspace);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].origin, ProxyOrigin::Global);
         assert_eq!(rows[0].pattern, "g1");
@@ -2707,6 +3115,15 @@ mod tests {
         assert_eq!(rows[1].pattern, "g2");
         assert_eq!(rows[2].origin, ProxyOrigin::Workspace);
         assert_eq!(rows[2].pattern, "w1");
+    }
+
+    #[test]
+    fn proxy_visible_rows_include_row_actions() {
+        let p = ProxyState::new(vec!["g1".into()], vec!["w1".into()]);
+        let rows = p.visible_rows(Scope::Workspace);
+        assert!(matches!(rows[0], ProxyViewRow::Entry(_)));
+        assert!(matches!(rows[1], ProxyViewRow::Entry(_)));
+        assert!(matches!(rows[2], ProxyViewRow::Add));
     }
 
     #[test]
@@ -2730,7 +3147,7 @@ mod tests {
         let mut p = ProxyState::new(vec!["g1".into()], vec!["w1".into()]);
         // Edit the workspace row in workspace view.
         p.cursor = 1;
-        let row = p.current_row(Scope::Workspace).unwrap();
+        let row = p.current_entry(Scope::Workspace).unwrap();
         p.upsert(Scope::Workspace, "w1-renamed".to_string(), Some(row));
         assert_eq!(p.global, vec!["g1".to_string()]);
         assert_eq!(p.workspace, vec!["w1-renamed".to_string()]);
@@ -2750,6 +3167,62 @@ mod tests {
         p.upsert(Scope::Workspace, "w1".to_string(), None);
         // Already present, must not be re-appended.
         assert_eq!(p.workspace, vec!["w1".to_string()]);
+    }
+
+    #[test]
+    fn filesystem_visible_rows_group_paths_and_filters() {
+        let state = FilesystemState::new(
+            FilesystemPolicy {
+                mounts: vec!["/tmp/shared".into()],
+                hide: vec!["secret".into()],
+                readonly: vec!["readonly".into()],
+            },
+            FilesystemPolicy::default(),
+        );
+        let rows = state.visible_rows(Scope::Global);
+        assert!(matches!(
+            rows[0],
+            FilesystemViewRow::Section(FilesystemSection::Path)
+        ));
+        assert!(matches!(rows[1], FilesystemViewRow::Entry(_)));
+        assert!(matches!(
+            rows[2],
+            FilesystemViewRow::Add(FilesystemField::Mount)
+        ));
+        assert!(matches!(
+            rows[3],
+            FilesystemViewRow::Section(FilesystemSection::Filter)
+        ));
+        assert!(matches!(rows[4], FilesystemViewRow::Entry(_)));
+        assert!(matches!(rows[5], FilesystemViewRow::Entry(_)));
+        assert!(matches!(
+            rows[6],
+            FilesystemViewRow::Add(FilesystemField::Hide)
+        ));
+        assert!(matches!(
+            rows[7],
+            FilesystemViewRow::Add(FilesystemField::Readonly)
+        ));
+    }
+
+    #[test]
+    fn item_action_modal_removes_existing_filesystem_item() {
+        let mut app = App::new(fresh_input());
+        app.scope = Scope::Workspace;
+        app.filesystem.cursor = 6;
+        let Some(FilesystemViewRow::Entry(row)) = app.filesystem.current_row(Scope::Workspace)
+        else {
+            panic!("expected workspace filesystem entry");
+        };
+        app.mode = Mode::ItemAction {
+            target: ItemActionTarget::Filesystem(row),
+            cursor: 1,
+        };
+
+        handle_item_action_key(&mut app, KeyCode::Enter);
+
+        assert!(app.filesystem.workspace.hide.is_empty());
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]

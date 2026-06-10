@@ -90,13 +90,6 @@ pub enum DefaultAgent {
 }
 
 impl DefaultAgent {
-    pub fn toggle(self) -> Self {
-        match self {
-            DefaultAgent::Claude => DefaultAgent::Codex,
-            DefaultAgent::Codex => DefaultAgent::Claude,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             DefaultAgent::Claude => "Claude Code",

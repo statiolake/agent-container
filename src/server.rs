@@ -124,16 +124,28 @@ pub enum McpPolicyScope {
     Codex,
 }
 
-pub async fn spawn(
-    bedrock: Option<(BedrockSetup, Option<String>)>,
-    mcp_servers: Vec<McpServer>,
-    task_runner: Option<TaskRunner>,
-    host_fs: Option<HostFs>,
-    policy: McpPolicy,
-    oauth: Arc<OAuthStore>,
-    stdio_bridge: Option<PathBridge>,
-    reload: Option<McpReloadConfig>,
-) -> Result<RunningServer> {
+pub struct SpawnConfig {
+    pub bedrock: Option<(BedrockSetup, Option<String>)>,
+    pub mcp_servers: Vec<McpServer>,
+    pub task_runner: Option<TaskRunner>,
+    pub host_fs: Option<HostFs>,
+    pub policy: McpPolicy,
+    pub oauth: Arc<OAuthStore>,
+    pub stdio_bridge: Option<PathBridge>,
+    pub reload: Option<McpReloadConfig>,
+}
+
+pub async fn spawn(config: SpawnConfig) -> Result<RunningServer> {
+    let SpawnConfig {
+        bedrock,
+        mcp_servers,
+        task_runner,
+        host_fs,
+        policy,
+        oauth,
+        stdio_bridge,
+        reload,
+    } = config;
     // Loopback bind is load-bearing for the security model: this broker
     // hands out fresh AWS Bedrock credentials and proxies authenticated
     // MCP traffic, and nothing about the protocol authenticates the
@@ -536,24 +548,24 @@ async fn forward_http(
     let is_tools_list = method_name.as_deref() == Some("tools/list");
     let tool_call = parse_tool_call(&body_bytes);
 
-    if is_tools_list || tool_call.is_some() {
-        if let Err(e) = ensure_http_initialized(&state, server_name, &server).await {
-            let reason = format!("{e:#}");
-            mark_mcp_recovery(&state, server_name, reason.clone()).await;
-            if is_tools_list {
-                return recovery_tools_list_response(
-                    parse_jsonrpc_id(&body_bytes),
-                    server_name,
-                    &reason,
-                );
-            }
-            if let Some(call) = tool_call.as_ref() {
-                return recovery_tool_result_response(
-                    call.id.clone(),
-                    format!("MCP server '{server_name}' is not initialized: {reason}"),
-                    true,
-                );
-            }
+    if (is_tools_list || tool_call.is_some())
+        && let Err(e) = ensure_http_initialized(&state, server_name, &server).await
+    {
+        let reason = format!("{e:#}");
+        mark_mcp_recovery(&state, server_name, reason.clone()).await;
+        if is_tools_list {
+            return recovery_tools_list_response(
+                parse_jsonrpc_id(&body_bytes),
+                server_name,
+                &reason,
+            );
+        }
+        if let Some(call) = tool_call.as_ref() {
+            return recovery_tool_result_response(
+                call.id.clone(),
+                format!("MCP server '{server_name}' is not initialized: {reason}"),
+                true,
+            );
         }
     }
 
@@ -671,17 +683,16 @@ async fn forward_http(
             .bytes()
             .await
             .context("failed to buffer tools/list response body")?;
-        if is_json {
-            if let Ok(parsed) = serde_json::from_slice::<Value>(&raw) {
-                if let Some(reason) = jsonrpc_error_text(&parsed) {
-                    mark_mcp_recovery(&state, server_name, reason.clone()).await;
-                    return recovery_tools_list_response(
-                        parse_jsonrpc_id(&body_bytes),
-                        server_name,
-                        &reason,
-                    );
-                }
-            }
+        if is_json
+            && let Ok(parsed) = serde_json::from_slice::<Value>(&raw)
+            && let Some(reason) = jsonrpc_error_text(&parsed)
+        {
+            mark_mcp_recovery(&state, server_name, reason.clone()).await;
+            return recovery_tools_list_response(
+                parse_jsonrpc_id(&body_bytes),
+                server_name,
+                &reason,
+            );
         }
         clear_mcp_recovery(&state, server_name).await;
         let filter_result = if is_json {
@@ -893,24 +904,24 @@ async fn forward_stdio_post(
     let is_tools_list = method_name.as_deref() == Some("tools/list");
     let tool_call = parse_tool_call(&body_bytes);
 
-    if is_tools_list || tool_call.is_some() {
-        if let Err(e) = ensure_stdio_initialized(&state, server_name, &handle).await {
-            let reason = format!("{e:#}");
-            mark_mcp_recovery(&state, server_name, reason.clone()).await;
-            if is_tools_list {
-                return recovery_tools_list_response(
-                    parse_jsonrpc_id(&body_bytes),
-                    server_name,
-                    &reason,
-                );
-            }
-            if let Some(call) = tool_call.as_ref() {
-                return recovery_tool_result_response(
-                    call.id.clone(),
-                    format!("MCP server '{server_name}' is not initialized: {reason}"),
-                    true,
-                );
-            }
+    if (is_tools_list || tool_call.is_some())
+        && let Err(e) = ensure_stdio_initialized(&state, server_name, &handle).await
+    {
+        let reason = format!("{e:#}");
+        mark_mcp_recovery(&state, server_name, reason.clone()).await;
+        if is_tools_list {
+            return recovery_tools_list_response(
+                parse_jsonrpc_id(&body_bytes),
+                server_name,
+                &reason,
+            );
+        }
+        if let Some(call) = tool_call.as_ref() {
+            return recovery_tool_result_response(
+                call.id.clone(),
+                format!("MCP server '{server_name}' is not initialized: {reason}"),
+                true,
+            );
         }
     }
 

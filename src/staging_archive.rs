@@ -62,13 +62,35 @@ fn write_entry(
         } else {
             format!("{tar_path}/")
         };
-        write_header(out, &name, 0, 0o755, uid, gid, b'5', "")?;
+        write_header(
+            out,
+            TarHeader {
+                path: &name,
+                size: 0,
+                mode: 0o755,
+                uid,
+                gid,
+                typeflag: b'5',
+                link_name: "",
+            },
+        )?;
         write_dir_children(root, path, out, uid, gid)?;
         return Ok(());
     }
 
     if file_type.is_file() {
-        write_header(out, &tar_path, metadata.len(), 0o644, uid, gid, b'0', "")?;
+        write_header(
+            out,
+            TarHeader {
+                path: &tar_path,
+                size: metadata.len(),
+                mode: 0o644,
+                uid,
+                gid,
+                typeflag: b'0',
+                link_name: "",
+            },
+        )?;
         let mut input =
             fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let copied = std::io::copy(&mut input, out)
@@ -84,10 +106,21 @@ fn write_entry(
         let link_name = target
             .to_str()
             .with_context(|| format!("non-utf8 symlink target {}", path.display()))?;
-        if link_name.as_bytes().len() > 100 {
+        if link_name.len() > 100 {
             bail!("symlink target too long for ustar: {}", path.display());
         }
-        write_header(out, &tar_path, 0, 0o777, uid, gid, b'2', link_name)?;
+        write_header(
+            out,
+            TarHeader {
+                path: &tar_path,
+                size: 0,
+                mode: 0o777,
+                uid,
+                gid,
+                typeflag: b'2',
+                link_name,
+            },
+        )?;
         return Ok(());
     }
 
@@ -122,34 +155,35 @@ fn tar_path(path: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-fn write_header(
-    out: &mut impl Write,
-    path: &str,
+struct TarHeader<'a> {
+    path: &'a str,
     size: u64,
     mode: u64,
     uid: u32,
     gid: u32,
     typeflag: u8,
-    link_name: &str,
-) -> Result<()> {
+    link_name: &'a str,
+}
+
+fn write_header(out: &mut impl Write, spec: TarHeader<'_>) -> Result<()> {
     let mut header = [0u8; 512];
-    write_name(&mut header, path)?;
-    write_octal(&mut header[100..108], mode)?;
-    write_octal(&mut header[108..116], u64::from(uid))?;
-    write_octal(&mut header[116..124], u64::from(gid))?;
-    write_octal(&mut header[124..136], size)?;
+    write_name(&mut header, spec.path)?;
+    write_octal(&mut header[100..108], spec.mode)?;
+    write_octal(&mut header[108..116], u64::from(spec.uid))?;
+    write_octal(&mut header[116..124], u64::from(spec.gid))?;
+    write_octal(&mut header[124..136], spec.size)?;
     write_octal(&mut header[136..148], 0)?;
     for b in &mut header[148..156] {
         *b = b' ';
     }
-    header[156] = typeflag;
-    write_bytes(&mut header[157..257], link_name.as_bytes())?;
+    header[156] = spec.typeflag;
+    write_bytes(&mut header[157..257], spec.link_name.as_bytes())?;
     header[257..263].copy_from_slice(b"ustar\0");
     header[263..265].copy_from_slice(b"00");
     let checksum: u32 = header.iter().map(|b| u32::from(*b)).sum();
     write_checksum(&mut header[148..156], checksum)?;
     out.write_all(&header)
-        .with_context(|| format!("failed to write tar header for {path}"))?;
+        .with_context(|| format!("failed to write tar header for {}", spec.path))?;
     Ok(())
 }
 
@@ -163,7 +197,7 @@ fn write_name(header: &mut [u8; 512], path: &str) -> Result<()> {
     for split in path.match_indices('/').map(|(idx, _)| idx).rev() {
         let prefix = &path[..split];
         let name = &path[split + 1..];
-        if prefix.as_bytes().len() <= 155 && name.as_bytes().len() <= 100 {
+        if prefix.len() <= 155 && name.len() <= 100 {
             write_bytes(&mut header[0..100], name.as_bytes())?;
             write_bytes(&mut header[345..500], prefix.as_bytes())?;
             return Ok(());
