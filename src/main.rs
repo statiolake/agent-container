@@ -194,14 +194,22 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn dispatch_mcp(agent: AgentKind, command: McpCommands) -> Result<()> {
+async fn dispatch_mcp(agent: Option<AgentKind>, command: McpCommands) -> Result<()> {
+    let host = paths::HostPaths::detect()?;
+    let agent = match agent {
+        Some(agent) => agent,
+        None => {
+            let merged_settings = settings::Settings::load_merged(&host.workspace)
+                .context("failed to load agent-container settings (global + workspace)")?;
+            agent_kind_from_default(merged_settings.general.default_agent())
+        }
+    };
     match command {
-        McpCommands::Auth { server } => mcp_auth_cmd(agent, &server).await,
+        McpCommands::Auth { server } => mcp_auth_cmd(&host, agent, &server).await,
     }
 }
 
-async fn mcp_auth_cmd(agent: AgentKind, server_name: &str) -> Result<()> {
-    let host = paths::HostPaths::detect()?;
+async fn mcp_auth_cmd(host: &paths::HostPaths, agent: AgentKind, server_name: &str) -> Result<()> {
     let servers = match agent {
         AgentKind::Claude => mcp::load_servers(&host.home.join(".claude.json"))
             .context("failed to load MCP servers from ~/.claude.json")?,

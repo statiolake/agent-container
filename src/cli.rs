@@ -79,9 +79,10 @@ pub enum Commands {
 
     /// Manage MCP server state used by agent-container.
     Mcp {
-        /// Which agent's MCP server declarations to use.
+        /// Which agent's MCP server declarations to use. Omit to use
+        /// `[general].default_agent` from settings.
         #[arg(long, value_enum)]
-        agent: AgentKind,
+        agent: Option<AgentKind>,
         #[command(subcommand)]
         command: McpCommands,
     },
@@ -138,7 +139,8 @@ const TOP_LEVEL_EXAMPLES: &str = r#"Examples:
   agent-container shell -- cat /etc/resolv.conf
   agent-container config
   agent-container config show --workspace
-  agent-container mcp --agent claude auth notion"#;
+  agent-container mcp auth notion
+  agent-container mcp --agent codex auth notion"#;
 
 const RUN_HELP: &str = r#"Launch a coding agent inside the sandbox container.
 
@@ -318,12 +320,24 @@ mod tests {
     }
 
     #[test]
-    fn mcp_auth_selects_agent_and_server() {
+    fn mcp_auth_accepts_default_agent_and_server() {
+        let cli = Cli::try_parse_from(["agent-container", "mcp", "auth", "notion"]).unwrap();
+
+        let Commands::Mcp { agent, command } = cli.command else {
+            panic!("expected mcp command");
+        };
+        assert_eq!(agent, None);
+        let McpCommands::Auth { server } = command;
+        assert_eq!(server, "notion");
+    }
+
+    #[test]
+    fn mcp_auth_accepts_explicit_agent_and_server() {
         let cli = Cli::try_parse_from([
             "agent-container",
             "mcp",
             "--agent",
-            "claude",
+            "codex",
             "auth",
             "notion",
         ])
@@ -332,7 +346,7 @@ mod tests {
         let Commands::Mcp { agent, command } = cli.command else {
             panic!("expected mcp command");
         };
-        assert_eq!(agent, AgentKind::Claude);
+        assert_eq!(agent, Some(AgentKind::Codex));
         let McpCommands::Auth { server } = command;
         assert_eq!(server, "notion");
     }
