@@ -87,7 +87,7 @@ pub fn sync_host_state(host: &HostPaths, opts: SyncOptions<'_>) -> Result<()> {
 
     sync_claude_json(host, &opts).context("failed to sync .claude.json")?;
     sync_settings_json(host, &opts).context("failed to sync .claude/settings.json")?;
-    sync_claude_md(host).context("failed to sync .claude/CLAUDE.md")?;
+    sync_claude_md(host).context("failed to stage .claude/CLAUDE.md")?;
     sync_claude_extensions(host).context("failed to sync Claude skills/commands/agents")?;
     sync_git_identity(host).context("failed to sync git identity")?;
     Ok(())
@@ -378,15 +378,17 @@ fn sync_claude_md(host: &HostPaths) -> Result<()> {
     let src = host.host_claude_md();
     let dest = host.staged_home.join(".claude/CLAUDE.md");
     clear_path(&dest)?;
-    if !src.is_file() {
-        return Ok(());
-    }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::copy(&src, &dest)
-        .with_context(|| format!("failed to copy {} to {}", src.display(), dest.display()))?;
+    let body = if src.is_file() {
+        fs::read_to_string(&src).with_context(|| format!("failed to read {}", src.display()))?
+    } else {
+        String::new()
+    };
+    fs::write(&dest, crate::container_notice::append_to(&body))
+        .with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
 }
 
@@ -933,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_md_is_staged_as_a_copied_file() {
+    fn claude_md_is_staged_with_container_notice() {
         let tmp_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
         let workspace = tmp_home.path().join("work");
@@ -950,10 +952,32 @@ mod tests {
 
         sync_claude_md(&host).unwrap();
 
-        assert_eq!(
-            fs::read_to_string(container_home.path().join(".claude/CLAUDE.md")).unwrap(),
-            "host instructions"
-        );
+        let out = fs::read_to_string(container_home.path().join(".claude/CLAUDE.md")).unwrap();
+        assert!(out.starts_with("host instructions\n\n"));
+        assert!(out.contains(crate::container_notice::MARKER));
+        assert!(out.contains("Network access from this container is restricted."));
+    }
+
+    #[test]
+    fn claude_md_notice_is_staged_even_without_host_file() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = tmp_home.path().join("work");
+        let claude_root = tmp_home.path().join(".claude");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&claude_root).unwrap();
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root,
+            workspace,
+            staged_home: container_home.path().to_path_buf(),
+        };
+
+        sync_claude_md(&host).unwrap();
+
+        let out = fs::read_to_string(container_home.path().join(".claude/CLAUDE.md")).unwrap();
+        assert!(out.starts_with(crate::container_notice::MARKER));
+        assert!(out.contains("HostRead, HostList, HostWrite, and HostSearch"));
     }
 
     #[test]

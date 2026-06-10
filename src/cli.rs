@@ -124,6 +124,8 @@ pub enum ConfigCommands {
 
 #[derive(Debug, Subcommand)]
 pub enum McpCommands {
+    /// List MCP servers declared for the selected agent.
+    List,
     /// Authenticate an HTTP MCP server with OAuth 2.1 + PKCE.
     Auth {
         /// MCP server name as declared in the selected agent's config.
@@ -352,7 +354,9 @@ mod tests {
             panic!("expected mcp command");
         };
         assert_eq!(agent, None);
-        let McpCommands::Auth { server } = command;
+        let McpCommands::Auth { server } = command else {
+            panic!("expected mcp auth command");
+        };
         assert_eq!(server, "notion");
     }
 
@@ -372,7 +376,20 @@ mod tests {
             panic!("expected mcp command");
         };
         assert_eq!(agent, Some(AgentKind::Codex));
-        let McpCommands::Auth { server } = command;
+        let McpCommands::Auth { server } = command else {
+            panic!("expected mcp auth command");
+        };
         assert_eq!(server, "notion");
+    }
+
+    #[test]
+    fn mcp_list_accepts_default_agent() {
+        let cli = Cli::try_parse_from(["agent-container", "mcp", "list"]).unwrap();
+
+        let Commands::Mcp { agent, command } = cli.command else {
+            panic!("expected mcp command");
+        };
+        assert_eq!(agent, None);
+        assert!(matches!(command, McpCommands::List));
     }
 }

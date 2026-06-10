@@ -2,6 +2,7 @@ mod aws;
 mod cli;
 mod codex;
 mod config_cmd;
+mod container_notice;
 mod creds;
 mod docker;
 mod host_fs;
@@ -209,17 +210,50 @@ async fn dispatch_mcp(agent: Option<AgentKind>, command: McpCommands) -> Result<
         }
     };
     match command {
+        McpCommands::List => mcp_list_cmd(&host, agent).await,
         McpCommands::Auth { server } => mcp_auth_cmd(&host, agent, &server).await,
     }
 }
 
-async fn mcp_auth_cmd(host: &paths::HostPaths, agent: AgentKind, server_name: &str) -> Result<()> {
-    let servers = match agent {
-        AgentKind::Claude => mcp::load_servers(&host.home.join(".claude.json"))
-            .context("failed to load MCP servers from ~/.claude.json")?,
-        AgentKind::Codex => mcp::load_codex_servers(&host.home.join(".codex/config.toml"))
-            .context("failed to load MCP servers from ~/.codex/config.toml")?,
+async fn mcp_list_cmd(host: &paths::HostPaths, agent: AgentKind) -> Result<()> {
+    let servers = load_agent_mcp_servers(host, agent)?;
+    let settings = settings::Settings::load_merged(&host.workspace)
+        .context("failed to load agent-container settings (global + workspace)")?;
+    let policy = match agent {
+        AgentKind::Claude => &settings.claude_code.mcp,
+        AgentKind::Codex => &settings.codex.mcp,
     };
+    let oauth_entries = oauth::load_from_keychain().unwrap_or_else(|e| {
+        eprintln!("[agent-container] warning: failed to read MCP OAuth records: {e:#}");
+        std::collections::HashMap::new()
+    });
+
+    println!("MCP servers for {agent:?}:");
+    if servers.is_empty() {
+        println!("  (none)");
+        return Ok(());
+    }
+
+    for server in servers {
+        println!("  {}", server.name());
+        println!("    Transport: {}", server.transport_label());
+        match &server {
+            mcp::McpServer::Http(http) => {
+                println!("    URL: {}", http.url);
+                println!("    Auth: {}", mcp_auth_status(http, &oauth_entries));
+            }
+            mcp::McpServer::Stdio(stdio) => {
+                println!("    Command: {}", stdio_command_summary(stdio));
+                println!("    Auth: Unsupported");
+            }
+        }
+        println!("    Policy: {}", mcp_policy_status(policy, server.name()));
+    }
+    Ok(())
+}
+
+async fn mcp_auth_cmd(host: &paths::HostPaths, agent: AgentKind, server_name: &str) -> Result<()> {
+    let servers = load_agent_mcp_servers(host, agent)?;
     let server = servers
         .iter()
         .find(|server| server.name() == server_name)
@@ -228,6 +262,79 @@ async fn mcp_auth_cmd(host: &paths::HostPaths, agent: AgentKind, server_name: &s
         bail!("MCP server '{server_name}' uses stdio; MCP OAuth applies only to HTTP transports");
     };
     mcp_auth::authenticate(server).await
+}
+
+fn load_agent_mcp_servers(
+    host: &paths::HostPaths,
+    agent: AgentKind,
+) -> Result<Vec<mcp::McpServer>> {
+    match agent {
+        AgentKind::Claude => mcp::load_servers(&host.home.join(".claude.json"))
+            .context("failed to load MCP servers from ~/.claude.json"),
+        AgentKind::Codex => mcp::load_codex_servers(&host.home.join(".codex/config.toml"))
+            .context("failed to load MCP servers from ~/.codex/config.toml"),
+    }
+}
+
+fn mcp_auth_status(
+    server: &mcp::HttpMcpServer,
+    oauth_entries: &std::collections::HashMap<String, oauth::McpOAuthEntry>,
+) -> String {
+    if server
+        .headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("authorization"))
+    {
+        return "Static Authorization header".to_string();
+    }
+    let Some(entry) = oauth_entries.get(&server.name) else {
+        return "OAuth not logged in".to_string();
+    };
+    let Some(expires_at) = entry.expires_at_ms else {
+        return "OAuth token present".to_string();
+    };
+    let remaining = expires_at - oauth::now_ms();
+    if remaining <= 0 {
+        return "OAuth expired".to_string();
+    }
+    format!("OAuth valid for {}", format_duration_ms(remaining))
+}
+
+fn mcp_policy_status(policy: &policy::McpPolicy, server: &str) -> String {
+    let Some(server_policy) = policy.servers.get(server) else {
+        return "default".to_string();
+    };
+    let status = if server_policy.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    if server_policy.tools.is_empty() {
+        status.to_string()
+    } else {
+        format!("{status}, {} tool override(s)", server_policy.tools.len())
+    }
+}
+
+fn stdio_command_summary(server: &mcp::StdioMcpServer) -> String {
+    std::iter::once(server.command.as_str())
+        .chain(server.args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_duration_ms(ms: i64) -> String {
+    let seconds = (ms / 1000).max(0);
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
 }
 
 async fn dispatch_config(

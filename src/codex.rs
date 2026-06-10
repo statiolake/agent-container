@@ -159,6 +159,22 @@ pub fn write_container_config(
         .context("serialising codex config.toml")?;
     fs::write(&path, format!("{header}{body}"))
         .with_context(|| format!("failed to write {}", path.display()))?;
+    write_container_agents_md(host_home, container_home)?;
+    Ok(())
+}
+
+fn write_container_agents_md(host_home: &Path, container_home: &Path) -> Result<()> {
+    let src = host_home.join(".codex/AGENTS.md");
+    let dir = container_home.join(".codex");
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let body = if src.is_file() {
+        fs::read_to_string(&src).with_context(|| format!("failed to read {}", src.display()))?
+    } else {
+        String::new()
+    };
+    let dest = dir.join("AGENTS.md");
+    fs::write(&dest, crate::container_notice::append_to(&body))
+        .with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
 }
 
@@ -247,6 +263,8 @@ trust_level = "trusted"
         assert_eq!(t["approval_policy"].as_str(), Some("never"));
         assert_eq!(t["sandbox_mode"].as_str(), Some("danger-full-access"));
         assert!(t.get("projects").is_none(), "projects must be dropped");
+        let agents = fs::read_to_string(container_home.path().join(".codex/AGENTS.md")).unwrap();
+        assert!(agents.contains(crate::container_notice::MARKER));
     }
 
     #[test]
@@ -294,6 +312,25 @@ trust_level = "trusted"
             servers[crate::host_fs::NAME]["url"].as_str(),
             Some("http://host.docker.internal:7000/mcp/host-fs")
         );
+    }
+
+    #[test]
+    fn writes_codex_agents_md_with_host_text_and_container_notice() {
+        let host_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(host_home.path().join(".codex")).unwrap();
+        fs::write(
+            host_home.path().join(".codex/AGENTS.md"),
+            "host codex instructions",
+        )
+        .unwrap();
+
+        write_container_agents_md(host_home.path(), container_home.path()).unwrap();
+
+        let out = fs::read_to_string(container_home.path().join(".codex/AGENTS.md")).unwrap();
+        assert!(out.starts_with("host codex instructions\n\n"));
+        assert!(out.contains(crate::container_notice::MARKER));
+        assert!(out.contains("task_runner MCP server"));
     }
 
     #[test]
