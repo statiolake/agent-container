@@ -15,6 +15,8 @@ struct ProtectedResourceMetadata {
 
 #[derive(Debug, Deserialize)]
 struct AuthorizationServerMetadata {
+    #[serde(default)]
+    issuer: Option<String>,
     authorization_endpoint: String,
     token_endpoint: String,
     #[serde(default)]
@@ -45,13 +47,7 @@ pub async fn authenticate(server: &HttpMcpServer) -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
-    let prm = discover_protected_resource(&http, &server.url).await?;
-    let as_url = prm
-        .authorization_servers
-        .first()
-        .cloned()
-        .context("protected resource metadata has no authorization_servers")?;
-    let metadata = discover_authorization_server(&http, &as_url).await?;
+    let (as_url, metadata) = discover_oauth_metadata(&http, &server.url).await?;
 
     let callback = CallbackListener::bind().await?;
     let redirect_uri = callback.redirect_uri();
@@ -112,59 +108,148 @@ async fn discover_protected_resource(
     http: &reqwest::Client,
     server_url: &str,
 ) -> Result<ProtectedResourceMetadata> {
-    let metadata_url = protected_resource_metadata_url(server_url)?;
-    let resp = http
-        .get(metadata_url.clone())
-        .send()
-        .await
-        .with_context(|| format!("GET {metadata_url} failed"))?;
-    if !resp.status().is_success() {
-        bail!(
-            "protected resource metadata request failed for {metadata_url}: {}",
-            resp.status()
-        );
+    let mut last_error = None;
+    for metadata_url in protected_resource_metadata_urls(server_url)? {
+        let resp = match http.get(metadata_url.clone()).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                last_error =
+                    Some(anyhow::Error::new(err).context(format!("GET {metadata_url} failed")));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_error = Some(anyhow::anyhow!(
+                "protected resource metadata request failed for {metadata_url}: {}",
+                resp.status()
+            ));
+            continue;
+        }
+        return resp.json().await.with_context(|| {
+            format!("failed to parse protected resource metadata from {metadata_url}")
+        });
     }
-    resp.json()
-        .await
-        .with_context(|| format!("failed to parse protected resource metadata from {metadata_url}"))
+
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("no protected resource metadata URL candidates")))
 }
 
-fn protected_resource_metadata_url(server_url: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(server_url).context("MCP server URL is invalid")?;
-    let mut path = url.path().trim_end_matches('/').to_string();
-    path.push_str("/.well-known/oauth-protected-resource");
-    url.set_path(&path);
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.to_string())
+fn protected_resource_metadata_urls(server_url: &str) -> Result<Vec<String>> {
+    well_known_urls(server_url, "oauth-protected-resource")
+}
+
+async fn discover_oauth_metadata(
+    http: &reqwest::Client,
+    server_url: &str,
+) -> Result<(String, AuthorizationServerMetadata)> {
+    match discover_protected_resource(http, server_url).await {
+        Ok(protected) => {
+            let authorization_servers = protected.authorization_servers;
+            if authorization_servers.is_empty() {
+                bail!("protected resource metadata has no authorization_servers");
+            }
+
+            let mut last_error = None;
+            for authorization_server in authorization_servers {
+                match discover_authorization_server(http, &authorization_server).await {
+                    Ok(metadata) => {
+                        let as_url = metadata
+                            .issuer
+                            .clone()
+                            .unwrap_or_else(|| authorization_server.clone());
+                        return Ok((as_url, metadata));
+                    }
+                    Err(err) => last_error = Some(err),
+                }
+            }
+
+            if let Some(err) = last_error {
+                return Err(err);
+            }
+        }
+        Err(err) => {
+            tracing::debug!(
+                ?err,
+                "protected resource metadata discovery failed; trying authorization-server discovery"
+            );
+        }
+    }
+
+    let metadata = discover_authorization_server(http, server_url).await?;
+    let as_url = metadata
+        .issuer
+        .clone()
+        .unwrap_or_else(|| issuer_base_url(server_url).unwrap_or_else(|_| server_url.to_string()));
+    Ok((as_url, metadata))
 }
 
 async fn discover_authorization_server(
     http: &reqwest::Client,
     authorization_server: &str,
 ) -> Result<AuthorizationServerMetadata> {
-    let mut url =
-        reqwest::Url::parse(authorization_server).context("authorization server URL is invalid")?;
-    let mut path = url.path().trim_end_matches('/').to_string();
-    path.push_str("/.well-known/oauth-authorization-server");
-    url.set_path(&path);
+    let mut last_error = None;
+    for url in well_known_urls(authorization_server, "oauth-authorization-server")? {
+        let resp = match http.get(url.clone()).send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                last_error = Some(anyhow::Error::new(err).context(format!("GET {url} failed")));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_error = Some(anyhow::anyhow!(
+                "authorization server metadata request failed for {url}: {}",
+                resp.status()
+            ));
+            continue;
+        }
+        return resp
+            .json()
+            .await
+            .with_context(|| format!("failed to parse authorization server metadata from {url}"));
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("no authorization server metadata URL candidates")))
+}
+
+fn well_known_urls(server_url: &str, suffix: &str) -> Result<Vec<String>> {
+    let url = reqwest::Url::parse(server_url).context("server URL is invalid")?;
+    let trimmed = url.path().trim_start_matches('/').trim_end_matches('/');
+    let canonical = format!("/.well-known/{suffix}");
+    let paths = if trimmed.is_empty() {
+        vec![canonical]
+    } else {
+        let mut paths = Vec::new();
+        push_unique(&mut paths, format!("{canonical}/{trimmed}"));
+        push_unique(&mut paths, format!("/{trimmed}/.well-known/{suffix}"));
+        push_unique(&mut paths, canonical);
+        paths
+    };
+
+    let mut urls = Vec::new();
+    for path in paths {
+        let mut candidate = url.clone();
+        candidate.set_path(&path);
+        candidate.set_query(None);
+        candidate.set_fragment(None);
+        urls.push(candidate.to_string());
+    }
+    Ok(urls)
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn issuer_base_url(server_url: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(server_url).context("server URL is invalid")?;
+    url.set_path("");
     url.set_query(None);
     url.set_fragment(None);
-
-    let resp = http
-        .get(url.clone())
-        .send()
-        .await
-        .with_context(|| format!("GET {url} failed"))?;
-    if !resp.status().is_success() {
-        bail!(
-            "authorization server metadata request failed for {url}: {}",
-            resp.status()
-        );
-    }
-    resp.json()
-        .await
-        .with_context(|| format!("failed to parse authorization server metadata from {url}"))
+    Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
 async fn register_client(
@@ -367,10 +452,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protected_resource_metadata_preserves_mcp_path() {
+    fn protected_resource_metadata_uses_well_known_prefix_with_mcp_path() {
         assert_eq!(
-            protected_resource_metadata_url("https://mcp.notion.com/mcp").unwrap(),
-            "https://mcp.notion.com/mcp/.well-known/oauth-protected-resource"
+            protected_resource_metadata_urls("https://mcp.notion.com/mcp").unwrap(),
+            vec![
+                "https://mcp.notion.com/.well-known/oauth-protected-resource/mcp",
+                "https://mcp.notion.com/mcp/.well-known/oauth-protected-resource",
+                "https://mcp.notion.com/.well-known/oauth-protected-resource",
+            ]
+        );
+    }
+
+    #[test]
+    fn authorization_server_metadata_uses_codex_discovery_order() {
+        assert_eq!(
+            well_known_urls("https://mcp.notion.com/mcp", "oauth-authorization-server").unwrap(),
+            vec![
+                "https://mcp.notion.com/.well-known/oauth-authorization-server/mcp",
+                "https://mcp.notion.com/mcp/.well-known/oauth-authorization-server",
+                "https://mcp.notion.com/.well-known/oauth-authorization-server",
+            ]
+        );
+    }
+
+    #[test]
+    fn issuer_base_url_drops_mcp_path() {
+        assert_eq!(
+            issuer_base_url("https://mcp.notion.com/mcp").unwrap(),
+            "https://mcp.notion.com"
         );
     }
 

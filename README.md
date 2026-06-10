@@ -315,11 +315,4 @@ global and workspace tasks share the same layout.
 
 ## License
 
-Not yet specified. Treat as "all rights reserved" until a `LICENSE`
-file is added.
-
-## Acknowledgements
-
-Built with Claude Code on a dogfooding loop — the same `agent-container`
-that you see here was the environment that most of this repository was
-written in.
+MIT License. See `LICENSE`.

@@ -208,9 +208,22 @@ pub fn shared_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static SHARED_CRED_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn shared_cred_test_guard() -> MutexGuard<'static, ()> {
+        SHARED_CRED_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn loader_runs_on_first_open_and_skipped_when_already_populated() {
+        let _guard = shared_cred_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let shared = dir.path().join("creds.json");
         let dest = dir.path().join("host.json");
@@ -240,6 +253,7 @@ mod tests {
 
     #[test]
     fn stale_shared_file_is_recreated_when_lock_is_free() {
+        let _guard = shared_cred_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let shared = dir.path().join("creds.json");
         let dest = dir.path().join("host.json");
@@ -256,6 +270,7 @@ mod tests {
 
     #[test]
     fn last_drop_writes_back_to_host_and_unlinks_shared() {
+        let _guard = shared_cred_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let shared = dir.path().join("creds.json");
         let lock = dir.path().join("creds.json.lock");
@@ -281,36 +296,93 @@ mod tests {
 
     #[test]
     fn intermediate_drop_does_not_write_back_or_unlink() {
+        let _guard = shared_cred_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let shared = dir.path().join("creds.json");
         let dest = dir.path().join("host.json");
+        let ready = dir.path().join("child.ready");
+        let release = dir.path().join("child.release");
 
         let (handle_a, _raw) =
             SharedCredFile::open(shared.clone(), HostSync::File(dest.clone()), || {
                 Ok("v1".to_string())
             })
             .unwrap();
-        let (handle_b, _raw) =
-            SharedCredFile::open(shared.clone(), HostSync::File(dest.clone()), || {
-                panic!("loader should not be invoked when file is populated");
-            })
-            .unwrap();
+        let mut child = spawn_shared_cred_child(&shared, &dest, &ready, &release);
+        wait_for_path(&ready);
 
-        // Drop A while B is still alive: nothing should be written back,
+        // Drop A while a separate sibling process is still alive: nothing should be written back,
         // and the shared file must stay so B keeps using it.
         drop(handle_a);
         assert!(!dest.exists(), "host file must not be touched mid-session");
         assert!(
             shared.exists(),
-            "shared file must remain while B holds the lock"
+            "shared file must remain while the sibling holds the lock"
         );
 
-        // Now drop B: this is the last container, it owns the cleanup.
-        drop(handle_b);
+        // Now let the sibling exit: this is the last container, it owns the cleanup.
+        fs::write(&release, "release").unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "child helper failed with {status}");
         assert!(dest.exists(), "host file must be written on the last drop");
         assert!(
             !shared.exists(),
             "shared file must be removed on the last drop"
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn shared_cred_child_helper() {
+        if std::env::var_os("AGENT_CONTAINER_SHARED_CRED_HELPER").is_none() {
+            return;
+        }
+        let shared = PathBuf::from(std::env::var_os("AGENT_CONTAINER_SHARED").unwrap());
+        let dest = PathBuf::from(std::env::var_os("AGENT_CONTAINER_SHARED_DEST").unwrap());
+        let ready = PathBuf::from(std::env::var_os("AGENT_CONTAINER_SHARED_READY").unwrap());
+        let release = PathBuf::from(std::env::var_os("AGENT_CONTAINER_SHARED_RELEASE").unwrap());
+
+        let (_handle, raw) = SharedCredFile::open(shared, HostSync::File(dest), || {
+            Ok("child-loader-should-not-run".to_string())
+        })
+        .unwrap();
+        assert_eq!(raw, "v1");
+        fs::write(&ready, "ready").unwrap();
+        wait_for_path(&release);
+    }
+
+    fn spawn_shared_cred_child(
+        shared: &Path,
+        dest: &Path,
+        ready: &Path,
+        release: &Path,
+    ) -> std::process::Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "shared_cred::tests::shared_cred_child_helper",
+                "--ignored",
+            ])
+            .env("AGENT_CONTAINER_SHARED_CRED_HELPER", "1")
+            .env("AGENT_CONTAINER_SHARED", shared)
+            .env("AGENT_CONTAINER_SHARED_DEST", dest)
+            .env("AGENT_CONTAINER_SHARED_READY", ready)
+            .env("AGENT_CONTAINER_SHARED_RELEASE", release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for_path(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {}", path.display());
     }
 }
