@@ -184,6 +184,10 @@ async fn main() -> Result<()> {
             rebuild_image,
             passthrough,
         } => shell_cmd(rebuild_image, passthrough).await,
+        Commands::Exec {
+            rebuild_image,
+            passthrough,
+        } => exec_cmd(rebuild_image, passthrough).await,
         Commands::Config {
             command,
             global,
@@ -730,6 +734,13 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     drop(claude_creds);
     drop(codex_auth);
     std::process::exit(exit);
+}
+
+async fn exec_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> {
+    if passthrough.is_empty() {
+        bail!("agent-container exec requires a command after `--`");
+    }
+    shell_cmd(rebuild_image, passthrough).await
 }
 
 fn prepare_claude_credentials(

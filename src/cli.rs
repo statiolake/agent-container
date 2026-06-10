@@ -54,6 +54,18 @@ pub enum Commands {
         passthrough: Vec<String>,
     },
 
+    /// Run a non-interactive command in the container and tear it down.
+    #[command(hide = true)]
+    Exec {
+        /// Rebuild the agent container image before starting, even if it
+        /// already exists locally.
+        #[arg(long)]
+        rebuild_image: bool,
+        /// Command to run inside bash. Must appear after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
+        passthrough: Vec<String>,
+    },
+
     /// Edit agent-container configuration (proxy allowlist, MCP tools).
     ///
     /// Settings are layered: a global file at
@@ -317,6 +329,19 @@ mod tests {
 
         assert!(Cli::try_parse_from(["agent-container", "shell", "cat"]).is_err());
         assert!(Cli::try_parse_from(["agent-container", "shell", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn hidden_exec_requires_double_dash_for_command() {
+        let cli = Cli::try_parse_from(["agent-container", "exec", "--", "true"]).unwrap();
+
+        let Commands::Exec { passthrough, .. } = cli.command else {
+            panic!("expected exec command");
+        };
+        assert_eq!(passthrough, ["true"]);
+
+        assert!(Cli::try_parse_from(["agent-container", "exec", "true"]).is_err());
+        assert!(Cli::try_parse_from(["agent-container", "exec", "--bogus"]).is_err());
     }
 
     #[test]
