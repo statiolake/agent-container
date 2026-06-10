@@ -300,7 +300,7 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     let agent_container_id = compose_service_container_id(&ctx, "agent")
         .await
         .context("failed to resolve created agent container id")?;
-    copy_staged_home_into_container(&opts.host.staged_home, &agent_container_id)
+    copy_staged_home_into_container(&opts.host.staged_home, &agent_container_id, uid, gid)
         .await
         .context("failed to copy staged home into agent container")?;
 
@@ -420,9 +420,14 @@ async fn compose_service_container_id(ctx: &ComposeCtx, service: &str) -> Result
     Ok(id.to_string())
 }
 
-async fn copy_staged_home_into_container(staged_home: &Path, container_id: &str) -> Result<()> {
+async fn copy_staged_home_into_container(
+    staged_home: &Path,
+    container_id: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
     let mut tar = Vec::new();
-    crate::staging_archive::write_tar(staged_home, &mut tar)
+    crate::staging_archive::write_tar_as(staged_home, &mut tar, uid, gid)
         .context("failed to build staged home tar stream")?;
 
     let mut child = Command::new("docker")

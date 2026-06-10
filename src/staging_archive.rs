@@ -6,16 +6,27 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+#[cfg(test)]
 pub fn write_tar(src_root: &Path, out: &mut impl Write) -> Result<()> {
+    write_tar_as(src_root, out, 0, 0)
+}
+
+pub fn write_tar_as(src_root: &Path, out: &mut impl Write, uid: u32, gid: u32) -> Result<()> {
     if src_root.is_dir() {
-        write_dir_children(src_root, src_root, out)?;
+        write_dir_children(src_root, src_root, out, uid, gid)?;
     }
     out.write_all(&[0; 1024])
         .context("failed to finish tar stream")?;
     Ok(())
 }
 
-fn write_dir_children(root: &Path, dir: &Path, out: &mut impl Write) -> Result<()> {
+fn write_dir_children(
+    root: &Path,
+    dir: &Path,
+    out: &mut impl Write,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
     let mut entries = fs::read_dir(dir)
         .with_context(|| format!("failed to read {}", dir.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -27,12 +38,19 @@ fn write_dir_children(root: &Path, dir: &Path, out: &mut impl Write) -> Result<(
         let relative = path
             .strip_prefix(root)
             .with_context(|| format!("failed to relativize {}", path.display()))?;
-        write_entry(root, relative, &path, out)?;
+        write_entry(root, relative, &path, out, uid, gid)?;
     }
     Ok(())
 }
 
-fn write_entry(root: &Path, relative: &Path, path: &Path, out: &mut impl Write) -> Result<()> {
+fn write_entry(
+    root: &Path,
+    relative: &Path,
+    path: &Path,
+    out: &mut impl Write,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     let file_type = metadata.file_type();
@@ -44,13 +62,13 @@ fn write_entry(root: &Path, relative: &Path, path: &Path, out: &mut impl Write) 
         } else {
             format!("{tar_path}/")
         };
-        write_header(out, &name, 0, 0o755, b'5', "")?;
-        write_dir_children(root, path, out)?;
+        write_header(out, &name, 0, 0o755, uid, gid, b'5', "")?;
+        write_dir_children(root, path, out, uid, gid)?;
         return Ok(());
     }
 
     if file_type.is_file() {
-        write_header(out, &tar_path, metadata.len(), 0o644, b'0', "")?;
+        write_header(out, &tar_path, metadata.len(), 0o644, uid, gid, b'0', "")?;
         let mut input =
             fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let copied = std::io::copy(&mut input, out)
@@ -69,7 +87,7 @@ fn write_entry(root: &Path, relative: &Path, path: &Path, out: &mut impl Write) 
         if link_name.as_bytes().len() > 100 {
             bail!("symlink target too long for ustar: {}", path.display());
         }
-        write_header(out, &tar_path, 0, 0o777, b'2', link_name)?;
+        write_header(out, &tar_path, 0, 0o777, uid, gid, b'2', link_name)?;
         return Ok(());
     }
 
@@ -109,14 +127,16 @@ fn write_header(
     path: &str,
     size: u64,
     mode: u64,
+    uid: u32,
+    gid: u32,
     typeflag: u8,
     link_name: &str,
 ) -> Result<()> {
     let mut header = [0u8; 512];
     write_name(&mut header, path)?;
     write_octal(&mut header[100..108], mode)?;
-    write_octal(&mut header[108..116], 0)?;
-    write_octal(&mut header[116..124], 0)?;
+    write_octal(&mut header[108..116], u64::from(uid))?;
+    write_octal(&mut header[116..124], u64::from(gid))?;
     write_octal(&mut header[124..136], size)?;
     write_octal(&mut header[136..148], 0)?;
     for b in &mut header[148..156] {
@@ -213,5 +233,20 @@ mod tests {
                 .any(|w| w == b".claude/skills/demo/SKILL.md")
         );
         assert_eq!(body.len() % 512, 0);
+    }
+
+    #[test]
+    fn writes_requested_uid_and_gid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("home");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".claude.json"), "{}").unwrap();
+        let mut archive = Vec::new();
+
+        write_tar_as(&root, &mut archive, 501, 20).unwrap();
+
+        let header = &archive[..512];
+        assert_eq!(std::str::from_utf8(&header[108..115]).unwrap(), "0000765");
+        assert_eq!(std::str::from_utf8(&header[116..123]).unwrap(), "0000024");
     }
 }
