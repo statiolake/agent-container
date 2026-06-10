@@ -13,11 +13,13 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::mcp::{HttpMcpServer, StdioMcpServer};
+use crate::mcp::{HttpMcpServer, McpServer, StdioMcpServer};
+use crate::oauth::OAuthStore;
 use crate::stdio_mcp;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const CLIENT_NAME: &str = "agent-container";
+pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -47,6 +49,33 @@ pub struct ToolAnnotations {
 impl Tool {
     pub fn read_only_hint(&self) -> Option<bool> {
         self.annotations.as_ref().and_then(|a| a.read_only_hint)
+    }
+}
+
+pub async fn fetch_tools_any(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> {
+    match server {
+        McpServer::Http(h) => {
+            let bearer = oauth
+                .access_token(&h.name)
+                .await
+                .with_context(|| format!("failed to get OAuth token for '{}'", h.name))?;
+            fetch_tools(h, bearer.as_deref()).await
+        }
+        McpServer::Stdio(s) => fetch_tools_stdio(s).await,
+    }
+}
+
+pub async fn fetch_tools_any_with_timeout(
+    server: &McpServer,
+    oauth: &OAuthStore,
+    timeout: Duration,
+) -> Result<Vec<Tool>> {
+    match tokio::time::timeout(timeout, fetch_tools_any(server, oauth)).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "timed out after {}s while initializing and fetching tools/list",
+            timeout.as_secs()
+        )),
     }
 }
 

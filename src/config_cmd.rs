@@ -14,20 +14,16 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::mcp::{self, McpServer};
-use crate::mcp_client::{Tool, fetch_tools, fetch_tools_stdio};
 use crate::oauth::{OAuthStore, load_from_keychain};
 use crate::paths::HostPaths;
 use crate::policy::McpPolicy;
 use crate::settings::{self, Scope, Settings};
 use crate::tui::{self, Outcome, ToolEntry, TuiInput};
-
-const MCP_TOOL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn stdio_is_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
@@ -268,16 +264,6 @@ fn template_for(scope: Scope) -> String {
     )
 }
 
-async fn fetch_any(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> {
-    match server {
-        McpServer::Http(h) => {
-            let bearer = oauth.access_token(&h.name).await.unwrap_or(None);
-            fetch_tools(h, bearer.as_deref()).await
-        }
-        McpServer::Stdio(s) => fetch_tools_stdio(s).await,
-    }
-}
-
 async fn fetch_tool_catalog(
     label: &str,
     servers: &[McpServer],
@@ -298,7 +284,12 @@ async fn fetch_tool_catalog(
         fetches.push(async move {
             let name = server.name().to_string();
             let transport = server.transport_label().to_string();
-            let result = fetch_any_with_timeout(&server, &oauth).await;
+            let result = crate::mcp_client::fetch_tools_any_with_timeout(
+                &server,
+                &oauth,
+                crate::mcp_client::DEFAULT_FETCH_TIMEOUT,
+            )
+            .await;
             (name, transport, result)
         });
     }
@@ -334,16 +325,6 @@ async fn fetch_tool_catalog(
             .then_with(|| a.tool_name.cmp(&b.tool_name))
     });
     entries
-}
-
-async fn fetch_any_with_timeout(server: &McpServer, oauth: &OAuthStore) -> Result<Vec<Tool>> {
-    match tokio::time::timeout(MCP_TOOL_FETCH_TIMEOUT, fetch_any(server, oauth)).await {
-        Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "timed out after {}s while fetching tools/list",
-            MCP_TOOL_FETCH_TIMEOUT.as_secs()
-        )),
-    }
 }
 
 /// Strip task entries from `final_tasks` whose value matches what the

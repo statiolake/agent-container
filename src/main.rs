@@ -31,6 +31,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 
 use crate::cli::{AgentKind, Cli, Commands, ConfigCommands, McpCommands};
 
@@ -227,11 +229,26 @@ async fn mcp_list_cmd(host: &paths::HostPaths, agent: AgentKind) -> Result<()> {
         eprintln!("[agent-container] warning: failed to read MCP OAuth records: {e:#}");
         std::collections::HashMap::new()
     });
+    let oauth_store = Arc::new(oauth::OAuthStore::new(oauth_entries.clone()));
 
     println!("MCP servers for {agent:?}:");
     if servers.is_empty() {
         println!("  (none)");
         return Ok(());
+    }
+
+    let mut probes = FuturesUnordered::new();
+    for server in servers.iter().cloned() {
+        let oauth_store = oauth_store.clone();
+        probes.push(async move {
+            let name = server.name().to_string();
+            let result = probe_mcp_server(&server, &oauth_store).await;
+            (name, result)
+        });
+    }
+    let mut probe_results = std::collections::BTreeMap::new();
+    while let Some((name, result)) = probes.next().await {
+        probe_results.insert(name, result);
     }
 
     for server in servers {
@@ -248,8 +265,20 @@ async fn mcp_list_cmd(host: &paths::HostPaths, agent: AgentKind) -> Result<()> {
             }
         }
         println!("    Policy: {}", mcp_policy_status(policy, server.name()));
+        match probe_results.remove(server.name()) {
+            Some(Ok(tool_count)) => println!("    Status: OK, {tool_count} tool(s)"),
+            Some(Err(e)) => println!("    Status: FAILED ({e:#})"),
+            None => println!("    Status: not checked"),
+        }
     }
     Ok(())
+}
+
+async fn probe_mcp_server(server: &mcp::McpServer, oauth: &oauth::OAuthStore) -> Result<usize> {
+    let tools =
+        mcp_client::fetch_tools_any_with_timeout(server, oauth, mcp_client::DEFAULT_FETCH_TIMEOUT)
+            .await?;
+    Ok(tools.len())
 }
 
 async fn mcp_auth_cmd(host: &paths::HostPaths, agent: AgentKind, server_name: &str) -> Result<()> {
@@ -291,13 +320,27 @@ fn mcp_auth_status(
         return "OAuth not logged in".to_string();
     };
     let Some(expires_at) = entry.expires_at_ms else {
-        return "OAuth token present".to_string();
+        return "OAuth credentials stored (no expiry)".to_string();
     };
     let remaining = expires_at - oauth::now_ms();
     if remaining <= 0 {
-        return "OAuth expired".to_string();
+        return if entry.refresh_token.is_some() {
+            "OAuth access token expired; refresh token stored".to_string()
+        } else {
+            "OAuth access token expired; no refresh token".to_string()
+        };
     }
-    format!("OAuth valid for {}", format_duration_ms(remaining))
+    if entry.refresh_token.is_some() {
+        format!(
+            "OAuth access token valid for {}",
+            format_duration_ms(remaining)
+        )
+    } else {
+        format!(
+            "OAuth access token valid for {}; no refresh token",
+            format_duration_ms(remaining)
+        )
+    }
 }
 
 fn mcp_policy_status(policy: &policy::McpPolicy, server: &str) -> String {
