@@ -10,6 +10,8 @@ RUN apt-get update \
         jq \
         less \
         procps \
+        python-is-python3 \
+        python3 \
         ripgrep \
         tini \
         tmux \
