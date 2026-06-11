@@ -45,7 +45,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs};
 
 use crate::policy::McpPolicy;
-use crate::settings::{DefaultAgent, FilesystemMount, FilesystemPolicy, GeneralPolicy, Scope};
+use crate::settings::{
+    ClaudePolicy, DefaultAgent, FilesystemMount, FilesystemPolicy, GeneralPolicy, Scope,
+};
 
 /// Single-line text buffer with readline-style editing primitives.
 ///
@@ -227,6 +229,8 @@ pub struct TuiInput {
     /// the TUI.
     pub general_global: GeneralPolicy,
     pub general_workspace: GeneralPolicy,
+    pub claude_global: ClaudePolicy,
+    pub claude_workspace: ClaudePolicy,
     pub proxy_allow_global: Vec<String>,
     pub proxy_allow_workspace: Vec<String>,
     pub filesystem_global: FilesystemPolicy,
@@ -254,6 +258,8 @@ pub struct TuiOutput {
     pub saved_scope: Scope,
     pub general_global: GeneralPolicy,
     pub general_workspace: GeneralPolicy,
+    pub claude_global: ClaudePolicy,
+    pub claude_workspace: ClaudePolicy,
     pub proxy_allow_global: Vec<String>,
     pub proxy_allow_workspace: Vec<String>,
     pub filesystem_global: FilesystemPolicy,
@@ -384,6 +390,9 @@ enum Mode {
     DefaultAgentSelect {
         cursor: usize,
     },
+    BypassWarningSelect {
+        cursor: usize,
+    },
     ItemAction {
         target: ItemActionTarget,
         cursor: usize,
@@ -441,10 +450,19 @@ impl TaskField {
 const DEFAULT_AGENT_CHOICES: [Option<DefaultAgent>; 3] =
     [None, Some(DefaultAgent::Claude), Some(DefaultAgent::Codex)];
 
+const BYPASS_WARNING_CHOICES: [Option<bool>; 3] = [None, Some(false), Some(true)];
+
 fn default_agent_index(agent: Option<DefaultAgent>) -> usize {
     DEFAULT_AGENT_CHOICES
         .iter()
         .position(|candidate| *candidate == agent)
+        .unwrap_or(0)
+}
+
+fn bypass_warning_index(value: Option<bool>) -> usize {
+    BYPASS_WARNING_CHOICES
+        .iter()
+        .position(|candidate| *candidate == value)
         .unwrap_or(0)
 }
 
@@ -843,19 +861,29 @@ impl FilesystemState {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GeneralRow {
     DefaultAgent,
+    BypassWarning,
 }
 
 struct GeneralState {
     global: GeneralPolicy,
     workspace: GeneralPolicy,
+    claude_global: ClaudePolicy,
+    claude_workspace: ClaudePolicy,
     cursor: usize,
 }
 
 impl GeneralState {
-    fn new(global: GeneralPolicy, workspace: GeneralPolicy) -> Self {
+    fn new(
+        global: GeneralPolicy,
+        workspace: GeneralPolicy,
+        claude_global: ClaudePolicy,
+        claude_workspace: ClaudePolicy,
+    ) -> Self {
         Self {
             global,
             workspace,
+            claude_global,
+            claude_workspace,
             cursor: 0,
         }
     }
@@ -890,6 +918,51 @@ impl GeneralState {
         self.active_policy_mut(scope).default_agent = agent;
     }
 
+    fn active_claude_policy_mut(&mut self, scope: Scope) -> &mut ClaudePolicy {
+        match scope {
+            Scope::Global => &mut self.claude_global,
+            Scope::Workspace => &mut self.claude_workspace,
+        }
+    }
+
+    fn effective_skip_bypass_warning(&self, scope: Scope) -> bool {
+        match scope {
+            Scope::Global => self.claude_global.skip_bypass_permissions_warning(),
+            Scope::Workspace => self
+                .claude_workspace
+                .skip_bypass_permissions_warning
+                .or(self.claude_global.skip_bypass_permissions_warning)
+                .unwrap_or(false),
+        }
+    }
+
+    fn bypass_warning_origin(&self, scope: Scope) -> ProxyOrigin {
+        match scope {
+            Scope::Global => ProxyOrigin::Global,
+            Scope::Workspace
+                if self
+                    .claude_workspace
+                    .skip_bypass_permissions_warning
+                    .is_some() =>
+            {
+                ProxyOrigin::Workspace
+            }
+            Scope::Workspace => ProxyOrigin::Global,
+        }
+    }
+
+    fn configured_skip_bypass_warning(&self, scope: Scope) -> Option<bool> {
+        match scope {
+            Scope::Global => self.claude_global.skip_bypass_permissions_warning,
+            Scope::Workspace => self.claude_workspace.skip_bypass_permissions_warning,
+        }
+    }
+
+    fn set_skip_bypass_warning(&mut self, scope: Scope, value: Option<bool>) {
+        self.active_claude_policy_mut(scope)
+            .skip_bypass_permissions_warning = value;
+    }
+
     fn configured_agent(&self, scope: Scope) -> Option<DefaultAgent> {
         match scope {
             Scope::Global => self.global.default_agent,
@@ -898,7 +971,7 @@ impl GeneralState {
     }
 
     fn visible_rows(&self, _scope: Scope) -> Vec<GeneralRow> {
-        vec![GeneralRow::DefaultAgent]
+        vec![GeneralRow::DefaultAgent, GeneralRow::BypassWarning]
     }
 
     fn current_row(&self, scope: Scope) -> Option<GeneralRow> {
@@ -1229,6 +1302,8 @@ enum RowAction {
 struct Snapshot {
     general_global: GeneralPolicy,
     general_workspace: GeneralPolicy,
+    claude_global: ClaudePolicy,
+    claude_workspace: ClaudePolicy,
     proxy_global: Vec<String>,
     proxy_workspace: Vec<String>,
     filesystem_global: FilesystemPolicy,
@@ -1266,6 +1341,8 @@ impl App {
         let initial = Snapshot {
             general_global: input.general_global.clone(),
             general_workspace: input.general_workspace.clone(),
+            claude_global: input.claude_global.clone(),
+            claude_workspace: input.claude_workspace.clone(),
             proxy_global: input.proxy_allow_global.clone(),
             proxy_workspace: input.proxy_allow_workspace.clone(),
             filesystem_global: input.filesystem_global.clone(),
@@ -1283,7 +1360,12 @@ impl App {
             workspace: input.workspace,
             scope: input.initial_scope,
             tab: TopTab::General,
-            general: GeneralState::new(input.general_global, input.general_workspace),
+            general: GeneralState::new(
+                input.general_global,
+                input.general_workspace,
+                input.claude_global,
+                input.claude_workspace,
+            ),
             proxy: ProxyState::new(input.proxy_allow_global, input.proxy_allow_workspace),
             filesystem: FilesystemState::new(input.filesystem_global, input.filesystem_workspace),
             mcp_claude: McpState::new(
@@ -1312,6 +1394,8 @@ impl App {
         self.proxy.global != self.initial.proxy_global
             || self.general.global != self.initial.general_global
             || self.general.workspace != self.initial.general_workspace
+            || self.general.claude_global != self.initial.claude_global
+            || self.general.claude_workspace != self.initial.claude_workspace
             || self.proxy.workspace != self.initial.proxy_workspace
             || self.filesystem.global != self.initial.filesystem_global
             || self.filesystem.workspace != self.initial.filesystem_workspace
@@ -1363,6 +1447,8 @@ impl App {
             saved_scope: self.scope,
             general_global: self.general.global,
             general_workspace: self.general.workspace,
+            claude_global: self.general.claude_global,
+            claude_workspace: self.general.claude_workspace,
             proxy_allow_global: self.proxy.global,
             proxy_allow_workspace: self.proxy.workspace,
             filesystem_global: self.filesystem.global,
@@ -1641,6 +1727,39 @@ fn handle_default_agent_select_key(app: &mut App, code: KeyCode) {
     app.mode = Mode::DefaultAgentSelect { cursor };
 }
 
+fn handle_bypass_warning_select_key(app: &mut App, code: KeyCode) {
+    let Mode::BypassWarningSelect { mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
+        return;
+    };
+
+    match code {
+        KeyCode::Esc => return,
+        KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
+            cursor = cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Right | KeyCode::Tab | KeyCode::Char('j')
+            if cursor + 1 < BYPASS_WARNING_CHOICES.len() =>
+        {
+            cursor += 1;
+        }
+        KeyCode::Home => {
+            cursor = 0;
+        }
+        KeyCode::End => {
+            cursor = BYPASS_WARNING_CHOICES.len().saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            let value = BYPASS_WARNING_CHOICES.get(cursor).copied().unwrap_or(None);
+            app.general.set_skip_bypass_warning(app.scope, value);
+            return;
+        }
+        _ => {}
+    }
+
+    app.mode = Mode::BypassWarningSelect { cursor };
+}
+
 fn start_item_edit(app: &mut App, target: ItemActionTarget) {
     match target {
         ItemActionTarget::Proxy(row) => {
@@ -1767,6 +1886,10 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             handle_default_agent_select_key(&mut app, key.code);
             continue;
         }
+        if matches!(app.mode, Mode::BypassWarningSelect { .. }) {
+            handle_bypass_warning_select_key(&mut app, key.code);
+            continue;
+        }
         if matches!(app.mode, Mode::ItemAction { .. }) {
             handle_item_action_key(&mut app, key.code);
             continue;
@@ -1852,6 +1975,13 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                     Some(GeneralRow::DefaultAgent) => {
                         app.mode = Mode::DefaultAgentSelect {
                             cursor: default_agent_index(app.general.configured_agent(scope)),
+                        };
+                    }
+                    Some(GeneralRow::BypassWarning) => {
+                        app.mode = Mode::BypassWarningSelect {
+                            cursor: bypass_warning_index(
+                                app.general.configured_skip_bypass_warning(scope),
+                            ),
                         };
                     }
                     None => {}
@@ -1985,6 +2115,10 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         render_default_agent_select_modal(f, area, cursor);
     }
 
+    if let Mode::BypassWarningSelect { cursor } = app.mode {
+        render_bypass_warning_select_modal(f, area, cursor);
+    }
+
     if let Mode::ItemAction { ref target, cursor } = app.mode {
         render_item_action_modal(f, area, target, cursor);
     }
@@ -2065,6 +2199,34 @@ fn render_general(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     Span::styled("Change Default Agent", Style::default().fg(Color::White)),
                     Span::raw("  "),
                     Span::styled(agent.label(), value_style.add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        if inherited { "  inherited" } else { "" },
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            }
+            GeneralRow::BypassWarning => {
+                let skip = app.general.effective_skip_bypass_warning(app.scope);
+                let origin = app.general.bypass_warning_origin(app.scope);
+                let inherited = app.scope == Scope::Workspace && origin == ProxyOrigin::Global;
+                let value_style = if inherited {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                let label = if skip {
+                    "Skip warning"
+                } else {
+                    "Confirm warning"
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        "Bypass Permissions Warning",
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(label, value_style.add_modifier(Modifier::BOLD)),
                     Span::styled(
                         if inherited { "  inherited" } else { "" },
                         Style::default().fg(Color::DarkGray),
@@ -2623,6 +2785,54 @@ fn render_default_agent_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, c
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+fn render_bypass_warning_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, cursor: usize) {
+    let w = parent.width.clamp(44, 62);
+    let h: u16 = 9;
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    let y = parent.y + (parent.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Bypass permissions warning ")
+        .style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![Line::from(Span::styled(
+        "Choose whether Claude Code asks before bypass mode.",
+        Style::default().fg(Color::DarkGray),
+    ))];
+    for (idx, choice) in BYPASS_WARNING_CHOICES.iter().copied().enumerate() {
+        let selected = idx == cursor;
+        let marker = if selected { ">" } else { " " };
+        let label = match choice {
+            None => "(unset)",
+            Some(false) => "Confirm warning",
+            Some(true) => "Skip warning",
+        };
+        let style = if selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::raw(" "),
+            Span::styled(label, style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ j/k move · Enter select · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn item_action_title(target: &ItemActionTarget) -> &'static str {
     match target {
         ItemActionTarget::Proxy(_) => " Proxy allow pattern ",
@@ -3055,6 +3265,8 @@ mod tests {
                 default_agent: Some(DefaultAgent::Claude),
             },
             general_workspace: GeneralPolicy::default(),
+            claude_global: ClaudePolicy::default(),
+            claude_workspace: ClaudePolicy::default(),
             proxy_allow_global: vec!["g".into()],
             proxy_allow_workspace: vec!["w".into()],
             filesystem_global: FilesystemPolicy {
@@ -3106,6 +3318,8 @@ mod tests {
                 default_agent: Some(DefaultAgent::Codex),
             },
             GeneralPolicy::default(),
+            ClaudePolicy::default(),
+            ClaudePolicy::default(),
         );
         assert_eq!(
             general.effective_agent(Scope::Workspace),
@@ -3122,22 +3336,24 @@ mod tests {
     }
 
     #[test]
-    fn general_default_agent_row_is_the_only_general_action() {
+    fn general_rows_include_default_agent_and_bypass_warning() {
         let mut general = GeneralState::new(
             GeneralPolicy {
                 default_agent: Some(DefaultAgent::Codex),
             },
             GeneralPolicy::default(),
+            ClaudePolicy::default(),
+            ClaudePolicy::default(),
         );
         assert_eq!(
             general.visible_rows(Scope::Workspace),
-            vec![GeneralRow::DefaultAgent]
+            vec![GeneralRow::DefaultAgent, GeneralRow::BypassWarning]
         );
 
         general.set_agent(Scope::Workspace, Some(DefaultAgent::Claude));
         assert_eq!(
             general.visible_rows(Scope::Workspace),
-            vec![GeneralRow::DefaultAgent]
+            vec![GeneralRow::DefaultAgent, GeneralRow::BypassWarning]
         );
     }
 
@@ -3170,6 +3386,44 @@ mod tests {
 
         assert_eq!(app.general.workspace.default_agent, None);
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn bypass_warning_select_modal_commits_explicit_choice() {
+        let mut app = App::new(fresh_input());
+        app.mode = Mode::BypassWarningSelect {
+            cursor: bypass_warning_index(Some(true)),
+        };
+
+        handle_bypass_warning_select_key(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.general.claude_workspace.skip_bypass_permissions_warning,
+            Some(true)
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn bypass_warning_defaults_to_confirm_until_overridden() {
+        let mut app = App::new(fresh_input());
+        assert!(!app.general.effective_skip_bypass_warning(Scope::Workspace));
+
+        app.general
+            .set_skip_bypass_warning(Scope::Global, Some(true));
+        assert!(app.general.effective_skip_bypass_warning(Scope::Workspace));
+        assert_eq!(
+            app.general.bypass_warning_origin(Scope::Workspace),
+            ProxyOrigin::Global
+        );
+
+        app.general
+            .set_skip_bypass_warning(Scope::Workspace, Some(false));
+        assert!(!app.general.effective_skip_bypass_warning(Scope::Workspace));
+        assert_eq!(
+            app.general.bypass_warning_origin(Scope::Workspace),
+            ProxyOrigin::Workspace
+        );
     }
 
     #[test]

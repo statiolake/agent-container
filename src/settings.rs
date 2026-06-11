@@ -33,6 +33,7 @@
 //!
 //! [claude]
 //! tmux_prefix = "C-b"
+//! skip_bypass_permissions_warning = false
 //! ```
 
 use std::collections::BTreeMap;
@@ -251,19 +252,25 @@ impl CodexPolicy {
 pub struct ClaudePolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_bypass_permissions_warning: Option<bool>,
 }
 
 impl ClaudePolicy {
     pub const DEFAULT_TMUX_PREFIX: &'static str = "C-b";
 
     pub fn is_empty(&self) -> bool {
-        self.tmux_prefix.is_none()
+        self.tmux_prefix.is_none() && self.skip_bypass_permissions_warning.is_none()
     }
 
     pub fn tmux_prefix(&self) -> &str {
         self.tmux_prefix
             .as_deref()
             .unwrap_or(Self::DEFAULT_TMUX_PREFIX)
+    }
+
+    pub fn skip_bypass_permissions_warning(&self) -> bool {
+        self.skip_bypass_permissions_warning.unwrap_or(false)
     }
 }
 
@@ -419,6 +426,10 @@ impl Settings {
         append_unique(&mut self.filesystem.readonly, overlay.filesystem.readonly);
         if overlay.claude.tmux_prefix.is_some() {
             self.claude.tmux_prefix = overlay.claude.tmux_prefix;
+        }
+        if overlay.claude.skip_bypass_permissions_warning.is_some() {
+            self.claude.skip_bypass_permissions_warning =
+                overlay.claude.skip_bypass_permissions_warning;
         }
     }
 
@@ -681,17 +692,21 @@ mounts = ["/tmp/notes"]
     #[test]
     fn claude_tmux_prefix_defaults_and_roundtrips() {
         assert_eq!(ClaudePolicy::default().tmux_prefix(), "C-b");
+        assert!(!ClaudePolicy::default().skip_bypass_permissions_warning());
 
         let raw = r#"
           [claude]
           tmux_prefix = "C-q"
+          skip_bypass_permissions_warning = true
         "#;
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.claude.tmux_prefix(), "C-q");
+        assert!(settings.claude.skip_bypass_permissions_warning());
 
         let serialized = toml::to_string_pretty(&settings).unwrap();
         assert!(serialized.contains("[claude]"));
         assert!(serialized.contains("tmux_prefix = \"C-q\""));
+        assert!(serialized.contains("skip_bypass_permissions_warning = true"));
     }
 
     #[test]
@@ -704,6 +719,18 @@ mounts = ["/tmp/notes"]
 
         base.merge_in_place(overlay);
         assert_eq!(base.claude.tmux_prefix(), "C-q");
+    }
+
+    #[test]
+    fn workspace_claude_bypass_warning_overrides_global() {
+        let mut base = Settings::default();
+        base.claude.skip_bypass_permissions_warning = Some(true);
+
+        let mut overlay = Settings::default();
+        overlay.claude.skip_bypass_permissions_warning = Some(false);
+
+        base.merge_in_place(overlay);
+        assert!(!base.claude.skip_bypass_permissions_warning());
     }
 
     #[test]

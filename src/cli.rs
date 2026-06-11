@@ -227,6 +227,7 @@ Supported TOML shape:
 
   [claude]
   tmux_prefix = "C-b"
+  skip_bypass_permissions_warning = false
 
 `proxy.allow` entries are tinyproxy extended regex patterns. Claude Code and
 Codex have separate MCP policy sections; legacy top-level `[mcp]` is still
@@ -254,7 +255,10 @@ Claude Code and Codex run directly by default. Pass `agent-container run
 --tmux` to wrap the agent in tmux so agent teams can attach panes. tmux mouse
 support is enabled automatically in that mode. `claude.tmux_prefix` controls
 tmux's prefix key for agent sessions; omit it to keep tmux's default `C-b`, or
-set it to a tmux key name such as `C-q`."#;
+set it to a tmux key name such as `C-q`. Set
+`claude.skip_bypass_permissions_warning = true` to pre-acknowledge Claude
+Code's bypass-permissions warning inside the staged container settings; the
+default is false so Claude Code asks for confirmation."#;
 
 const CONFIG_EXAMPLES: &str = r#"Examples:
   agent-container config

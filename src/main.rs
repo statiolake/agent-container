@@ -70,6 +70,7 @@ struct AgentConfigSync<'a> {
     codex_task_runner_enabled: bool,
     claude_host_fs_enabled: bool,
     codex_host_fs_enabled: bool,
+    skip_bypass_permissions_warning: bool,
 }
 
 struct AgentServices {
@@ -494,6 +495,7 @@ fn sync_agent_configs(input: AgentConfigSync<'_>) -> Result<()> {
             mcp_servers: input.claude_mcp_servers,
             task_runner_enabled: input.claude_task_runner_enabled,
             host_fs_enabled: input.claude_host_fs_enabled,
+            skip_bypass_permissions_warning: input.skip_bypass_permissions_warning,
         },
     )
     .context("failed to sync host Claude Code state into container")?;
@@ -662,6 +664,7 @@ async fn run_cmd(
         codex_task_runner_enabled: services.codex_task_runner_enabled,
         claude_host_fs_enabled: services.claude_host_fs_enabled,
         codex_host_fs_enabled: services.codex_host_fs_enabled,
+        skip_bypass_permissions_warning: merged_settings.claude.skip_bypass_permissions_warning(),
     })?;
 
     let credentials_path = claude_creds
@@ -847,6 +850,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         codex_task_runner_enabled: services.codex_task_runner_enabled,
         claude_host_fs_enabled: services.claude_host_fs_enabled,
         codex_host_fs_enabled: services.codex_host_fs_enabled,
+        skip_bypass_permissions_warning: merged_settings.claude.skip_bypass_permissions_warning(),
     })?;
 
     let credentials_path = claude_creds

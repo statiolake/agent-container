@@ -69,6 +69,10 @@ pub struct SyncOptions<'a> {
     pub task_runner_enabled: bool,
     /// When true, inject the broker's built-in host filesystem MCP.
     pub host_fs_enabled: bool,
+    /// When true, pre-acknowledge Claude Code's bypass-permissions warning in
+    /// the staged container settings. Defaults false so Claude Code can show
+    /// its normal confirmation dialog.
+    pub skip_bypass_permissions_warning: bool,
 }
 
 impl SyncOptions<'_> {
@@ -291,6 +295,13 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
             "sandbox".to_string(),
             serde_json::json!({ "enabled": false }),
         );
+        if opts.skip_bypass_permissions_warning {
+            // Acknowledge Claude Code's one-time warning in the staged
+            // container settings only, so the host profile is not modified.
+            obj.insert("bypassPermissionsModeAccepted".into(), Value::Bool(true));
+        } else {
+            obj.remove("bypassPermissionsModeAccepted");
+        }
         // Mirror the awsCredentialExport injection we do for .claude.json
         // — Claude Code looks in settings.json first for user-level
         // configuration, which is where the operator most naturally puts
@@ -586,6 +597,7 @@ mod tests {
                 mcp_servers: &[],
                 task_runner_enabled: false,
                 host_fs_enabled: false,
+                skip_bypass_permissions_warning: false,
             },
         )
         .unwrap();
@@ -649,6 +661,7 @@ mod tests {
                 mcp_servers: &[],
                 task_runner_enabled: false,
                 host_fs_enabled: false,
+                skip_bypass_permissions_warning: false,
             },
         )
         .unwrap();
@@ -715,6 +728,7 @@ mod tests {
                 mcp_servers: &servers,
                 task_runner_enabled: false,
                 host_fs_enabled: false,
+                skip_bypass_permissions_warning: false,
             },
         )
         .unwrap();
@@ -764,6 +778,7 @@ mod tests {
                 mcp_servers: &[],
                 task_runner_enabled: true,
                 host_fs_enabled: false,
+                skip_bypass_permissions_warning: false,
             },
         )
         .unwrap();
@@ -804,6 +819,7 @@ mod tests {
                 mcp_servers: &[],
                 task_runner_enabled: false,
                 host_fs_enabled: true,
+                skip_bypass_permissions_warning: false,
             },
         )
         .unwrap();
@@ -855,6 +871,7 @@ mod tests {
                 mcp_servers: &[],
                 task_runner_enabled: false,
                 host_fs_enabled: false,
+                skip_bypass_permissions_warning: false,
             },
         )
         .unwrap();
@@ -880,7 +897,51 @@ mod tests {
             serde_json::json!({ "enabled": false }),
             "sandbox should be forced off inside the container",
         );
+        assert!(
+            out.get("bypassPermissionsModeAccepted").is_none(),
+            "bypass-permissions warning should be confirmed by default",
+        );
         assert!(out.get("awsAuthRefresh").is_none());
+    }
+
+    #[test]
+    fn settings_json_can_skip_bypass_permissions_warning() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = tmp_home.path().join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let claude_root = tmp_home.path().join(".claude");
+        fs::create_dir_all(&claude_root).unwrap();
+        fs::write(claude_root.join("settings.json"), r#"{"theme": "dark"}"#).unwrap();
+
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root,
+            workspace,
+            staged_home: container_home.path().to_path_buf(),
+        };
+        sync_settings_json(
+            &host,
+            &SyncOptions {
+                bedrock: None,
+                broker_url_from_container: "http://unused",
+                mcp_servers: &[],
+                task_runner_enabled: false,
+                host_fs_enabled: false,
+                skip_bypass_permissions_warning: true,
+            },
+        )
+        .unwrap();
+
+        let out: Value = serde_json::from_str(
+            &fs::read_to_string(container_home.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            out["bypassPermissionsModeAccepted"],
+            serde_json::json!(true),
+            "enabled setting should acknowledge the container-only warning",
+        );
     }
 
     #[test]
@@ -907,6 +968,7 @@ mod tests {
                 mcp_servers: &[],
                 task_runner_enabled: false,
                 host_fs_enabled: false,
+                skip_bypass_permissions_warning: false,
             },
         )
         .unwrap();
