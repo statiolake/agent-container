@@ -87,7 +87,7 @@ pub struct RunOptions {
     /// `host_kind::HostKind`; everything downstream just reads it.
     pub broker_url_from_container: String,
     /// The command to invoke inside the container, e.g.
-    /// `["claude", "--dangerously-skip-permissions"]` or `["codex"]`.
+    /// `["claude", "--permission-mode", "bypassPermissions"]` or `["codex"]`.
     pub agent_command: Vec<String>,
     pub extra_args: Vec<String>,
     /// User-defined `proxy.allow` patterns, already merged across global

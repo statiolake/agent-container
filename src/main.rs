@@ -709,7 +709,8 @@ fn agent_command(agent: AgentKind, tmux: bool, tmux_prefix: &str) -> Result<Vec<
     match (agent, tmux) {
         (AgentKind::Claude, false) => Ok(vec![
             "claude".to_string(),
-            "--dangerously-skip-permissions".to_string(),
+            "--permission-mode".to_string(),
+            "bypassPermissions".to_string(),
         ]),
         (AgentKind::Codex, false) => Ok(vec!["codex".to_string()]),
         (AgentKind::Claude, true) => claude_tmux_agent_command(tmux_prefix),
@@ -728,7 +729,7 @@ fn claude_tmux_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
             "set-option -g mouse on \\;",
             &format!("set-option -g prefix {tmux_prefix} \\;"),
             &format!("bind-key {tmux_prefix} send-prefix \\;"),
-            "new-session -A -s claude-code -- claude --dangerously-skip-permissions \"$@\"",
+            "new-session -A -s claude-code -- claude --permission-mode bypassPermissions \"$@\"",
         ]
         .join(" "),
         "agent-container-claude".to_string(),
@@ -990,7 +991,10 @@ mod tests {
     fn claude_runs_directly_by_default() {
         let command = agent_command(AgentKind::Claude, false, "C-q;touch").unwrap();
 
-        assert_eq!(command, ["claude", "--dangerously-skip-permissions"]);
+        assert_eq!(
+            command,
+            ["claude", "--permission-mode", "bypassPermissions"]
+        );
     }
 
     #[test]

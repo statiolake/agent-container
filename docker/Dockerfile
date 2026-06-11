@@ -44,4 +44,4 @@ ENV LC_ALL=C.UTF-8
 WORKDIR /home/agent
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["claude", "--dangerously-skip-permissions"]
+CMD ["claude", "--permission-mode", "bypassPermissions"]

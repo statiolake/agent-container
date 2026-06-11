@@ -36,7 +36,7 @@ use crate::paths::HostPaths;
 /// - `mcpServers` + friends: handled separately by the container's proxy path.
 /// - `env`: exports can reference host tool paths that don't exist here.
 /// - `hooks`: shell commands that typically shell out to host binaries.
-/// - `permissions`: we run with `--dangerously-skip-permissions` anyway.
+/// - `permissions`: we run Claude Code in bypass-permissions mode anyway.
 /// - `sandbox`: Claude Code's in-process sandbox is redundant (and noisy)
 ///   inside the container. The top-level settings.json gets an explicit
 ///   `{"enabled": false}` re-injected after the strip — Claude Code

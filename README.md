@@ -4,7 +4,7 @@ Run Claude Code and Codex inside a sandboxed Docker container, with full
 network isolation, a host-side proxy allowlist, and a spec-conformant
 MCP bridge. The host agents' auth, config, and custom slash commands
 carry over so the containerised session feels the same as running them
-natively — except an escaped `--dangerously-skip-permissions` or a
+natively — except an escaped bypass-permissions session or a
 prompt-injected shell command cannot reach anything outside the
 workspace.
 
@@ -22,7 +22,7 @@ shrinks the blast radius to "whatever is in the current workspace":
 - **No direct internet**. The container runs on a `--internal` Docker
   network and reaches the outside world only through a forward proxy
   whose hostname allowlist is under your control.
-- **`--dangerously-skip-permissions` is safe** — it just gives the
+- **Claude Code's bypass-permissions mode is safe** — it just gives the
   agent full rein inside the container, not on your machine.
 
 ## Architecture
