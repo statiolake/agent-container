@@ -296,11 +296,16 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
             serde_json::json!({ "enabled": false }),
         );
         if opts.skip_bypass_permissions_warning {
-            // Acknowledge Claude Code's one-time warning in the staged
-            // container settings only, so the host profile is not modified.
-            obj.insert("bypassPermissionsModeAccepted".into(), Value::Bool(true));
+            // Skip Claude Code's bypass-permissions warning in the staged
+            // user settings only, so the host profile is not modified. This
+            // is intentionally written to ~/.claude/settings.json inside the
+            // container; Claude Code ignores this key in project settings.
+            obj.insert(
+                "skipDangerousModePermissionPrompt".into(),
+                Value::Bool(true),
+            );
         } else {
-            obj.remove("bypassPermissionsModeAccepted");
+            obj.remove("skipDangerousModePermissionPrompt");
         }
         // Mirror the awsCredentialExport injection we do for .claude.json
         // — Claude Code looks in settings.json first for user-level
@@ -898,7 +903,7 @@ mod tests {
             "sandbox should be forced off inside the container",
         );
         assert!(
-            out.get("bypassPermissionsModeAccepted").is_none(),
+            out.get("skipDangerousModePermissionPrompt").is_none(),
             "bypass-permissions warning should be confirmed by default",
         );
         assert!(out.get("awsAuthRefresh").is_none());
@@ -938,7 +943,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            out["bypassPermissionsModeAccepted"],
+            out["skipDangerousModePermissionPrompt"],
             serde_json::json!(true),
             "enabled setting should acknowledge the container-only warning",
         );
