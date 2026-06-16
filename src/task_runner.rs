@@ -20,8 +20,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::process::Command;
 
@@ -31,6 +33,8 @@ use tokio::process::Command;
 pub const NAME: &str = "task-runner";
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+const TIMEOUT_ARGUMENT: &str = "timeout_seconds";
+const MAX_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskRunner {
@@ -164,11 +168,17 @@ impl TaskRunner {
                 json!({
                     "name": name,
                     "description": format!(
-                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. `$CONFIG_ROOT` points at the host-side agent-container settings directory that defined this task."
+                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. `$CONFIG_ROOT` points at the host-side agent-container settings directory that defined this task. Set `{TIMEOUT_ARGUMENT}` to a positive number of seconds when this host task needs an explicit timeout; omit it to run without a task-runner timeout."
                     ),
                     "inputSchema": {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            TIMEOUT_ARGUMENT: {
+                                "type": "number",
+                                "exclusiveMinimum": 0,
+                                "description": "Optional task-runner timeout in seconds. This reserved argument is not passed to the host command as an environment variable."
+                            }
+                        },
                         "additionalProperties": {
                             "oneOf": [
                                 { "type": "string" },
@@ -223,7 +233,7 @@ impl TaskRunner {
                     }),
                 )
             }
-            Err(e) => tool_error(id, format!("task '{name}' failed to spawn: {e:#}")),
+            Err(e) => tool_error(id, format!("task '{name}' failed: {e:#}")),
         }
     }
 }
@@ -231,6 +241,7 @@ impl TaskRunner {
 #[derive(Debug, Default)]
 struct CmdInvocation {
     env: BTreeMap<String, String>,
+    timeout: Option<Duration>,
 }
 
 struct CmdOutput {
@@ -250,6 +261,11 @@ fn parse_invocation(arguments: Option<&Value>) -> std::result::Result<CmdInvocat
     };
 
     for (key, value) in arguments {
+        if key == TIMEOUT_ARGUMENT {
+            invocation.timeout = Some(parse_timeout(value)?);
+            continue;
+        }
+
         if !is_valid_env_key(key) {
             return Err(format!(
                 "argument key `{key}` is not a valid environment variable name"
@@ -272,6 +288,35 @@ fn parse_invocation(arguments: Option<&Value>) -> std::result::Result<CmdInvocat
     Ok(invocation)
 }
 
+fn parse_timeout(value: &Value) -> std::result::Result<Duration, String> {
+    let seconds = match value {
+        Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| format!("argument `{TIMEOUT_ARGUMENT}` must be a finite number"))?,
+        Value::String(s) => s.trim().parse::<f64>().map_err(|_| {
+            format!("argument `{TIMEOUT_ARGUMENT}` must be a positive number of seconds")
+        })?,
+        _ => {
+            return Err(format!(
+                "argument `{TIMEOUT_ARGUMENT}` must be a positive number of seconds"
+            ));
+        }
+    };
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(format!(
+            "argument `{TIMEOUT_ARGUMENT}` must be a positive number of seconds"
+        ));
+    }
+    if seconds > MAX_TIMEOUT.as_secs_f64() {
+        return Err(format!(
+            "argument `{TIMEOUT_ARGUMENT}` must be no more than {} seconds",
+            MAX_TIMEOUT.as_secs()
+        ));
+    }
+    let duration = Duration::from_secs_f64(seconds);
+    Ok(duration)
+}
+
 fn is_valid_env_key(key: &str) -> bool {
     let mut chars = key.chars();
     matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
@@ -285,7 +330,20 @@ async fn run_command(task: &TaskSpec, invocation: &CmdInvocation) -> Result<CmdO
     cmd.arg("-c").arg(&task.command);
     cmd.envs(&invocation.env);
     cmd.env("CONFIG_ROOT", &task.config_root);
-    let out = cmd.output().await.context("failed to spawn command")?;
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    let child = cmd.spawn().context("failed to spawn command")?;
+    let out = match invocation.timeout {
+        Some(duration) => match tokio::time::timeout(duration, child.wait_with_output()).await {
+            Ok(result) => result.context("failed to wait for command")?,
+            Err(_) => bail!("command timed out after {} seconds", duration.as_secs_f64()),
+        },
+        None => child
+            .wait_with_output()
+            .await
+            .context("failed to wait for command")?,
+    };
     Ok(CmdOutput {
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -430,6 +488,8 @@ mod tests {
         let r = build();
         let req = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
         let resp = r.handle(req).await.unwrap();
+        let first = &resp["result"]["tools"].as_array().unwrap()[0];
+        assert!(first["inputSchema"]["properties"][TIMEOUT_ARGUMENT].is_object());
         let names: Vec<_> = resp["result"]["tools"]
             .as_array()
             .unwrap()
@@ -480,16 +540,45 @@ mod tests {
         tasks.insert(
             "expand".into(),
             task(
-                "printf '%s/%s/%s\\n' \"$value\" \"$count\" \"$enabled\"",
+                "printf '%s/%s/%s/%s\\n' \"$value\" \"$count\" \"$enabled\" \"${timeout_seconds:-unset}\"",
                 "/tmp/agent-container-test",
             ),
         );
         let r = TaskRunner::new(tasks);
-        let req = br#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"expand","arguments":{"value":"hello world","count":42,"enabled":true}}}"#;
+        let req = br#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"expand","arguments":{"value":"hello world","count":42,"enabled":true,"timeout_seconds":3}}}"#;
         let resp = r.handle(req).await.unwrap();
         assert_eq!(resp["result"]["isError"], false);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("hello world/42/true"));
+        assert!(text.contains("hello world/42/true/unset"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_times_out_when_requested() {
+        let mut tasks = BTreeMap::new();
+        tasks.insert(
+            "slow".into(),
+            task("sleep 5; printf late", "/tmp/agent-container-test"),
+        );
+        let r = TaskRunner::new(tasks);
+        let req = br#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"slow","arguments":{"timeout_seconds":0.01}}}"#;
+        let resp = r.handle(req).await.unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn invalid_timeout_is_rejected() {
+        let r = build();
+        let req = br#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"echo","arguments":{"timeout_seconds":0}}}"#;
+        let resp = r.handle(req).await.unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("positive number")
+        );
     }
 
     #[tokio::test]

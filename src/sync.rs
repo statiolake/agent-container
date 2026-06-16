@@ -503,7 +503,7 @@ fn copy_children_without_overwrite(src: &Path, dest: &Path) -> Result<()> {
             );
             continue;
         }
-        copy_entry(&entry.path(), &target, entry.file_type()?)?;
+        copy_entry(&entry.path(), &target)?;
     }
     Ok(())
 }
@@ -518,24 +518,48 @@ fn clear_path(path: &Path) -> Result<()> {
 }
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
+    let mut stack = Vec::new();
+    copy_dir_recursive_inner(src, dest, &mut stack)
+}
+
+fn copy_dir_recursive_inner(
+    src: &Path,
+    dest: &Path,
+    stack: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    let canonical = src
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", src.display()))?;
+    if stack.contains(&canonical) {
+        anyhow::bail!("refusing to copy symlink cycle at {}", src.display());
+    }
+    stack.push(canonical);
+
     fs::create_dir_all(dest)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
-        let file_type = entry.file_type()?;
         let path = entry.path();
         let target = dest.join(entry.file_name());
-        copy_entry(&path, &target, file_type)?;
+        copy_entry_inner(&path, &target, stack)?;
     }
+    stack.pop();
     Ok(())
 }
 
-fn copy_entry(src: &Path, dest: &Path, file_type: fs::FileType) -> Result<()> {
+fn copy_entry(src: &Path, dest: &Path) -> Result<()> {
+    let mut stack = Vec::new();
+    copy_entry_inner(src, dest, &mut stack)
+}
+
+fn copy_entry_inner(src: &Path, dest: &Path, stack: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    // `metadata` follows symlinks. Staged Claude extensions must be portable
+    // inside the container, so a host symlink is copied as the target's actual
+    // file or directory rather than recreated as a link to a host-only path.
+    let metadata =
+        fs::metadata(src).with_context(|| format!("failed to stat {}", src.display()))?;
+    let file_type = metadata.file_type();
     if file_type.is_dir() {
-        copy_dir_recursive(src, dest)?;
-    } else if file_type.is_symlink() {
-        let link_target = fs::read_link(src)?;
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(link_target, dest)?;
+        copy_dir_recursive_inner(src, dest, stack)?;
     } else {
         fs::copy(src, dest)?;
     }
@@ -1136,6 +1160,63 @@ mod tests {
             fs::read_to_string(container_home.path().join(".claude/skills/shared/SKILL.md"))
                 .unwrap(),
             "user"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_extension_symlinks_are_copied_as_real_files() {
+        let tmp_home = tempfile::tempdir().unwrap();
+        let container_home = tempfile::tempdir().unwrap();
+        let workspace = tmp_home.path().join("work");
+        fs::create_dir_all(&workspace).unwrap();
+        let claude_root = tmp_home.path().join(".claude");
+        fs::create_dir_all(claude_root.join("skills")).unwrap();
+
+        let external = tmp_home.path().join("external-skills");
+        fs::create_dir_all(external.join("linked-skill")).unwrap();
+        fs::write(external.join("linked-skill/SKILL.md"), "linked skill").unwrap();
+        fs::write(external.join("linked-command.md"), "linked command").unwrap();
+
+        std::os::unix::fs::symlink(
+            external.join("linked-skill"),
+            claude_root.join("skills/linked-skill"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            external.join("linked-command.md"),
+            claude_root.join("skills/linked-command.md"),
+        )
+        .unwrap();
+
+        let host = HostPaths {
+            home: tmp_home.path().to_path_buf(),
+            claude_root,
+            workspace,
+            staged_home: container_home.path().to_path_buf(),
+        };
+        sync_claude_extensions(&host).unwrap();
+
+        let out_root = container_home.path().join(".claude/skills");
+        assert_eq!(
+            fs::read_to_string(out_root.join("linked-skill/SKILL.md")).unwrap(),
+            "linked skill"
+        );
+        assert_eq!(
+            fs::read_to_string(out_root.join("linked-command.md")).unwrap(),
+            "linked command"
+        );
+        assert!(
+            !fs::symlink_metadata(out_root.join("linked-skill"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !fs::symlink_metadata(out_root.join("linked-command.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 
