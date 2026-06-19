@@ -255,11 +255,10 @@ host history/auth paths into the container's ephemeral `$HOME`:
 - `~/.claude/settings.json` — same stripping.
 - `~/.claude/commands/`, `~/.claude/agents/`, `~/.claude/skills/` —
   user-authored slash commands, subagents and skills are mirrored.
-- `~/.claude/plugins/` — copied as a local plugin tree, with marketplace
-  `installLocation` paths rewritten to `/home/agent`. Git metadata is
-  excluded, but plugin-local `commands/`, `skills/`, agents, hooks, and
-  scripts keep their plugin namespace instead of being flattened into the
-  top-level directories.
+- Plugin-provided `commands/` and `skills/` are flattened into those same
+  top-level directories. The plugin marketplace/cache tree itself is not
+  copied, so Claude Code does not try to refresh marketplaces from inside
+  the container.
 - `~/.codex/config.toml` — only model/persona scalar settings are inherited,
   while `[mcp_servers.*]` entries are rewritten to the agent-container broker.
   The container pins `approval_policy = "never"` and

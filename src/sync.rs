@@ -12,9 +12,10 @@
 //! - `~/.claude/settings.json` — user-level settings, copied as-is.
 //! - `~/.claude/skills/`, `~/.claude/commands/`, `~/.claude/agents/` — user-
 //!   authored extensions (custom skills, slash commands, subagents).
-//! - `~/.claude/plugins/` — copied as a local plugin tree, with marketplace
-//!   install paths rewritten to the container home so Claude Code can use the
-//!   already-cached plugins without fetching marketplaces from the network.
+//! - Plugin-provided `skills/` and `commands/` are flattened into the same
+//!   top-level extension directories. The plugin marketplace/cache tree
+//!   itself is not copied, because Claude Code treats that tree as managed
+//!   marketplace state and may try to refresh it over the network.
 //!
 //! Not copied: user-level hooks, the raw MCP configuration, other projects,
 //! or anything under `~/.claude/` not listed above.
@@ -53,8 +54,6 @@ const COMMON_STRIP: &[&str] = &[
     "permissions",
     "sandbox",
 ];
-
-const CONTAINER_HOME: &str = "/home/agent";
 
 pub struct SyncOptions<'a> {
     pub bedrock: Option<&'a crate::aws::BedrockSetup>,
@@ -410,18 +409,27 @@ fn sync_claude_md(host: &HostPaths) -> Result<()> {
 }
 
 fn sync_claude_extensions(host: &HostPaths) -> Result<()> {
-    // User-authored extensions keep their native top-level shape.
+    // User-authored extensions keep their native top-level shape. Plugin
+    // marketplaces are a different ownership model: Claude Code manages
+    // them as remote state, so the container receives only their portable
+    // skills/commands payloads merged into the top-level extension dirs.
     for name in ["skills", "commands"] {
         let src = host.claude_root.join(name);
         let dest = host.staged_home.join(".claude").join(name);
         mirror_or_clear(&src, &dest)?;
+        merge_plugin_extension_dirs(host, name)
+            .with_context(|| format!("failed to merge plugin {name}"))?;
     }
 
     let src = host.claude_root.join("agents");
     let dest = host.staged_home.join(".claude").join("agents");
     mirror_or_clear(&src, &dest)?;
 
-    sync_claude_plugins(host).context("failed to sync Claude plugins")
+    // Never stage the plugin marketplace/cache tree; only flattened portable
+    // commands and skills belong in the container.
+    let plugin_dest = host.staged_home.join(".claude").join("plugins");
+    clear_path(&plugin_dest)?;
+    Ok(())
 }
 
 /// Mirror `src` → `dest`, wiping any pre-existing container copy first.
@@ -437,45 +445,61 @@ fn mirror_or_clear(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sync_claude_plugins(host: &HostPaths) -> Result<()> {
-    let src = host.claude_root.join("plugins");
-    let dest = host.staged_home.join(".claude").join("plugins");
-    clear_path(&dest)?;
-    if !src.is_dir() {
-        fs::create_dir_all(&dest)
-            .with_context(|| format!("failed to create empty {}", dest.display()))?;
-        return Ok(());
-    }
+fn merge_plugin_extension_dirs(host: &HostPaths, name: &str) -> Result<()> {
+    let plugin_root = host.claude_root.join("plugins");
+    let mut extension_dirs = Vec::new();
+    collect_extension_dirs(&plugin_root, name, &mut extension_dirs)?;
+    extension_dirs.sort();
 
-    copy_dir_recursive_excluding_names(&src, &dest, &[".git"])
-        .with_context(|| format!("failed to copy {} to {}", src.display(), dest.display()))?;
-    rewrite_known_marketplace_locations(&dest)
+    let dest = host.staged_home.join(".claude").join(name);
+    for src in extension_dirs {
+        copy_children_without_overwrite(&src, &dest)?;
+    }
+    Ok(())
 }
 
-fn rewrite_known_marketplace_locations(plugin_dest: &Path) -> Result<()> {
-    let path = plugin_dest.join("known_marketplaces.json");
-    if !path.is_file() {
+fn collect_extension_dirs(
+    root: &Path,
+    name: &str,
+    out: &mut Vec<std::path::PathBuf>,
+) -> Result<()> {
+    if !root.is_dir() {
         return Ok(());
     }
-    let raw =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut value: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {} as JSON", path.display()))?;
-    let Some(markets) = value.as_object_mut() else {
-        return Ok(());
-    };
-    for (name, entry) in markets {
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert(
-                "installLocation".to_string(),
-                Value::String(format!(
-                    "{CONTAINER_HOME}/.claude/plugins/marketplaces/{name}"
-                )),
-            );
+
+    let mut entries = fs::read_dir(root)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() {
+            continue;
         }
+        let path = entry.path();
+        if entry.file_name() == name {
+            out.push(path);
+            continue;
+        }
+        collect_extension_dirs(&path, name, out)?;
     }
-    let pretty = serde_json::to_string_pretty(&value)?;
-    fs::write(&path, pretty).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn copy_children_without_overwrite(src: &Path, dest: &Path) -> Result<()> {
+    let mut entries = fs::read_dir(src)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    if entries.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(dest)?;
+
+    for entry in entries {
+        let target = dest.join(entry.file_name());
+        if target.exists() {
+            continue;
+        }
+        copy_entry(&entry.path(), &target)?;
+    }
     Ok(())
 }
 
@@ -490,6 +514,11 @@ fn clear_path(path: &Path) -> Result<()> {
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     copy_dir_recursive_excluding_names(src, dest, &[])
+}
+
+fn copy_entry(src: &Path, dest: &Path) -> Result<()> {
+    let mut stack = Vec::new();
+    copy_entry_inner(src, dest, &[], &mut stack)
 }
 
 fn copy_dir_recursive_excluding_names(
@@ -1058,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_extensions_preserve_plugin_tree_without_flattening() {
+    fn claude_extensions_flatten_plugin_skills_and_commands() {
         let tmp_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
         let workspace = tmp_home.path().join("work");
@@ -1108,34 +1137,22 @@ mod tests {
             fs::read_to_string(out_root.join("agents/helper.md")).unwrap(),
             "agent"
         );
-        assert!(
-            !out_root.join("skills/plugin-skill").exists(),
-            "plugin skills must stay inside the plugin tree"
-        );
-        assert!(
-            !out_root.join("commands/plugin.md").exists(),
-            "plugin commands must stay inside the plugin tree"
-        );
         assert_eq!(
-            fs::read_to_string(
-                out_root.join("plugins/cache/vendor/plugin-a/skills/plugin-skill/SKILL.md")
-            )
-            .unwrap(),
+            fs::read_to_string(out_root.join("skills/plugin-skill/SKILL.md")).unwrap(),
             "plugin skill"
         );
         assert_eq!(
-            fs::read_to_string(out_root.join("plugins/cache/vendor/plugin-a/commands/plugin.md"))
-                .unwrap(),
+            fs::read_to_string(out_root.join("commands/plugin.md")).unwrap(),
             "plugin command"
         );
         assert!(
-            !out_root.join("plugins/cache/vendor/plugin-a/.git").exists(),
-            "git metadata should not be copied into the staged plugin tree"
+            !out_root.join("plugins").exists(),
+            "plugin marketplace/cache tree should not be staged"
         );
     }
 
     #[test]
-    fn user_and_plugin_extensions_keep_separate_namespaces() {
+    fn user_extensions_win_when_plugin_flattening_collides() {
         let tmp_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
         let workspace = tmp_home.path().join("work");
@@ -1161,35 +1178,24 @@ mod tests {
                 .unwrap(),
             "user"
         );
-        assert_eq!(
-            fs::read_to_string(
-                container_home
-                    .path()
-                    .join(".claude/plugins/cache/vendor/plugin-a/skills/shared/SKILL.md")
-            )
-            .unwrap(),
-            "plugin"
+        assert!(
+            !container_home.path().join(".claude/plugins").exists(),
+            "plugin tree is intentionally not staged"
         );
     }
 
     #[test]
-    fn plugin_marketplace_install_locations_are_rewritten_for_container() {
+    fn marketplace_plugin_skills_are_flattened_without_marketplace_state() {
         let tmp_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
         let workspace = tmp_home.path().join("work");
         fs::create_dir_all(&workspace).unwrap();
         let claude_root = tmp_home.path().join(".claude");
         let plugins = claude_root.join("plugins");
-        fs::create_dir_all(plugins.join("marketplaces/example/plugins/demo")).unwrap();
+        fs::create_dir_all(plugins.join("marketplaces/example/plugins/demo/skills/demo")).unwrap();
         fs::write(
-            plugins.join("known_marketplaces.json"),
-            serde_json::json!({
-                "example": {
-                    "source": { "source": "github", "repo": "owner/repo" },
-                    "installLocation": plugins.join("marketplaces/example")
-                }
-            })
-            .to_string(),
+            plugins.join("marketplaces/example/plugins/demo/skills/demo/SKILL.md"),
+            "demo skill",
         )
         .unwrap();
 
@@ -1201,18 +1207,13 @@ mod tests {
         };
         sync_claude_extensions(&host).unwrap();
 
-        let out: Value = serde_json::from_str(
-            &fs::read_to_string(
-                container_home
-                    .path()
-                    .join(".claude/plugins/known_marketplaces.json"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
         assert_eq!(
-            out["example"]["installLocation"].as_str(),
-            Some("/home/agent/.claude/plugins/marketplaces/example")
+            fs::read_to_string(container_home.path().join(".claude/skills/demo/SKILL.md")).unwrap(),
+            "demo skill"
+        );
+        assert!(
+            !container_home.path().join(".claude/plugins").exists(),
+            "marketplace state must not be copied into the container"
         );
     }
 
