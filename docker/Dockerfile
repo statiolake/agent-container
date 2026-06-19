@@ -9,6 +9,7 @@ RUN apt-get update \
         git \
         jq \
         less \
+        ncurses-term \
         procps \
         python-is-python3 \
         python3 \

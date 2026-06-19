@@ -727,11 +727,17 @@ fn claude_tmux_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
         "sh".to_string(),
         "-lc".to_string(),
         [
-            "exec tmux",
+            "exec tmux -f /dev/null",
             "start-server \\;",
+            "set-option -s escape-time 0 \\;",
+            "set-option -g default-terminal tmux-256color \\;",
+            "set-option -g focus-events on \\;",
             "set-option -g mouse on \\;",
             &format!("set-option -g prefix {tmux_prefix} \\;"),
             &format!("bind-key {tmux_prefix} send-prefix \\;"),
+            "bind-key -T root WheelUpPane send-keys -M \\;",
+            "bind-key -T root WheelDownPane send-keys -M \\;",
+            "bind-key -T root MouseDrag1Pane send-keys -M \\;",
             "new-session -A -s claude-code -- claude --permission-mode bypassPermissions \"$@\"",
         ]
         .join(" "),
@@ -745,11 +751,17 @@ fn codex_tmux_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
         "sh".to_string(),
         "-lc".to_string(),
         [
-            "exec tmux",
+            "exec tmux -f /dev/null",
             "start-server \\;",
+            "set-option -s escape-time 0 \\;",
+            "set-option -g default-terminal tmux-256color \\;",
+            "set-option -g focus-events on \\;",
             "set-option -g mouse on \\;",
             &format!("set-option -g prefix {tmux_prefix} \\;"),
             &format!("bind-key {tmux_prefix} send-prefix \\;"),
+            "bind-key -T root WheelUpPane send-keys -M \\;",
+            "bind-key -T root WheelDownPane send-keys -M \\;",
+            "bind-key -T root MouseDrag1Pane send-keys -M \\;",
             "new-session -A -s codex -- codex \"$@\"",
         ]
         .join(" "),
@@ -1013,9 +1025,16 @@ mod tests {
         let command = agent_command(AgentKind::Claude, true, "C-q").unwrap();
         let script = &command[2];
 
+        assert!(script.contains("exec tmux -f /dev/null"));
         assert!(script.contains("set-option -g mouse on"));
+        assert!(script.contains("set-option -s escape-time 0"));
+        assert!(script.contains("set-option -g default-terminal tmux-256color"));
+        assert!(script.contains("set-option -g focus-events on"));
         assert!(script.contains("set-option -g prefix C-q"));
         assert!(script.contains("bind-key C-q send-prefix"));
+        assert!(script.contains("bind-key -T root WheelUpPane send-keys -M"));
+        assert!(script.contains("bind-key -T root WheelDownPane send-keys -M"));
+        assert!(script.contains("bind-key -T root MouseDrag1Pane send-keys -M"));
         assert!(script.contains("new-session -A -s claude-code"));
     }
 
@@ -1024,9 +1043,16 @@ mod tests {
         let command = agent_command(AgentKind::Codex, true, "C-q").unwrap();
         let script = &command[2];
 
+        assert!(script.contains("exec tmux -f /dev/null"));
         assert!(script.contains("set-option -g mouse on"));
+        assert!(script.contains("set-option -s escape-time 0"));
+        assert!(script.contains("set-option -g default-terminal tmux-256color"));
+        assert!(script.contains("set-option -g focus-events on"));
         assert!(script.contains("set-option -g prefix C-q"));
         assert!(script.contains("bind-key C-q send-prefix"));
+        assert!(script.contains("bind-key -T root WheelUpPane send-keys -M"));
+        assert!(script.contains("bind-key -T root WheelDownPane send-keys -M"));
+        assert!(script.contains("bind-key -T root MouseDrag1Pane send-keys -M"));
         assert!(script.contains("new-session -A -s codex"));
     }
 

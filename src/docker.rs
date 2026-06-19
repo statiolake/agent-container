@@ -15,6 +15,7 @@ use crate::paths::HostPaths;
 
 const AGENT_IMAGE_TAG: &str = "agent-container:dev";
 const PROXY_IMAGE_TAG: &str = "agent-container-proxy:dev";
+const DOCKER_ATTACH_DETACH_KEYS: &str = "ctrl-],ctrl-]";
 
 /// Build required images. The agent image can be force-built on demand;
 /// the proxy image is still only built when missing.
@@ -305,11 +306,10 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         .context("failed to copy staged home into agent container")?;
 
     let mut cmd = Command::new("docker");
-    cmd.args(["start", "-a"]);
-    if is_stdin_tty() {
-        cmd.arg("-i");
-    }
-    cmd.arg(&agent_container_id);
+    cmd.args(docker_start_attach_args(
+        &agent_container_id,
+        is_stdin_tty(),
+    ));
     let child = cmd.spawn().context("failed to spawn docker start")?;
     let status = wait_compose_child_or_interrupt(child, ctx.clone(), "docker start").await;
     proxy_reload.abort();
@@ -823,6 +823,20 @@ fn is_stdin_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
+fn docker_start_attach_args(container_id: &str, stdin_tty: bool) -> Vec<String> {
+    let mut args = vec![
+        "start".to_string(),
+        "-a".to_string(),
+        "--detach-keys".to_string(),
+        DOCKER_ATTACH_DETACH_KEYS.to_string(),
+    ];
+    if stdin_tty {
+        args.push("-i".to_string());
+    }
+    args.push(container_id.to_string());
+    args
+}
+
 pub fn default_dockerfile_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("AGENT_CONTAINER_DOCKERFILE_DIR") {
         return PathBuf::from(dir);
@@ -926,5 +940,29 @@ mod tests {
             dockerfile.contains("python3-openpyxl"),
             "agent image should include openpyxl for XLSX work"
         );
+    }
+
+    #[test]
+    fn agent_image_includes_extended_terminfo() {
+        let dockerfile = include_str!("../docker/Dockerfile");
+        assert!(
+            dockerfile.contains("ncurses-term"),
+            "agent image should include terminfo for tmux and modern terminals"
+        );
+    }
+
+    #[test]
+    fn docker_attach_uses_non_default_detach_keys() {
+        let args = docker_start_attach_args("container-id", true);
+        assert_eq!(args[0], "start");
+        assert!(args.contains(&"-a".to_string()));
+        assert!(args.contains(&"-i".to_string()));
+        assert_eq!(
+            args.windows(2)
+                .find(|pair| pair[0] == "--detach-keys")
+                .map(|pair| pair[1].as_str()),
+            Some(DOCKER_ATTACH_DETACH_KEYS)
+        );
+        assert_ne!(DOCKER_ATTACH_DETACH_KEYS, "ctrl-p,ctrl-q");
     }
 }
