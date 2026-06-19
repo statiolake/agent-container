@@ -192,10 +192,11 @@ Runtime behavior uses the merged view: global settings first, then workspace
 settings on top. Without `--global`, writes target the workspace file. Use
 `--global` for defaults that should apply to every repository.
 
-The workspace `.agent-container` directory is mounted read-only inside the
-agent container, so an in-container agent cannot silently rewrite its own
-workspace-local policy while running. If you ask an agent to prepare settings,
-have it write them on the host side before starting a new `run` session.
+The workspace `.agent-container` directory is read-only inside the agent
+container and through HostWrite, so an in-container agent cannot silently
+rewrite its own workspace-local policy while running. If you ask an agent to
+prepare settings, have it write them on the host side before starting a new
+`run` session.
 
 Supported TOML shape:
 
@@ -249,9 +250,10 @@ regular expressions matched against paths relative to each mounted root:
 hidden paths are shadowed so the agent cannot see them, while readonly paths
 are visible but overlaid as read-only. Global defaults hide common secret file
 names such as `.env`, `.env.*`, private key files, `.npmrc`, `.pypirc`, and
-`.netrc`, and make `.claude` / `.codex` readonly. Existing matched files are
-shadow-mounted at container startup. The host-fs MCP reloads the policy on
-every tool call, so saved settings take effect there without restarting.
+`.netrc`, and make `.agent-container` / `.claude` / `.codex` readonly.
+Existing matched files are shadow-mounted at container startup. The host-fs
+MCP reloads the policy on every tool call, so saved settings take effect
+there without restarting.
 
 Claude Code and Codex run directly by default. Pass `agent-container run
 --tmux` to wrap the agent in tmux so agent teams can attach panes. tmux mouse

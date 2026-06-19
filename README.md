@@ -122,10 +122,12 @@ The agent image also includes Python 3 as `python` for lightweight local
 scripting inside the container.
 
 The workspace mount is writable, but `<workspace>/.agent-container` is
-overlaid as read-only at the same path inside the container. If the
-directory does not exist on the host, an empty read-only directory is
-mounted there so an in-container agent cannot create workspace-local
-agent-container settings for itself.
+read-only by default. It is overlaid as read-only at the same path inside
+the container and is also covered by the built-in host filesystem readonly
+rule, so HostWrite cannot rewrite workspace-local agent-container settings
+or scripts. If the directory does not exist on the host, an empty read-only
+directory is mounted there so an in-container agent cannot create
+workspace-local agent-container settings for itself.
 
 Claude Code and Codex run directly by default. Pass `agent-container run
 --tmux` to wrap the agent in tmux so agent teams can attach panes. tmux mouse

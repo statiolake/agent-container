@@ -450,7 +450,7 @@ impl FilesystemMatcher {
     pub fn new(workspace: &Path, policy: &crate::settings::FilesystemPolicy) -> Result<Self> {
         let roots = mounted_roots(workspace, policy)?;
         let hide = compile_regexes(&policy.hide)?;
-        let readonly = compile_regexes(&policy.readonly)?;
+        let readonly = compile_regexes(&crate::settings::effective_filesystem_readonly(policy))?;
         Ok(Self {
             roots,
             hide,
@@ -524,9 +524,10 @@ fn mounted_roots(
     workspace: &Path,
     policy: &crate::settings::FilesystemPolicy,
 ) -> Result<Vec<MountedRoot>> {
+    let workspace = std::fs::canonicalize(workspace)
+        .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?;
     let mut roots = vec![MountedRoot {
-        path: std::fs::canonicalize(workspace)
-            .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?,
+        path: workspace.clone(),
         readonly: false,
     }];
     for mount in &policy.mounts {
@@ -537,13 +538,18 @@ fn mounted_roots(
         let path = std::fs::canonicalize(&path)
             .with_context(|| format!("failed to resolve filesystem mount {}", path.display()))?;
         if !roots.iter().any(|root| root.path == path) {
-            roots.push(MountedRoot {
-                path,
-                readonly: mount.readonly,
-            });
+            let readonly = mount.readonly || is_builtin_readonly_workspace_path(&workspace, &path);
+            roots.push(MountedRoot { path, readonly });
         }
     }
     Ok(roots)
+}
+
+fn is_builtin_readonly_workspace_path(workspace: &Path, path: &Path) -> bool {
+    crate::settings::BUILTIN_READONLY_WORKSPACE_DIRS
+        .iter()
+        .map(|name| workspace.join(name))
+        .any(|protected| path.starts_with(protected))
 }
 
 pub fn classify_path(
@@ -687,6 +693,7 @@ mod tests {
     fn filesystem_policy_classifies_workspace_paths() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("work");
+        std::fs::create_dir_all(workspace.join(".agent-container")).unwrap();
         std::fs::create_dir_all(workspace.join(".claude")).unwrap();
         std::fs::write(workspace.join(".env"), "secret").unwrap();
         std::fs::write(workspace.join("README.md"), "ok").unwrap();
@@ -701,6 +708,10 @@ mod tests {
             FilesystemAccess::Hidden
         );
         assert_eq!(
+            classify_path(&workspace, &policy, &workspace.join(".agent-container")).unwrap(),
+            FilesystemAccess::Readonly
+        );
+        assert_eq!(
             classify_path(&workspace, &policy, &workspace.join(".claude")).unwrap(),
             FilesystemAccess::Readonly
         );
@@ -711,6 +722,48 @@ mod tests {
         assert_eq!(
             classify_path(&workspace, &policy, dir.path()).unwrap(),
             FilesystemAccess::Hidden
+        );
+    }
+
+    #[test]
+    fn builtin_workspace_state_dirs_are_readonly_even_without_policy_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        std::fs::create_dir_all(workspace.join(".agent-container")).unwrap();
+        std::fs::create_dir_all(workspace.join(".claude")).unwrap();
+        std::fs::create_dir_all(workspace.join(".codex")).unwrap();
+        let policy = crate::settings::FilesystemPolicy::default();
+
+        for name in crate::settings::BUILTIN_READONLY_WORKSPACE_DIRS {
+            assert_eq!(
+                classify_path(&workspace, &policy, &workspace.join(name)).unwrap(),
+                FilesystemAccess::Readonly,
+                "{name} should be protected by the built-in readonly policy"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_workspace_state_dirs_stay_readonly_when_mounted_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("work");
+        let config_root = workspace.join(".agent-container");
+        let scripts = config_root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let policy = crate::settings::FilesystemPolicy {
+            mounts: vec![crate::settings::FilesystemMount::new(
+                config_root.display().to_string(),
+                false,
+            )],
+            hide: Vec::new(),
+            readonly: Vec::new(),
+        };
+        let matcher = FilesystemMatcher::new(&workspace, &policy).unwrap();
+
+        assert!(matcher.root_readonly(&std::fs::canonicalize(&config_root).unwrap()));
+        assert_eq!(
+            classify_path(&workspace, &policy, &scripts).unwrap(),
+            FilesystemAccess::Readonly
         );
     }
 

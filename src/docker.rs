@@ -847,6 +847,7 @@ mod tests {
         let workspace = dir.path().join("work");
         std::fs::create_dir_all(workspace.join("private")).unwrap();
         std::fs::create_dir_all(workspace.join("blocked-dir")).unwrap();
+        std::fs::create_dir_all(workspace.join(".agent-container")).unwrap();
         std::fs::create_dir_all(workspace.join(".claude")).unwrap();
         std::fs::write(workspace.join(".env"), "secret").unwrap();
         std::fs::write(workspace.join("private/token.txt"), "secret").unwrap();
@@ -860,7 +861,10 @@ mod tests {
                 r"^private(/|$)".to_string(),
                 r"^blocked-dir$".to_string(),
             ],
-            readonly: vec![r"(^|/)\.claude(/|$)".to_string()],
+            readonly: vec![
+                r"(^|/)\.agent-container(/|$)".to_string(),
+                r"(^|/)\.claude(/|$)".to_string(),
+            ],
         };
         let mounts =
             prepare_secret_shadow_mounts(&workspace, Path::new("/workspace"), 42, &policy).unwrap();
@@ -871,6 +875,7 @@ mod tests {
         assert!(targets.contains(&"/workspace/.env".to_string()));
         assert!(targets.contains(&"/workspace/private".to_string()));
         assert!(targets.contains(&"/workspace/blocked-dir".to_string()));
+        assert!(targets.contains(&"/workspace/.agent-container".to_string()));
         assert!(targets.contains(&"/workspace/.claude".to_string()));
         assert!(!targets.contains(&"/workspace/README.md".to_string()));
         let file_mount = mounts
@@ -890,6 +895,14 @@ mod tests {
         assert_eq!(
             readonly_mount.source,
             std::fs::canonicalize(workspace.join(".claude")).unwrap()
+        );
+        let agent_container_mount = mounts
+            .iter()
+            .find(|mount| mount.target == Path::new("/workspace/.agent-container"))
+            .unwrap();
+        assert_eq!(
+            agent_container_mount.source,
+            std::fs::canonicalize(workspace.join(".agent-container")).unwrap()
         );
     }
 

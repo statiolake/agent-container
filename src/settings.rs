@@ -213,11 +213,23 @@ pub fn default_filesystem_hide() -> Vec<String> {
     .collect()
 }
 
-pub fn default_filesystem_readonly() -> Vec<String> {
-    [r"(^|/)\.claude(/|$)", r"(^|/)\.codex(/|$)"]
-        .into_iter()
-        .map(str::to_string)
+pub const BUILTIN_READONLY_WORKSPACE_DIRS: &[&str] = &[".agent-container", ".claude", ".codex"];
+
+pub fn builtin_filesystem_readonly() -> Vec<String> {
+    BUILTIN_READONLY_WORKSPACE_DIRS
+        .iter()
+        .map(|name| format!(r"(^|/){}(/|$)", regex::escape(name)))
         .collect()
+}
+
+pub fn default_filesystem_readonly() -> Vec<String> {
+    builtin_filesystem_readonly()
+}
+
+pub fn effective_filesystem_readonly(policy: &FilesystemPolicy) -> Vec<String> {
+    let mut readonly = policy.readonly.clone();
+    append_unique(&mut readonly, builtin_filesystem_readonly());
+    readonly
 }
 
 /// Claude Code MCP policy. Legacy top-level `[mcp]` is still accepted on
@@ -494,6 +506,26 @@ mod tests {
             "bundled defaults should seed proxy.allow"
         );
         assert!(g.proxy.allow.iter().any(|p| p.contains("anthropic")));
+    }
+
+    #[test]
+    fn builtin_workspace_state_dirs_are_default_and_effective_readonly() {
+        let builtin = builtin_filesystem_readonly();
+        assert_eq!(default_filesystem_readonly(), builtin);
+
+        let policy = FilesystemPolicy {
+            mounts: Vec::new(),
+            hide: Vec::new(),
+            readonly: Vec::new(),
+        };
+        assert_eq!(effective_filesystem_readonly(&policy), builtin);
+        for name in BUILTIN_READONLY_WORKSPACE_DIRS {
+            let escaped = regex::escape(name);
+            assert!(
+                builtin.iter().any(|pattern| pattern.contains(&escaped)),
+                "{name} should be represented in the built-in readonly regexes"
+            );
+        }
     }
 
     #[test]
