@@ -12,6 +12,7 @@ RUN apt-get update \
         procps \
         python-is-python3 \
         python3 \
+        python3-openpyxl \
         ripgrep \
         tini \
         tmux \

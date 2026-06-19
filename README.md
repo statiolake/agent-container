@@ -118,8 +118,8 @@ directories. Codex history/resume files under `~/.codex/sessions`,
 `~/.codex/archived_sessions`, `~/.codex/shell_snapshots`,
 `~/.codex/session_index.jsonl`, and `~/.codex/history.jsonl` are mounted from
 the host, so sessions created in the container are visible to host Codex too.
-The agent image also includes Python 3 as `python` for lightweight local
-scripting inside the container.
+The agent image also includes Python 3 as `python`, plus `openpyxl` for
+basic XLSX inspection and generation inside the container.
 
 The workspace mount is writable, but `<workspace>/.agent-container` is
 read-only by default. It is overlaid as read-only at the same path inside

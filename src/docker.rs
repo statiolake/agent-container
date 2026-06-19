@@ -918,4 +918,13 @@ mod tests {
             vec!["-f", "base.yml", "-f", "shadow.yml"]
         );
     }
+
+    #[test]
+    fn agent_image_includes_openpyxl() {
+        let dockerfile = include_str!("../docker/Dockerfile");
+        assert!(
+            dockerfile.contains("python3-openpyxl"),
+            "agent image should include openpyxl for XLSX work"
+        );
+    }
 }
