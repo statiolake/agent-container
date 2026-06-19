@@ -18,6 +18,7 @@
 //! - ←/→ or `h`/`l` (or Tab/Shift+Tab) switch tabs.
 //! - ↑/↓ or `j`/`k` move within the current tab.
 //! - `Enter` activates the highlighted row.
+//! - `a` adds an item in the highlighted row's context.
 //! - `t` toggles the scope target between Global and Workspace (the save
 //!   destination). Each scope keeps its own in-memory proxy allow list so
 //!   switching back and forth preserves edits.
@@ -48,6 +49,30 @@ use crate::policy::McpPolicy;
 use crate::settings::{
     ClaudePolicy, DefaultAgent, FilesystemMount, FilesystemPolicy, GeneralPolicy, Scope,
 };
+
+fn plain() -> Style {
+    Style::default()
+}
+
+fn muted() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn heading() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
+fn selected() -> Style {
+    Style::default().bg(Color::DarkGray).fg(Color::White)
+}
+
+fn selected_bold() -> Style {
+    selected().add_modifier(Modifier::BOLD)
+}
+
+fn danger() -> Style {
+    Style::default().fg(Color::Red)
+}
 
 /// Single-line text buffer with readline-style editing primitives.
 ///
@@ -1694,6 +1719,51 @@ fn start_task_add(app: &mut App) {
     };
 }
 
+fn start_proxy_add(app: &mut App) {
+    app.mode = Mode::ProxyInput {
+        target: PatternTarget::Proxy,
+        buffer: TextField::default(),
+        editing: None,
+    };
+}
+
+fn start_filesystem_add(app: &mut App, field: FilesystemField) {
+    app.mode = Mode::FilesystemInput {
+        field,
+        buffer: TextField::default(),
+        mount_readonly: field == FilesystemField::Mount,
+        error: None,
+        editing: None,
+    };
+}
+
+fn filesystem_add_field_for_current(app: &App) -> FilesystemField {
+    match app.filesystem.current_row(app.scope) {
+        Some(FilesystemViewRow::Section(FilesystemSection::Path)) => FilesystemField::Mount,
+        Some(FilesystemViewRow::Section(FilesystemSection::Filter)) => FilesystemField::Hide,
+        Some(FilesystemViewRow::Entry(row)) => row.field,
+        Some(FilesystemViewRow::Add(field)) => field,
+        None => FilesystemField::Mount,
+    }
+}
+
+fn start_add_for_current_context(app: &mut App) {
+    match app.tab {
+        TopTab::General => {}
+        TopTab::Proxy => start_proxy_add(app),
+        TopTab::HostFs => {
+            let field = filesystem_add_field_for_current(app);
+            start_filesystem_add(app, field);
+        }
+        TopTab::McpClaude | TopTab::McpCodex => match app.active_mcp().current_row(app.scope) {
+            Some(McpRow::TaskRunnerHeader | McpRow::TaskRow(_) | McpRow::TaskAddHint) => {
+                start_task_add(app);
+            }
+            Some(McpRow::Server(_) | McpRow::Tool(_)) | None => {}
+        },
+    }
+}
+
 fn handle_default_agent_select_key(app: &mut App, code: KeyCode) {
     let Mode::DefaultAgentSelect { mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal)
     else {
@@ -1946,6 +2016,9 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             KeyCode::Left | KeyCode::Char('h') => app.tab = app.tab.prev(),
             KeyCode::Right | KeyCode::Char('l') => app.tab = app.tab.next(),
             KeyCode::Char('t') => app.toggle_scope(),
+            KeyCode::Char('a') if key.modifiers.is_empty() => {
+                start_add_for_current_context(&mut app);
+            }
             KeyCode::Up | KeyCode::Char('k') => match app.tab {
                 TopTab::General => app.general.move_up(),
                 TopTab::Proxy => app.proxy.move_up(),
@@ -2000,11 +2073,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                             };
                         }
                         Some(ProxyViewRow::Add) => {
-                            app.mode = Mode::ProxyInput {
-                                target: PatternTarget::Proxy,
-                                buffer: TextField::default(),
-                                editing: None,
-                            };
+                            start_proxy_add(&mut app);
                         }
                         Some(ProxyViewRow::Entry(_)) => {}
                         None => {}
@@ -2020,13 +2089,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                         }
                     }
                     Some(FilesystemViewRow::Add(field)) => {
-                        app.mode = Mode::FilesystemInput {
-                            field,
-                            buffer: TextField::default(),
-                            mount_readonly: field == FilesystemField::Mount,
-                            error: None,
-                            editing: None,
-                        };
+                        start_filesystem_add(&mut app, field);
                     }
                     Some(FilesystemViewRow::Section(_)) | None => {}
                 },
@@ -2133,50 +2196,26 @@ fn render_title(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Scope::Global => "Global",
         Scope::Workspace => "Workspace",
     };
-    // Brand tag uses a deep blue so it doesn't collide with the active-tab
-    // highlight below (cyan was ambiguous with the old tab style).
     let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " agent-container ",
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("agent-container", heading()),
         Span::raw("  settings  "),
-        Span::styled(
-            format!("[{scope_label}]"),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "  (t to switch scope)",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("[{scope_label}]"), heading()),
+        Span::styled("  (t to switch scope)", muted()),
     ]));
     f.render_widget(title, area);
 }
 
 fn render_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    // Pad labels so the highlight background feels like a chip instead of a
-    // bare word, then drop the default "|" divider — the coloured background
-    // on the active tab is already enough of a separator.
     let titles: Vec<Line> = TopTab::titles()
         .iter()
-        .map(|s| Line::from(Span::raw(format!(" {s} "))))
+        .map(|s| Line::from(Span::raw(*s)))
         .collect();
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::BOTTOM))
         .select(app.tab.index())
-        .divider("")
-        .style(Style::default().fg(Color::DarkGray))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .divider("  ")
+        .style(muted())
+        .highlight_style(heading());
     f.render_widget(tabs, area);
 }
 
@@ -2189,31 +2228,20 @@ fn render_general(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 let agent = app.general.effective_agent(app.scope);
                 let origin = app.general.origin(app.scope);
                 let inherited = app.scope == Scope::Workspace && origin == ProxyOrigin::Global;
-                let value_style = if inherited {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().fg(Color::Cyan)
-                };
+                let value_style = if inherited { muted() } else { heading() };
                 ListItem::new(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled("Change Default Agent", Style::default().fg(Color::White)),
+                    Span::raw("Change Default Agent"),
                     Span::raw("  "),
                     Span::styled(agent.label(), value_style.add_modifier(Modifier::BOLD)),
-                    Span::styled(
-                        if inherited { "  inherited" } else { "" },
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(if inherited { "  inherited" } else { "" }, muted()),
                 ]))
             }
             GeneralRow::BypassWarning => {
                 let skip = app.general.effective_skip_bypass_warning(app.scope);
                 let origin = app.general.bypass_warning_origin(app.scope);
                 let inherited = app.scope == Scope::Workspace && origin == ProxyOrigin::Global;
-                let value_style = if inherited {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().fg(Color::Cyan)
-                };
+                let value_style = if inherited { muted() } else { heading() };
                 let label = if skip {
                     "Skip warning"
                 } else {
@@ -2221,28 +2249,18 @@ fn render_general(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(
-                        "Bypass Permissions Warning",
-                        Style::default().fg(Color::White),
-                    ),
+                    Span::raw("Bypass Permissions Warning"),
                     Span::raw("  "),
                     Span::styled(label, value_style.add_modifier(Modifier::BOLD)),
-                    Span::styled(
-                        if inherited { "  inherited" } else { "" },
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(if inherited { "  inherited" } else { "" }, muted()),
                 ]))
             }
         })
         .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::NONE))
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
+        .highlight_style(selected_bold())
+        .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
@@ -2272,39 +2290,25 @@ fn render_pattern_list(
                 let pattern_style = if is_inherited {
                     // Slightly dim the inherited rows so the scope they
                     // belong to is obvious without an extra marker.
-                    Style::default().fg(Color::DarkGray)
+                    muted()
                 } else {
-                    Style::default()
+                    plain()
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        if overlay { "* " } else { "  " }.to_string(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(if overlay { "* " } else { "  " }.to_string(), heading()),
                     Span::styled(row.pattern.clone(), pattern_style),
                 ]))
             }
             ProxyViewRow::Add => ListItem::new(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    "+ Add Allow Pattern...",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::ITALIC),
-                ),
+                Span::styled("+ Add Allow Pattern...", muted()),
             ])),
         })
         .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::NONE))
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
+        .highlight_style(selected_bold())
+        .highlight_symbol("> ");
     f.render_stateful_widget(list, area, list_state);
 }
 
@@ -2319,20 +2323,11 @@ fn render_filesystem(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     FilesystemSection::Path => "▾ Path",
                     FilesystemSection::Filter => "▾ Filter",
                 };
-                ListItem::new(Line::from(Span::styled(
-                    title,
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                )))
+                ListItem::new(Line::from(Span::styled(title, heading())))
             }
             FilesystemViewRow::Entry(row) => {
                 let is_inherited = row.origin != active;
-                let style = if is_inherited {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default()
-                };
+                let style = if is_inherited { muted() } else { plain() };
                 let overlay = app.scope == Scope::Workspace && row.origin == ProxyOrigin::Workspace;
                 let readonly = if row.field == FilesystemField::Mount {
                     if row.mount_readonly { "[x] " } else { "[ ] " }
@@ -2340,40 +2335,23 @@ fn render_filesystem(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     ""
                 };
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        if overlay { "* " } else { "  " }.to_string(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("{:<8}", row.field.label()),
-                        Style::default().fg(Color::Cyan),
-                    ),
+                    Span::styled(if overlay { "* " } else { "  " }.to_string(), heading()),
+                    Span::styled(format!("{:<8}", row.field.label()), muted()),
                     Span::raw(" "),
-                    Span::styled(readonly, Style::default().fg(Color::Cyan)),
+                    Span::styled(readonly, muted()),
                     Span::styled(row.value.clone(), style),
                 ]))
             }
             FilesystemViewRow::Add(field) => ListItem::new(Line::from(vec![
                 Span::raw("    "),
-                Span::styled(
-                    field.add_label(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::ITALIC),
-                ),
+                Span::styled(field.add_label(), muted()),
             ])),
         })
         .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::NONE))
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
+        .highlight_style(selected_bold())
+        .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
@@ -2392,20 +2370,12 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 };
                 let count = visible_tasks.len();
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{marker} task-runner"),
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format!("{marker} task-runner"), heading()),
                     Span::styled(
                         format!("  ({count} task{})", if count == 1 { "" } else { "s" }),
-                        Style::default().fg(Color::DarkGray),
+                        muted(),
                     ),
-                    Span::styled(
-                        "  host commands exposed as MCP tools",
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled("  host commands exposed as MCP tools", muted()),
                 ]))
             }
             McpRow::TaskRow(name) => {
@@ -2414,25 +2384,15 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     scope == Scope::Workspace && app.active_mcp().task_is_workspace_override(&name);
                 ListItem::new(Line::from(vec![
                     Span::raw("    "),
-                    Span::styled(
-                        if overlay { "* " } else { "  " }.to_string(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(name, Style::default().fg(Color::Cyan)),
+                    Span::styled(if overlay { "* " } else { "  " }.to_string(), heading()),
+                    Span::styled(name, heading()),
                     Span::raw(" = "),
-                    Span::styled(command, Style::default().fg(Color::White)),
+                    Span::raw(command),
                 ]))
             }
             McpRow::TaskAddHint => ListItem::new(Line::from(vec![
                 Span::raw("      "),
-                Span::styled(
-                    "+ Add Task...",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::ITALIC),
-                ),
+                Span::styled("+ Add Task...", muted()),
             ])),
             McpRow::Server(si) => {
                 let mcp = app.active_mcp();
@@ -2440,14 +2400,8 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 let (enabled, total) = mcp.enabled_count_for(scope, si);
                 let marker = if mcp.expanded[si] { "▾" } else { "▸" };
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{marker} {name}"),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  ({enabled}/{total} enabled)"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(format!("{marker} {name}"), heading()),
+                    Span::styled(format!("  ({enabled}/{total} enabled)"), muted()),
                 ]))
             }
             McpRow::Tool(ti) => render_tool_row(
@@ -2459,12 +2413,8 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::NONE))
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
+        .highlight_style(selected_bold())
+        .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
@@ -2483,8 +2433,8 @@ fn render_tool_row(entry: &ToolEntry, enabled: bool, mark_overlay: bool) -> List
         .to_string();
 
     let annotation: Option<Span<'static>> = match entry.read_only_hint {
-        Some(true) => Some(Span::styled(" [RO]", Style::default().fg(Color::Green))),
-        Some(false) => Some(Span::styled(" [W]", Style::default().fg(Color::Yellow))),
+        Some(true) => Some(Span::styled(" [RO]", muted())),
+        Some(false) => Some(Span::styled(" [W]", muted())),
         None => None,
     };
 
@@ -2493,9 +2443,7 @@ fn render_tool_row(entry: &ToolEntry, enabled: bool, mark_overlay: bool) -> List
         Span::raw(format!("{cb} ")),
         Span::styled(
             if mark_overlay { "* " } else { "  " }.to_string(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            heading(),
         ),
         Span::raw(entry.tool_name.clone()),
     ];
@@ -2504,29 +2452,26 @@ fn render_tool_row(entry: &ToolEntry, enabled: bool, mark_overlay: bool) -> List
     }
     if !desc.is_empty() {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(desc, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(desc, muted()));
     }
     ListItem::new(Line::from(spans))
 }
 
 fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let key = |s: &str, color: Color| {
-        Span::styled(
-            s.to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )
-    };
+    let key = |s: &str| Span::styled(s.to_string(), heading());
 
     let help = Line::from(vec![
-        key("←/→ h/l", Color::Cyan),
+        key("←/→ h/l"),
         Span::raw(" tabs · "),
-        key("↑/↓ j/k", Color::Cyan),
+        key("↑/↓ j/k"),
         Span::raw(" move · "),
-        key("Enter", Color::Cyan),
+        key("Enter"),
         Span::raw(" activate row · "),
-        key("t", Color::Yellow),
+        key("a"),
+        Span::raw(" add · "),
+        key("t"),
         Span::raw(" scope · "),
-        key("q", Color::Red),
+        key("q"),
         Span::raw(" finish"),
     ]);
 
@@ -2541,7 +2486,7 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     .map(DefaultAgent::label)
                     .unwrap_or("inherited"),
             ),
-            Style::default().fg(Color::DarkGray),
+            muted(),
         )]),
         TopTab::Proxy => Line::from(vec![Span::styled(
             format!(
@@ -2549,7 +2494,7 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 app.proxy.global.len(),
                 app.proxy.workspace.len(),
             ),
-            Style::default().fg(Color::DarkGray),
+            muted(),
         )]),
         TopTab::HostFs => Line::from(vec![Span::styled(
             format!(
@@ -2561,7 +2506,7 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 app.filesystem.workspace.hide.len(),
                 app.filesystem.workspace.readonly.len(),
             ),
-            Style::default().fg(Color::DarkGray),
+            muted(),
         )]),
         TopTab::McpClaude | TopTab::McpCodex => {
             let mcp = app.active_mcp();
@@ -2575,7 +2520,7 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     "{task_count} task(s) · {enabled}/{total} tool(s) enabled across {} server(s)",
                     mcp.server_names.len()
                 ),
-                Style::default().fg(Color::DarkGray),
+                muted(),
             )])
         }
     };
@@ -2606,13 +2551,14 @@ fn render_proxy_input_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(muted())
+        .title_style(heading());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let hint = Line::from(vec![Span::styled(
         "POSIX extended regex. Enter commit · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
-        Style::default().fg(Color::DarkGray),
+        muted(),
     )]);
     let body = Line::from(vec![Span::raw("> "), Span::raw(buffer.value())]);
     let para = Paragraph::new(vec![hint, Line::from(""), body]);
@@ -2650,7 +2596,8 @@ fn render_filesystem_input_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(muted())
+        .title_style(heading());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2665,25 +2612,19 @@ fn render_filesystem_input_modal(
             "Regex matched against paths relative to each mounted root; matching paths are mounted read-only."
         }
     };
-    let hint = Line::from(vec![Span::styled(
-        hint_text,
-        Style::default().fg(Color::DarkGray),
-    )]);
+    let hint = Line::from(vec![Span::styled(hint_text, muted())]);
     let body = Line::from(vec![Span::raw("> "), Span::raw(buffer.value())]);
     let mut lines = vec![hint, Line::from(""), body];
     if field == FilesystemField::Mount {
         let checkbox = if mount_readonly { "[x]" } else { "[ ]" };
         lines.push(Line::from(vec![
-            Span::styled(checkbox, Style::default().fg(Color::Cyan)),
+            Span::styled(checkbox, heading()),
             Span::raw(" Readonly"),
-            Span::styled("  Space toggle", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Space toggle", muted()),
         ]));
     }
     if let Some(error) = error {
-        lines.push(Line::from(Span::styled(
-            error.to_string(),
-            Style::default().fg(Color::Red),
-        )));
+        lines.push(Line::from(Span::styled(error.to_string(), danger())));
     }
     let para = Paragraph::new(lines);
     f.render_widget(para, inner);
@@ -2704,29 +2645,30 @@ fn render_confirm_quit_modal(f: &mut ratatui::Frame<'_>, parent: Rect, cursor: u
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Exit settings? ")
-        .style(Style::default().fg(Color::Yellow));
+        .border_style(muted())
+        .title_style(heading());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let mut lines = vec![
         Line::from(Span::styled(
             "Choose how to leave the settings editor.",
-            Style::default().fg(Color::White),
+            plain(),
         )),
         Line::from(""),
     ];
     for (idx, action) in QUIT_ACTION_CHOICES.iter().copied().enumerate() {
         let selected = idx == cursor;
         let marker = if selected { ">" } else { " " };
-        let (label, color) = match action {
-            QuitAction::SaveAndQuit => ("Save and Quit", Color::Green),
-            QuitAction::KeepEditing => ("Keep Editing", Color::Cyan),
-            QuitAction::DiscardAndQuit => ("Discard and Quit", Color::Red),
+        let (label, style) = match action {
+            QuitAction::SaveAndQuit => ("Save and Quit", plain()),
+            QuitAction::KeepEditing => ("Keep Editing", plain()),
+            QuitAction::DiscardAndQuit => ("Discard and Quit", danger()),
         };
         let style = if selected {
-            Style::default().fg(color).add_modifier(Modifier::BOLD)
+            style.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(color)
+            style
         };
         lines.push(Line::from(vec![
             Span::raw(marker),
@@ -2737,7 +2679,7 @@ fn render_confirm_quit_modal(f: &mut ratatui::Frame<'_>, parent: Rect, cursor: u
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "↑/↓ j/k move · Enter select · Esc cancel",
-        Style::default().fg(Color::DarkGray),
+        muted(),
     )));
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -2753,24 +2695,19 @@ fn render_default_agent_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, c
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Select default agent ")
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(muted())
+        .title_style(heading());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let mut lines = vec![Line::from(Span::styled(
         "Choose the agent for this scope.",
-        Style::default().fg(Color::DarkGray),
+        muted(),
     ))];
     for (idx, agent) in DEFAULT_AGENT_CHOICES.iter().copied().enumerate() {
         let selected = idx == cursor;
         let marker = if selected { ">" } else { " " };
-        let style = if selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
+        let style = if selected { heading() } else { plain() };
         lines.push(Line::from(vec![
             Span::raw(marker),
             Span::raw(" "),
@@ -2780,7 +2717,7 @@ fn render_default_agent_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, c
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "↑/↓ j/k move · Enter select · Esc cancel",
-        Style::default().fg(Color::DarkGray),
+        muted(),
     )));
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -2796,13 +2733,14 @@ fn render_bypass_warning_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Bypass permissions warning ")
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(muted())
+        .title_style(heading());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let mut lines = vec![Line::from(Span::styled(
         "Choose whether Claude Code asks before bypass mode.",
-        Style::default().fg(Color::DarkGray),
+        muted(),
     ))];
     for (idx, choice) in BYPASS_WARNING_CHOICES.iter().copied().enumerate() {
         let selected = idx == cursor;
@@ -2812,13 +2750,7 @@ fn render_bypass_warning_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, 
             Some(false) => "Confirm warning",
             Some(true) => "Skip warning",
         };
-        let style = if selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
+        let style = if selected { heading() } else { plain() };
         lines.push(Line::from(vec![
             Span::raw(marker),
             Span::raw(" "),
@@ -2828,7 +2760,7 @@ fn render_bypass_warning_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "↑/↓ j/k move · Enter select · Esc cancel",
-        Style::default().fg(Color::DarkGray),
+        muted(),
     )));
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -2869,28 +2801,26 @@ fn render_item_action_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(item_action_title(target))
-        .style(Style::default().fg(Color::Cyan));
+        .border_style(muted())
+        .title_style(heading());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let mut lines = vec![
-        Line::from(Span::styled(
-            item_action_value(target),
-            Style::default().fg(Color::White),
-        )),
+        Line::from(Span::styled(item_action_value(target), plain())),
         Line::from(""),
     ];
     for (idx, action) in ITEM_ACTION_CHOICES.iter().copied().enumerate() {
         let selected = idx == cursor;
         let marker = if selected { ">" } else { " " };
-        let (label, color) = match action {
-            ItemAction::Edit => ("Edit", Color::Cyan),
-            ItemAction::Remove => ("Remove", Color::Red),
+        let (label, style) = match action {
+            ItemAction::Edit => ("Edit", plain()),
+            ItemAction::Remove => ("Remove", danger()),
         };
         let style = if selected {
-            Style::default().fg(color).add_modifier(Modifier::BOLD)
+            style.add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(color)
+            style
         };
         lines.push(Line::from(vec![
             Span::raw(marker),
@@ -2901,7 +2831,7 @@ fn render_item_action_modal(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "↑/↓ j/k move · Enter select · Esc cancel",
-        Style::default().fg(Color::DarkGray),
+        muted(),
     )));
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -2925,24 +2855,18 @@ fn render_task_input_modal(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .style(Style::default().fg(Color::Magenta));
+        .border_style(muted())
+        .title_style(heading());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let focus_style = |f: TaskField, row: TaskField| {
-        if f == row {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        }
+        if f == row { selected_bold() } else { muted() }
     };
 
     let hint = Line::from(vec![Span::styled(
         "Tab/↑↓ switch · Enter commit · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
-        Style::default().fg(Color::DarkGray),
+        muted(),
     )]);
     let name_line = Line::from(vec![
         Span::styled(" name    ", focus_style(focus, TaskField::Name)),
@@ -3579,6 +3503,45 @@ mod tests {
             rows[7],
             FilesystemViewRow::Add(FilesystemField::Readonly)
         ));
+    }
+
+    #[test]
+    fn add_shortcut_opens_proxy_add_input() {
+        let mut app = App::new(fresh_input());
+        app.tab = TopTab::Proxy;
+
+        start_add_for_current_context(&mut app);
+
+        assert!(matches!(app.mode, Mode::ProxyInput { editing: None, .. }));
+    }
+
+    #[test]
+    fn add_shortcut_uses_current_filesystem_context() {
+        let mut app = App::new(fresh_input());
+        app.tab = TopTab::HostFs;
+        app.filesystem.cursor = 3; // Filter section.
+
+        start_add_for_current_context(&mut app);
+
+        assert!(matches!(
+            app.mode,
+            Mode::FilesystemInput {
+                field: FilesystemField::Hide,
+                editing: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn add_shortcut_opens_task_input_from_task_runner_rows() {
+        let mut app = App::new(fresh_input());
+        app.tab = TopTab::McpClaude;
+        app.mcp_claude.cursor = 0; // task-runner header.
+
+        start_add_for_current_context(&mut app);
+
+        assert!(matches!(app.mode, Mode::TaskInput { editing: None, .. }));
     }
 
     #[test]
