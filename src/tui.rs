@@ -19,6 +19,8 @@
 //! - ↑/↓ or `j`/`k` move within the current tab.
 //! - `Enter` activates the highlighted row.
 //! - `a` adds an item in the highlighted row's context.
+//! - `d` removes the highlighted row when it is owned by the active scope.
+//! - `s` saves the active scope and exits.
 //! - `t` toggles the scope target between Global and Workspace (the save
 //!   destination). Each scope keeps its own in-memory proxy allow list so
 //!   switching back and forth preserves edits.
@@ -456,6 +458,12 @@ const QUIT_ACTION_CHOICES: [QuitAction; 3] = [
     QuitAction::KeepEditing,
     QuitAction::DiscardAndQuit,
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShortcutHint {
+    key: &'static str,
+    label: &'static str,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TaskField {
@@ -1764,6 +1772,101 @@ fn start_add_for_current_context(app: &mut App) {
     }
 }
 
+fn can_add_for_current_context(app: &App) -> bool {
+    match app.tab {
+        TopTab::General => false,
+        TopTab::Proxy | TopTab::HostFs => true,
+        TopTab::McpClaude | TopTab::McpCodex => matches!(
+            app.active_mcp().current_row(app.scope),
+            Some(McpRow::TaskRunnerHeader | McpRow::TaskRow(_) | McpRow::TaskAddHint)
+        ),
+    }
+}
+
+fn removable_item_for_current_context(app: &App) -> Option<ItemActionTarget> {
+    let active = ProxyOrigin::from_scope(app.scope);
+    match app.tab {
+        TopTab::General => None,
+        TopTab::Proxy => match app.proxy.current_row(app.scope) {
+            Some(ProxyViewRow::Entry(row)) if row.origin == active => {
+                Some(ItemActionTarget::Proxy(row))
+            }
+            _ => None,
+        },
+        TopTab::HostFs => match app.filesystem.current_row(app.scope) {
+            Some(FilesystemViewRow::Entry(row)) if row.origin == active => {
+                Some(ItemActionTarget::Filesystem(row))
+            }
+            _ => None,
+        },
+        TopTab::McpClaude | TopTab::McpCodex => {
+            let mcp = app.active_mcp();
+            match mcp.current_row(app.scope) {
+                Some(McpRow::TaskRow(name)) => {
+                    let owned_by_scope = match app.scope {
+                        Scope::Global => mcp.tasks_global.contains_key(&name),
+                        Scope::Workspace => mcp.tasks_workspace.contains_key(&name),
+                    };
+                    owned_by_scope.then_some(ItemActionTarget::Task(name))
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+fn remove_current_context_item(app: &mut App) -> bool {
+    let Some(target) = removable_item_for_current_context(app) else {
+        return false;
+    };
+    remove_item(app, target);
+    true
+}
+
+fn shortcut_hints(app: &App) -> Vec<ShortcutHint> {
+    let mut hints = vec![
+        ShortcutHint {
+            key: "←/→ h/l",
+            label: "tabs",
+        },
+        ShortcutHint {
+            key: "↑/↓ j/k",
+            label: "move",
+        },
+        ShortcutHint {
+            key: "Enter",
+            label: "select",
+        },
+    ];
+    if can_add_for_current_context(app) {
+        hints.push(ShortcutHint {
+            key: "a",
+            label: "add",
+        });
+    }
+    if removable_item_for_current_context(app).is_some() {
+        hints.push(ShortcutHint {
+            key: "d",
+            label: "remove",
+        });
+    }
+    hints.extend([
+        ShortcutHint {
+            key: "s",
+            label: "save",
+        },
+        ShortcutHint {
+            key: "t",
+            label: "scope",
+        },
+        ShortcutHint {
+            key: "q",
+            label: "exit",
+        },
+    ]);
+    hints
+}
+
 fn handle_default_agent_select_key(app: &mut App, code: KeyCode) {
     let Mode::DefaultAgentSelect { mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal)
     else {
@@ -1871,7 +1974,7 @@ fn remove_item(app: &mut App, target: ItemActionTarget) {
     }
 }
 
-fn handle_item_action_key(app: &mut App, code: KeyCode) {
+fn handle_item_action_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     let Mode::ItemAction { target, mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal)
     else {
         return;
@@ -1879,6 +1982,10 @@ fn handle_item_action_key(app: &mut App, code: KeyCode) {
 
     match code {
         KeyCode::Esc => return,
+        KeyCode::Char('d') if modifiers.is_empty() => {
+            remove_item(app, target);
+            return;
+        }
         KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
             cursor = cursor.saturating_sub(1);
         }
@@ -1961,11 +2068,14 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             continue;
         }
         if matches!(app.mode, Mode::ItemAction { .. }) {
-            handle_item_action_key(&mut app, key.code);
+            handle_item_action_key(&mut app, key.code, key.modifiers);
             continue;
         }
         if let Mode::ConfirmQuit { mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal) {
             match key.code {
+                KeyCode::Char('s') if key.modifiers.is_empty() => {
+                    break Outcome::Save(Box::new(app.into_output()));
+                }
                 KeyCode::Esc | KeyCode::Char('q') => {}
                 KeyCode::Up | KeyCode::Char('k') => {
                     cursor = cursor.saturating_sub(1);
@@ -1999,6 +2109,10 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             continue;
         }
 
+        if key.code == KeyCode::Char('s') && key.modifiers.is_empty() {
+            break Outcome::Save(Box::new(app.into_output()));
+        }
+
         let want_quit = match key.code {
             KeyCode::Char('q') => true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => true,
@@ -2018,6 +2132,9 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             KeyCode::Char('t') => app.toggle_scope(),
             KeyCode::Char('a') if key.modifiers.is_empty() => {
                 start_add_for_current_context(&mut app);
+            }
+            KeyCode::Char('d') if key.modifiers.is_empty() => {
+                remove_current_context_item(&mut app);
             }
             KeyCode::Up | KeyCode::Char('k') => match app.tab {
                 TopTab::General => app.general.move_up(),
@@ -2208,14 +2325,21 @@ fn render_title(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn render_tabs(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let titles: Vec<Line> = TopTab::titles()
         .iter()
-        .map(|s| Line::from(Span::raw(*s)))
+        .enumerate()
+        .map(|(idx, s)| {
+            if idx == app.tab.index() {
+                Line::from(Span::styled(format!(" {s} "), selected_bold()))
+            } else {
+                Line::from(Span::styled(format!(" {s} "), muted()))
+            }
+        })
         .collect();
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::BOTTOM))
         .select(app.tab.index())
         .divider("  ")
         .style(muted())
-        .highlight_style(heading());
+        .highlight_style(selected_bold());
     f.render_widget(tabs, area);
 }
 
@@ -2460,20 +2584,16 @@ fn render_tool_row(entry: &ToolEntry, enabled: bool, mark_overlay: bool) -> List
 fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let key = |s: &str| Span::styled(s.to_string(), heading());
 
-    let help = Line::from(vec![
-        key("←/→ h/l"),
-        Span::raw(" tabs · "),
-        key("↑/↓ j/k"),
-        Span::raw(" move · "),
-        key("Enter"),
-        Span::raw(" activate row · "),
-        key("a"),
-        Span::raw(" add · "),
-        key("t"),
-        Span::raw(" scope · "),
-        key("q"),
-        Span::raw(" finish"),
-    ]);
+    let hints = shortcut_hints(app);
+    let mut help_spans = Vec::new();
+    for (idx, hint) in hints.iter().enumerate() {
+        if idx > 0 {
+            help_spans.push(Span::raw(" · "));
+        }
+        help_spans.push(key(hint.key));
+        help_spans.push(Span::raw(format!(" {}", hint.label)));
+    }
+    let help = Line::from(help_spans);
 
     let status = match app.tab {
         TopTab::General => Line::from(vec![Span::styled(
@@ -3558,10 +3678,72 @@ mod tests {
             cursor: 1,
         };
 
-        handle_item_action_key(&mut app, KeyCode::Enter);
+        handle_item_action_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
 
         assert!(app.filesystem.workspace.hide.is_empty());
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn shortcut_hints_include_save_and_contextual_remove() {
+        let mut app = App::new(fresh_input());
+        app.tab = TopTab::Proxy;
+        app.scope = Scope::Workspace;
+        app.proxy.cursor = 0; // inherited global row
+
+        let inherited = shortcut_hints(&app);
+        assert!(
+            inherited
+                .iter()
+                .any(|hint| hint.key == "s" && hint.label == "save")
+        );
+        assert!(
+            inherited
+                .iter()
+                .any(|hint| hint.key == "a" && hint.label == "add")
+        );
+        assert!(!inherited.iter().any(|hint| hint.key == "d"));
+
+        app.proxy.cursor = 1; // workspace-owned row
+        let owned = shortcut_hints(&app);
+        assert!(
+            owned
+                .iter()
+                .any(|hint| hint.key == "d" && hint.label == "remove")
+        );
+    }
+
+    #[test]
+    fn delete_shortcut_removes_only_active_scope_item() {
+        let mut app = App::new(fresh_input());
+        app.tab = TopTab::Proxy;
+        app.scope = Scope::Workspace;
+        app.proxy.cursor = 0; // inherited global row
+
+        assert!(!remove_current_context_item(&mut app));
+        assert_eq!(app.proxy.global, vec!["g".to_string()]);
+
+        app.proxy.cursor = 1; // workspace row
+        assert!(remove_current_context_item(&mut app));
+        assert!(app.proxy.workspace.is_empty());
+    }
+
+    #[test]
+    fn shortcut_hints_do_not_duplicate_meanings() {
+        let mut app = App::new(fresh_input());
+        app.tab = TopTab::HostFs;
+        app.scope = Scope::Workspace;
+        app.filesystem.cursor = 6; // workspace-owned hide filter
+
+        let hints = shortcut_hints(&app);
+        let mut labels = std::collections::BTreeSet::new();
+        for hint in hints {
+            assert!(
+                labels.insert(hint.label),
+                "duplicate shortcut meaning: {}",
+                hint.label
+            );
+        }
     }
 
     #[test]
