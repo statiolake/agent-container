@@ -33,6 +33,10 @@ pub enum Commands {
         /// launched directly.
         #[arg(long)]
         tmux: bool,
+        /// Run Claude Code through Bedrock for this session using the named
+        /// host AWS profile. This does not modify host env or settings.
+        #[arg(long, value_name = "PROFILE")]
+        bedrock_profile: Option<String>,
         /// Extra arguments forwarded to the chosen agent inside the container.
         /// Must appear after `--`.
         #[arg(last = true, allow_hyphen_values = true)]
@@ -147,6 +151,7 @@ const TOP_LEVEL_EXAMPLES: &str = r#"Examples:
   agent-container run
   agent-container run --rebuild-image
   agent-container run --agent codex
+  agent-container run --agent claude --bedrock-profile sandbox-bedrock
   agent-container run --tmux
   agent-container run -- --continue
   agent-container shell
@@ -169,7 +174,9 @@ on ordinary container shell access.
 
 Arguments for the chosen agent are accepted only after `--`, for example
 `agent-container run -- --continue`. Pass `--tmux` when you want the agent
-wrapped in a tmux session for agent teams or pane attachment."#;
+wrapped in a tmux session for agent teams or pane attachment. Pass
+`--bedrock-profile PROFILE` with Claude Code to enable Bedrock for only that
+session without changing host AWS environment variables."#;
 
 const SHELL_HELP: &str = r#"Open an interactive shell inside the same container environment used by `run`.
 
@@ -323,6 +330,34 @@ mod tests {
             panic!("expected run command");
         };
         assert!(tmux);
+        assert_eq!(passthrough, ["--continue"]);
+    }
+
+    #[test]
+    fn run_bedrock_profile_is_a_real_option() {
+        let cli = Cli::try_parse_from([
+            "agent-container",
+            "run",
+            "--agent",
+            "claude",
+            "--bedrock-profile",
+            "sandbox",
+            "--",
+            "--continue",
+        ])
+        .unwrap();
+
+        let Commands::Run {
+            agent,
+            bedrock_profile,
+            passthrough,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert_eq!(agent, Some(AgentKind::Claude));
+        assert_eq!(bedrock_profile.as_deref(), Some("sandbox"));
         assert_eq!(passthrough, ["--continue"]);
     }
 

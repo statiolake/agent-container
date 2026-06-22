@@ -200,17 +200,16 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     // Bedrock env vars: declared as `${VAR:-}` in compose.yml, so an unset
     // shell var translates to an empty string in the container.
     //
-    // AWS_PROFILE / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
-    // AWS_SESSION_TOKEN are deliberately NOT forwarded: creds live only
-    // in Claude Code's memory (via awsCredentialExport), and letting the
-    // host's own AWS env vars leak in would make the container transact
-    // against whatever account the host shell happens to be pointing at
-    // — not necessarily the one the operator chose in settings.json.
+    // AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN are
+    // deliberately NOT forwarded: creds live only in Claude Code's memory
+    // (via awsCredentialExport). AWS_PROFILE is set only from the selected
+    // Bedrock setup, not inherited from the host shell.
     let mut put = |k: &str, v: String| {
         env.insert(k.to_string(), v);
     };
     if let Some(setup) = &opts.bedrock_setup {
         put("CLAUDE_CODE_USE_BEDROCK", "1".to_string());
+        put("AWS_PROFILE", setup.profile.clone());
         if let Some(model) = &setup.model {
             put("ANTHROPIC_MODEL", model.clone());
         }
@@ -222,6 +221,7 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     for key in [
         "CLAUDE_CODE_USE_BEDROCK",
         "ANTHROPIC_MODEL",
+        "AWS_PROFILE",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
     ] {
@@ -964,5 +964,14 @@ mod tests {
             Some(DOCKER_ATTACH_DETACH_KEYS)
         );
         assert_ne!(DOCKER_ATTACH_DETACH_KEYS, "ctrl-p,ctrl-q");
+    }
+
+    #[test]
+    fn compose_exposes_selected_bedrock_profile_env() {
+        let compose = include_str!("../docker/compose.yml");
+        assert!(
+            compose.contains("AWS_PROFILE=${AWS_PROFILE:-}"),
+            "agent service should receive the selected Bedrock profile"
+        );
     }
 }

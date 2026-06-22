@@ -211,6 +211,17 @@ hook, pointed at a tiny `curl` against the broker. The container never
 writes `~/.aws/credentials`; the credentials live only in Claude Code's
 memory for the lifetime of the request.
 
+For one-off sessions, pass `--bedrock-profile PROFILE` instead of changing
+host settings or shell env:
+
+```sh
+agent-container run --agent claude --bedrock-profile my-bedrock-profile
+```
+
+That run injects `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_PROFILE=PROFILE`, and
+`AWS_REGION=ap-northeast-1` into the staged Claude Code settings and the
+container process environment.
+
 On the host, the broker resolves credentials via `aws configure
 export-credentials --profile <profile> --format process` — which
 handles static keys, SSO and assume-role uniformly. If resolution fails
@@ -226,9 +237,9 @@ before a retry. Put it in `~/.claude/settings.json` (preferred) or
 
 Host-side AWS env vars (`AWS_PROFILE`, `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) are deliberately **not**
-forwarded into the container. Otherwise a shell that happens to be
-pointing at a different AWS account would silently override the profile
-you chose in `settings.json`.
+forwarded into the container. `AWS_PROFILE` is set only from settings or
+`--bedrock-profile`; otherwise a shell that happens to be pointing at a
+different AWS account would silently override the profile you chose.
 
 ### Logging
 

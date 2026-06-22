@@ -182,8 +182,9 @@ async fn main() -> Result<()> {
             agent,
             rebuild_image,
             tmux,
+            bedrock_profile,
             passthrough,
-        } => run_cmd(agent, rebuild_image, tmux, passthrough).await,
+        } => run_cmd(agent, rebuild_image, tmux, bedrock_profile, passthrough).await,
         Commands::Shell {
             rebuild_image,
             passthrough,
@@ -555,13 +556,14 @@ async fn run_cmd(
     agent_override: Option<AgentKind>,
     rebuild_image: bool,
     tmux: bool,
+    bedrock_profile: Option<String>,
     passthrough: Vec<String>,
 ) -> Result<()> {
     let host = paths::HostPaths::detect()?;
 
     // Host-side discovery — always performed so broker/sync can populate
     // correctly regardless of which agent is the session primary.
-    let bedrock = aws::detect_setup(&host.claude_root.join("settings.json"))
+    let detected_bedrock = aws::detect_setup(&host.claude_root.join("settings.json"))
         .context("failed to read Bedrock settings from ~/.claude/settings.json")?;
     let refresh = aws::detect_refresh_command(
         &host.claude_root.join("settings.json"),
@@ -576,6 +578,7 @@ async fn run_cmd(
         .context("failed to load agent-container settings (global + workspace)")?;
     let agent = agent_override
         .unwrap_or_else(|| agent_kind_from_default(merged_settings.general.default_agent()));
+    let bedrock = resolve_run_bedrock_setup(agent, detected_bedrock, bedrock_profile)?;
     let task_runner_tasks = task_runner::load_specs_from_settings(&host.workspace)?;
     let services = build_agent_services(
         &host,
@@ -699,6 +702,28 @@ async fn run_cmd(
     drop(claude_creds);
     drop(codex_auth);
     std::process::exit(exit);
+}
+
+fn resolve_run_bedrock_setup(
+    agent: AgentKind,
+    detected: Option<aws::BedrockSetup>,
+    profile_override: Option<String>,
+) -> Result<Option<aws::BedrockSetup>> {
+    let Some(profile) = profile_override else {
+        return Ok(detected);
+    };
+    if agent != AgentKind::Claude {
+        bail!("--bedrock-profile is only supported when running Claude Code");
+    }
+    let profile = profile.trim();
+    if profile.is_empty() {
+        bail!("--bedrock-profile requires a non-empty profile name");
+    }
+    Ok(Some(aws::BedrockSetup {
+        profile: profile.to_string(),
+        model: detected.and_then(|setup| setup.model),
+        region: Some("ap-northeast-1".to_string()),
+    }))
 }
 
 fn agent_kind_from_default(agent: settings::DefaultAgent) -> AgentKind {
@@ -1061,5 +1086,30 @@ mod tests {
     fn claude_tmux_prefix_rejects_shell_metacharacters() {
         let err = agent_command(AgentKind::Claude, true, "C-q;touch").unwrap_err();
         assert!(format!("{err:#}").contains("invalid claude.tmux_prefix"));
+    }
+
+    #[test]
+    fn bedrock_profile_override_sets_claude_bedrock_profile_and_region() {
+        let detected = aws::BedrockSetup {
+            profile: "from-settings".to_string(),
+            model: Some("model-from-settings".to_string()),
+            region: Some("us-west-2".to_string()),
+        };
+
+        let setup =
+            resolve_run_bedrock_setup(AgentKind::Claude, Some(detected), Some("sandbox".into()))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(setup.profile, "sandbox");
+        assert_eq!(setup.model.as_deref(), Some("model-from-settings"));
+        assert_eq!(setup.region.as_deref(), Some("ap-northeast-1"));
+    }
+
+    #[test]
+    fn bedrock_profile_override_rejects_codex() {
+        let err =
+            resolve_run_bedrock_setup(AgentKind::Codex, None, Some("sandbox".into())).unwrap_err();
+        assert!(format!("{err:#}").contains("only supported when running Claude Code"));
     }
 }

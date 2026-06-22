@@ -42,12 +42,13 @@ services:
       - COLORTERM=${COLORTERM:-truecolor}
       # Bedrock pathway. Credentials themselves never travel through env
       # vars — the container's awsCredentialExport command fetches them
-      # from the broker on demand. AWS_PROFILE / AWS_ACCESS_KEY_ID /
+      # from the broker on demand. AWS_ACCESS_KEY_ID /
       # AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN are intentionally NOT
       # forwarded so the host's own AWS environment can't hijack which
       # account the container transacts against.
       - CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-}
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
+      - AWS_PROFILE=${AWS_PROFILE:-}
       - AWS_REGION=${AWS_REGION:-}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-}
       - AGENT_CONTAINER_HOST_ENDPOINT=${AGENT_CONTAINER_HOST_ENDPOINT}

@@ -327,6 +327,7 @@ fn sync_settings_json(host: &HostPaths, opts: &SyncOptions<'_>) -> Result<()> {
             // process env and settings.json env both match.
             let mut env = serde_json::Map::new();
             env.insert("CLAUDE_CODE_USE_BEDROCK".into(), Value::String("1".into()));
+            env.insert("AWS_PROFILE".into(), Value::String(bedrock.profile.clone()));
             if let Some(model) = &bedrock.model {
                 env.insert("ANTHROPIC_MODEL".into(), Value::String(model.clone()));
             }
@@ -1033,6 +1034,7 @@ mod tests {
             Some("1")
         );
         assert_eq!(env["CLAUDE_CODE_USE_BEDROCK"].as_str(), Some("1"));
+        assert_eq!(env["AWS_PROFILE"].as_str(), Some("bedrock"));
         assert_eq!(
             env["ANTHROPIC_MODEL"].as_str(),
             Some("anthropic.claude-sonnet-4-20250514-v1:0")
