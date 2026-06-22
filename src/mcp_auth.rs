@@ -393,17 +393,25 @@ impl CallbackListener {
         let (status, body) = if error.is_some() {
             (
                 "400 Bad Request",
-                "MCP authentication failed. Return to the terminal.",
+                oauth_callback_page(
+                    "Authentication failed",
+                    "Return to the terminal and retry the MCP auth command.",
+                    false,
+                ),
             )
         } else {
             (
                 "200 OK",
-                "MCP authentication complete. Return to the terminal.",
+                oauth_callback_page(
+                    "Authentication complete",
+                    "You can close this tab and return to the terminal.",
+                    true,
+                ),
             )
         };
         let response = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
+            "HTTP/1.1 {status}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len(),
         );
         let _ = stream.write_all(response.as_bytes()).await;
 
@@ -415,6 +423,87 @@ impl CallbackListener {
         }
         code.context("OAuth callback did not include code")
     }
+}
+
+fn oauth_callback_page(title: &str, message: &str, ok: bool) -> String {
+    let accent = if ok { "#2563eb" } else { "#b91c1c" };
+    let icon = if ok { "OK" } else { "!" };
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+:root {{
+  color-scheme: light dark;
+  --bg: #f7f7f8;
+  --panel: #ffffff;
+  --text: #171717;
+  --muted: #666a73;
+  --border: #dedfe3;
+  --accent: {accent};
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{
+    --bg: #111214;
+    --panel: #181a1f;
+    --text: #f3f4f6;
+    --muted: #a1a1aa;
+    --border: #2d3038;
+  }}
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
+main {{
+  width: min(420px, calc(100vw - 40px));
+  padding: 28px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}}
+.mark {{
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font-weight: 700;
+  margin-bottom: 18px;
+}}
+h1 {{
+  margin: 0 0 8px;
+  font-size: 22px;
+  line-height: 1.2;
+  font-weight: 650;
+  letter-spacing: 0;
+}}
+p {{
+  margin: 0;
+  color: var(--muted);
+}}
+</style>
+</head>
+<body>
+<main>
+  <div class="mark" aria-hidden="true">{icon}</div>
+  <h1>{title}</h1>
+  <p>{message}</p>
+</main>
+</body>
+</html>"#
+    )
 }
 
 fn pkce_verifier() -> String {
@@ -498,5 +587,15 @@ mod tests {
         assert!(url.contains("code_challenge=challenge"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("resource=https%3A%2F%2Fmcp.example%2Fmcp"));
+    }
+
+    #[test]
+    fn oauth_callback_page_is_html() {
+        let html = oauth_callback_page("Authentication complete", "Close this tab.", true);
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("<meta name=\"viewport\""));
+        assert!(html.contains("Authentication complete"));
+        assert!(html.contains("Close this tab."));
+        assert!(html.contains("border-radius: 8px"));
     }
 }
