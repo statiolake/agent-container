@@ -37,6 +37,10 @@ pub enum Commands {
         /// host AWS profile. This does not modify host env or settings.
         #[arg(long, value_name = "PROFILE")]
         bedrock_profile: Option<String>,
+        /// Bedrock AWS region for this Claude Code session. Defaults to
+        /// `[general].bedrock_region`, then ap-northeast-1.
+        #[arg(long, value_name = "REGION")]
+        bedrock_region: Option<String>,
         /// Extra arguments forwarded to the chosen agent inside the container.
         /// Must appear after `--`.
         #[arg(last = true, allow_hyphen_values = true)]
@@ -152,6 +156,7 @@ const TOP_LEVEL_EXAMPLES: &str = r#"Examples:
   agent-container run --rebuild-image
   agent-container run --agent codex
   agent-container run --agent claude --bedrock-profile sandbox-bedrock
+  agent-container run --agent claude --bedrock-profile sandbox-bedrock --bedrock-region us-west-2
   agent-container run --tmux
   agent-container run -- --continue
   agent-container shell
@@ -176,7 +181,8 @@ Arguments for the chosen agent are accepted only after `--`, for example
 `agent-container run -- --continue`. Pass `--tmux` when you want the agent
 wrapped in a tmux session for agent teams or pane attachment. Pass
 `--bedrock-profile PROFILE` with Claude Code to enable Bedrock for only that
-session without changing host AWS environment variables."#;
+session without changing host AWS environment variables. Use `--bedrock-region
+REGION` to override `[general].bedrock_region` for that session."#;
 
 const SHELL_HELP: &str = r#"Open an interactive shell inside the same container environment used by `run`.
 
@@ -212,6 +218,7 @@ Supported TOML shape:
 
   [general]
   default_agent = "codex"
+  bedrock_region = "ap-northeast-1"
 
   [claude_code.mcp.servers.github]
   enabled = true
@@ -350,6 +357,7 @@ mod tests {
         let Commands::Run {
             agent,
             bedrock_profile,
+            bedrock_region,
             passthrough,
             ..
         } = cli.command
@@ -358,7 +366,28 @@ mod tests {
         };
         assert_eq!(agent, Some(AgentKind::Claude));
         assert_eq!(bedrock_profile.as_deref(), Some("sandbox"));
+        assert_eq!(bedrock_region, None);
         assert_eq!(passthrough, ["--continue"]);
+    }
+
+    #[test]
+    fn run_bedrock_region_is_a_real_option() {
+        let cli = Cli::try_parse_from([
+            "agent-container",
+            "run",
+            "--agent",
+            "claude",
+            "--bedrock-profile",
+            "sandbox",
+            "--bedrock-region",
+            "us-west-2",
+        ])
+        .unwrap();
+
+        let Commands::Run { bedrock_region, .. } = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(bedrock_region.as_deref(), Some("us-west-2"));
     }
 
     #[test]

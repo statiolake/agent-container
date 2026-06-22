@@ -268,7 +268,7 @@ fn template_for(scope: Scope) -> String {
         }
     };
     format!(
-        "{header}\n# Uncomment examples below.\n# [general]\n# default_agent = \"codex\"\n\n# [proxy]\n# allow = [\"^my-internal\\\\.example$\"]\n\n# [filesystem]\n# mounts = [{{ path = \"/Users/me/project-notes\", readonly = true }}]\n# hide = [\"(^|/)\\\\.env(\\\\..*)?$\"]\n# readonly = [\"(^|/)\\\\.claude(/|$)\"]\n\n# Claude Code MCP policy:\n# [claude_code.mcp.servers.github]\n# enabled = true\n# [claude_code.mcp.servers.github.tools]\n# list_issues = true\n# create_issue = false\n\n# Codex MCP policy:\n# [codex.mcp.servers.local-tools.tools]\n# search = true\n# mutate = false\n\n# [claude]\n# tmux_prefix = \"C-b\"\n# skip_bypass_permissions_warning = false\n"
+        "{header}\n# Uncomment examples below.\n# [general]\n# default_agent = \"codex\"\n# bedrock_region = \"ap-northeast-1\"\n\n# [proxy]\n# allow = [\"^my-internal\\\\.example$\"]\n\n# [filesystem]\n# mounts = [{{ path = \"/Users/me/project-notes\", readonly = true }}]\n# hide = [\"(^|/)\\\\.env(\\\\..*)?$\"]\n# readonly = [\"(^|/)\\\\.claude(/|$)\"]\n\n# Claude Code MCP policy:\n# [claude_code.mcp.servers.github]\n# enabled = true\n# [claude_code.mcp.servers.github.tools]\n# list_issues = true\n# create_issue = false\n\n# Codex MCP policy:\n# [codex.mcp.servers.local-tools.tools]\n# search = true\n# mutate = false\n\n# [claude]\n# tmux_prefix = \"C-b\"\n# skip_bypass_permissions_warning = false\n"
     )
 }
 

@@ -417,6 +417,9 @@ enum Mode {
     DefaultAgentSelect {
         cursor: usize,
     },
+    BedrockRegionInput {
+        buffer: TextField,
+    },
     BypassWarningSelect {
         cursor: usize,
     },
@@ -894,6 +897,7 @@ impl FilesystemState {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GeneralRow {
     DefaultAgent,
+    BedrockRegion,
     BypassWarning,
 }
 
@@ -936,6 +940,26 @@ impl GeneralState {
                 .default_agent
                 .or(self.global.default_agent)
                 .unwrap_or_default(),
+        }
+    }
+
+    fn effective_bedrock_region(&self, scope: Scope) -> &str {
+        match scope {
+            Scope::Global => self.global.bedrock_region(),
+            Scope::Workspace => self
+                .workspace
+                .bedrock_region
+                .as_deref()
+                .or(self.global.bedrock_region.as_deref())
+                .unwrap_or(GeneralPolicy::DEFAULT_BEDROCK_REGION),
+        }
+    }
+
+    fn bedrock_region_origin(&self, scope: Scope) -> ProxyOrigin {
+        match scope {
+            Scope::Global => ProxyOrigin::Global,
+            Scope::Workspace if self.workspace.bedrock_region.is_some() => ProxyOrigin::Workspace,
+            Scope::Workspace => ProxyOrigin::Global,
         }
     }
 
@@ -1003,8 +1027,23 @@ impl GeneralState {
         }
     }
 
+    fn configured_bedrock_region(&self, scope: Scope) -> Option<&str> {
+        match scope {
+            Scope::Global => self.global.bedrock_region.as_deref(),
+            Scope::Workspace => self.workspace.bedrock_region.as_deref(),
+        }
+    }
+
+    fn set_bedrock_region(&mut self, scope: Scope, value: Option<String>) {
+        self.active_policy_mut(scope).bedrock_region = value;
+    }
+
     fn visible_rows(&self, _scope: Scope) -> Vec<GeneralRow> {
-        vec![GeneralRow::DefaultAgent, GeneralRow::BypassWarning]
+        vec![
+            GeneralRow::DefaultAgent,
+            GeneralRow::BedrockRegion,
+            GeneralRow::BypassWarning,
+        ]
     }
 
     fn current_row(&self, scope: Scope) -> Option<GeneralRow> {
@@ -1900,6 +1939,30 @@ fn handle_default_agent_select_key(app: &mut App, code: KeyCode) {
     app.mode = Mode::DefaultAgentSelect { cursor };
 }
 
+fn handle_bedrock_region_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    let Mode::BedrockRegionInput { mut buffer } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
+        return;
+    };
+
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    match code {
+        KeyCode::Esc => return,
+        KeyCode::Char('c') if ctrl => return,
+        KeyCode::Enter => {
+            let value = buffer.value().trim().to_string();
+            app.general
+                .set_bedrock_region(app.scope, (!value.is_empty()).then_some(value));
+            return;
+        }
+        _ => {
+            apply_editing_key(&mut buffer, code, modifiers);
+        }
+    }
+
+    app.mode = Mode::BedrockRegionInput { buffer };
+}
+
 fn handle_bypass_warning_select_key(app: &mut App, code: KeyCode) {
     let Mode::BypassWarningSelect { mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal)
     else {
@@ -2063,6 +2126,10 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             handle_default_agent_select_key(&mut app, key.code);
             continue;
         }
+        if matches!(app.mode, Mode::BedrockRegionInput { .. }) {
+            handle_bedrock_region_input_key(&mut app, key.code, key.modifiers);
+            continue;
+        }
         if matches!(app.mode, Mode::BypassWarningSelect { .. }) {
             handle_bypass_warning_select_key(&mut app, key.code);
             continue;
@@ -2165,6 +2232,13 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                     Some(GeneralRow::DefaultAgent) => {
                         app.mode = Mode::DefaultAgentSelect {
                             cursor: default_agent_index(app.general.configured_agent(scope)),
+                        };
+                    }
+                    Some(GeneralRow::BedrockRegion) => {
+                        app.mode = Mode::BedrockRegionInput {
+                            buffer: TextField::from_str(
+                                app.general.configured_bedrock_region(scope).unwrap_or(""),
+                            ),
                         };
                     }
                     Some(GeneralRow::BypassWarning) => {
@@ -2295,6 +2369,10 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
         render_default_agent_select_modal(f, area, cursor);
     }
 
+    if let Mode::BedrockRegionInput { ref buffer } = app.mode {
+        render_bedrock_region_input_modal(f, area, buffer);
+    }
+
     if let Mode::BypassWarningSelect { cursor } = app.mode {
         render_bypass_warning_select_modal(f, area, cursor);
     }
@@ -2358,6 +2436,19 @@ fn render_general(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     Span::raw("Change Default Agent"),
                     Span::raw("  "),
                     Span::styled(agent.label(), value_style.add_modifier(Modifier::BOLD)),
+                    Span::styled(if inherited { "  inherited" } else { "" }, muted()),
+                ]))
+            }
+            GeneralRow::BedrockRegion => {
+                let region = app.general.effective_bedrock_region(app.scope);
+                let origin = app.general.bedrock_region_origin(app.scope);
+                let inherited = app.scope == Scope::Workspace && origin == ProxyOrigin::Global;
+                let value_style = if inherited { muted() } else { heading() };
+                ListItem::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw("Change Bedrock Region"),
+                    Span::raw("  "),
+                    Span::styled(region, value_style.add_modifier(Modifier::BOLD)),
                     Span::styled(if inherited { "  inherited" } else { "" }, muted()),
                 ]))
             }
@@ -2842,6 +2933,39 @@ fn render_default_agent_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, c
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+fn render_bedrock_region_input_modal(f: &mut ratatui::Frame<'_>, parent: Rect, buffer: &TextField) {
+    let w = parent.width.clamp(44, 66);
+    let h: u16 = 6;
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    let y = parent.y + (parent.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Bedrock region ")
+        .border_style(muted())
+        .title_style(heading());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let hint = Line::from(vec![Span::styled(
+        "AWS region. Empty value inherits the lower scope/default.",
+        muted(),
+    )]);
+    let body = Line::from(vec![Span::raw("> "), Span::raw(buffer.value())]);
+    let help = Line::from(Span::styled(
+        "Enter commit · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
+        muted(),
+    ));
+    let para = Paragraph::new(vec![hint, Line::from(""), body, help]);
+    f.render_widget(para, inner);
+
+    let cursor_x = inner.x + 2 + buffer.prefix_width();
+    let cursor_y = inner.y + 2;
+    f.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
 fn render_bypass_warning_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, cursor: usize) {
     let w = parent.width.clamp(44, 62);
     let h: u16 = 9;
@@ -3307,6 +3431,7 @@ mod tests {
             initial_scope: Scope::Workspace,
             general_global: GeneralPolicy {
                 default_agent: Some(DefaultAgent::Claude),
+                ..Default::default()
             },
             general_workspace: GeneralPolicy::default(),
             claude_global: ClaudePolicy::default(),
@@ -3360,6 +3485,7 @@ mod tests {
         let mut general = GeneralState::new(
             GeneralPolicy {
                 default_agent: Some(DefaultAgent::Codex),
+                ..Default::default()
             },
             GeneralPolicy::default(),
             ClaudePolicy::default(),
@@ -3384,6 +3510,7 @@ mod tests {
         let mut general = GeneralState::new(
             GeneralPolicy {
                 default_agent: Some(DefaultAgent::Codex),
+                ..Default::default()
             },
             GeneralPolicy::default(),
             ClaudePolicy::default(),
@@ -3391,14 +3518,69 @@ mod tests {
         );
         assert_eq!(
             general.visible_rows(Scope::Workspace),
-            vec![GeneralRow::DefaultAgent, GeneralRow::BypassWarning]
+            vec![
+                GeneralRow::DefaultAgent,
+                GeneralRow::BedrockRegion,
+                GeneralRow::BypassWarning,
+            ]
         );
 
         general.set_agent(Scope::Workspace, Some(DefaultAgent::Claude));
         assert_eq!(
             general.visible_rows(Scope::Workspace),
-            vec![GeneralRow::DefaultAgent, GeneralRow::BypassWarning]
+            vec![
+                GeneralRow::DefaultAgent,
+                GeneralRow::BedrockRegion,
+                GeneralRow::BypassWarning,
+            ]
         );
+    }
+
+    #[test]
+    fn bedrock_region_inherits_until_overridden() {
+        let mut general = GeneralState::new(
+            GeneralPolicy {
+                bedrock_region: Some("us-west-2".into()),
+                ..Default::default()
+            },
+            GeneralPolicy::default(),
+            ClaudePolicy::default(),
+            ClaudePolicy::default(),
+        );
+        assert_eq!(
+            general.effective_bedrock_region(Scope::Workspace),
+            "us-west-2"
+        );
+        assert_eq!(
+            general.bedrock_region_origin(Scope::Workspace),
+            ProxyOrigin::Global
+        );
+
+        general.set_bedrock_region(Scope::Workspace, Some("eu-central-1".into()));
+        assert_eq!(
+            general.effective_bedrock_region(Scope::Workspace),
+            "eu-central-1"
+        );
+        assert_eq!(
+            general.bedrock_region_origin(Scope::Workspace),
+            ProxyOrigin::Workspace
+        );
+    }
+
+    #[test]
+    fn bedrock_region_input_commits_trimmed_value() {
+        let mut app = App::new(fresh_input());
+        app.mode = Mode::BedrockRegionInput {
+            buffer: TextField::from_str(" us-west-2 "),
+        };
+
+        handle_bedrock_region_input_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
+
+        assert_eq!(
+            app.general.workspace.bedrock_region.as_deref(),
+            Some("us-west-2")
+        );
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]

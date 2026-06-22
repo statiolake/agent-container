@@ -219,8 +219,14 @@ agent-container run --agent claude --bedrock-profile my-bedrock-profile
 ```
 
 That run injects `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_PROFILE=PROFILE`, and
-`AWS_REGION=ap-northeast-1` into the staged Claude Code settings and the
-container process environment.
+`AWS_REGION=<region>` into the staged Claude Code settings and the container
+process environment. The region comes from `--bedrock-region`, then
+`[general].bedrock_region`, and defaults to `ap-northeast-1`:
+
+```toml
+[general]
+bedrock_region = "ap-northeast-1"
+```
 
 On the host, the broker resolves credentials via `aws configure
 export-credentials --profile <profile> --format process` — which

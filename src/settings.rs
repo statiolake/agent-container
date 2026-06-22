@@ -21,6 +21,7 @@
 //!
 //! [general]
 //! default_agent = "claude"
+//! bedrock_region = "ap-northeast-1"
 //!
 //! [task_runner.tasks]
 //! lint = "cargo check"
@@ -70,15 +71,25 @@ pub struct Settings {
 pub struct GeneralPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_agent: Option<DefaultAgent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bedrock_region: Option<String>,
 }
 
 impl GeneralPolicy {
+    pub const DEFAULT_BEDROCK_REGION: &'static str = "ap-northeast-1";
+
     pub fn is_empty(&self) -> bool {
-        self.default_agent.is_none()
+        self.default_agent.is_none() && self.bedrock_region.is_none()
     }
 
     pub fn default_agent(&self) -> DefaultAgent {
         self.default_agent.unwrap_or_default()
+    }
+
+    pub fn bedrock_region(&self) -> &str {
+        self.bedrock_region
+            .as_deref()
+            .unwrap_or(Self::DEFAULT_BEDROCK_REGION)
     }
 }
 
@@ -401,7 +412,7 @@ impl Settings {
     ///
     /// - `proxy.allow`: overlay entries are appended to the base list,
     ///   preserving order and removing exact duplicates.
-    /// - `general.default_agent`: workspace overrides global when set.
+    /// - `general.*`: workspace overrides each global scalar when set.
     /// - `claude_code.mcp.servers.<server>` and
     ///   `codex.mcp.servers.<server>`: if overlay declares a server, the
     ///   whole entry replaces the base entry (matching VS Code's
@@ -418,6 +429,9 @@ impl Settings {
         overlay.migrate_legacy_mcp();
         if overlay.general.default_agent.is_some() {
             self.general.default_agent = overlay.general.default_agent;
+        }
+        if overlay.general.bedrock_region.is_some() {
+            self.general.bedrock_region = overlay.general.bedrock_region;
         }
         for pat in overlay.proxy.allow {
             if !self.proxy.allow.contains(&pat) {
@@ -645,6 +659,7 @@ mounts = ["/tmp/notes"]
         let written = Settings {
             general: GeneralPolicy {
                 default_agent: Some(DefaultAgent::Codex),
+                bedrock_region: Some("us-west-2".into()),
             },
             ..Default::default()
         };
@@ -652,18 +667,22 @@ mounts = ["/tmp/notes"]
 
         let read = Settings::load_from(&path).unwrap();
         assert_eq!(read.general.default_agent(), DefaultAgent::Codex);
+        assert_eq!(read.general.bedrock_region(), "us-west-2");
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("[general]"));
         assert!(raw.contains("default_agent = \"codex\""));
+        assert!(raw.contains("bedrock_region = \"us-west-2\""));
 
         let mut base = Settings {
             general: GeneralPolicy {
                 default_agent: Some(DefaultAgent::Claude),
+                bedrock_region: Some("ap-northeast-1".into()),
             },
             ..Default::default()
         };
         base.merge_in_place(read);
         assert_eq!(base.general.default_agent(), DefaultAgent::Codex);
+        assert_eq!(base.general.bedrock_region(), "us-west-2");
     }
 
     #[test]

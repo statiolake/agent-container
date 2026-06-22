@@ -183,8 +183,19 @@ async fn main() -> Result<()> {
             rebuild_image,
             tmux,
             bedrock_profile,
+            bedrock_region,
             passthrough,
-        } => run_cmd(agent, rebuild_image, tmux, bedrock_profile, passthrough).await,
+        } => {
+            run_cmd(
+                agent,
+                rebuild_image,
+                tmux,
+                bedrock_profile,
+                bedrock_region,
+                passthrough,
+            )
+            .await
+        }
         Commands::Shell {
             rebuild_image,
             passthrough,
@@ -557,6 +568,7 @@ async fn run_cmd(
     rebuild_image: bool,
     tmux: bool,
     bedrock_profile: Option<String>,
+    bedrock_region: Option<String>,
     passthrough: Vec<String>,
 ) -> Result<()> {
     let host = paths::HostPaths::detect()?;
@@ -578,7 +590,13 @@ async fn run_cmd(
         .context("failed to load agent-container settings (global + workspace)")?;
     let agent = agent_override
         .unwrap_or_else(|| agent_kind_from_default(merged_settings.general.default_agent()));
-    let bedrock = resolve_run_bedrock_setup(agent, detected_bedrock, bedrock_profile)?;
+    let bedrock = resolve_run_bedrock_setup(
+        agent,
+        detected_bedrock,
+        bedrock_profile,
+        bedrock_region,
+        merged_settings.general.bedrock_region(),
+    )?;
     let task_runner_tasks = task_runner::load_specs_from_settings(&host.workspace)?;
     let services = build_agent_services(
         &host,
@@ -708,13 +726,20 @@ fn resolve_run_bedrock_setup(
     agent: AgentKind,
     detected: Option<aws::BedrockSetup>,
     profile_override: Option<String>,
+    region_override: Option<String>,
+    configured_region: &str,
 ) -> Result<Option<aws::BedrockSetup>> {
-    let Some(profile) = profile_override else {
-        return Ok(detected);
-    };
-    if agent != AgentKind::Claude {
-        bail!("--bedrock-profile is only supported when running Claude Code");
+    let has_region_override = region_override.is_some();
+    let region = resolve_bedrock_region(region_override, configured_region)?;
+    if (profile_override.is_some() || has_region_override) && agent != AgentKind::Claude {
+        bail!("--bedrock-profile and --bedrock-region are only supported when running Claude Code");
     }
+    let Some(profile) = profile_override else {
+        return Ok(detected.map(|mut setup| {
+            setup.region = Some(region);
+            setup
+        }));
+    };
     let profile = profile.trim();
     if profile.is_empty() {
         bail!("--bedrock-profile requires a non-empty profile name");
@@ -722,8 +747,22 @@ fn resolve_run_bedrock_setup(
     Ok(Some(aws::BedrockSetup {
         profile: profile.to_string(),
         model: detected.and_then(|setup| setup.model),
-        region: Some("ap-northeast-1".to_string()),
+        region: Some(region),
     }))
+}
+
+fn resolve_bedrock_region(
+    region_override: Option<String>,
+    configured_region: &str,
+) -> Result<String> {
+    let raw = region_override
+        .as_deref()
+        .unwrap_or(configured_region)
+        .trim();
+    if raw.is_empty() {
+        bail!("Bedrock region must not be empty");
+    }
+    Ok(raw.to_string())
 }
 
 fn agent_kind_from_default(agent: settings::DefaultAgent) -> AgentKind {
@@ -1096,10 +1135,15 @@ mod tests {
             region: Some("us-west-2".to_string()),
         };
 
-        let setup =
-            resolve_run_bedrock_setup(AgentKind::Claude, Some(detected), Some("sandbox".into()))
-                .unwrap()
-                .unwrap();
+        let setup = resolve_run_bedrock_setup(
+            AgentKind::Claude,
+            Some(detected),
+            Some("sandbox".into()),
+            None,
+            "ap-northeast-1",
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(setup.profile, "sandbox");
         assert_eq!(setup.model.as_deref(), Some("model-from-settings"));
@@ -1107,9 +1151,66 @@ mod tests {
     }
 
     #[test]
+    fn bedrock_profile_override_uses_configured_region() {
+        let setup = resolve_run_bedrock_setup(
+            AgentKind::Claude,
+            None,
+            Some("sandbox".into()),
+            None,
+            "us-east-1",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(setup.profile, "sandbox");
+        assert_eq!(setup.region.as_deref(), Some("us-east-1"));
+    }
+
+    #[test]
+    fn bedrock_region_override_beats_configured_region() {
+        let detected = aws::BedrockSetup {
+            profile: "from-settings".to_string(),
+            model: None,
+            region: Some("eu-central-1".to_string()),
+        };
+
+        let setup = resolve_run_bedrock_setup(
+            AgentKind::Claude,
+            Some(detected),
+            None,
+            Some("us-west-2".into()),
+            "ap-northeast-1",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(setup.profile, "from-settings");
+        assert_eq!(setup.region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
     fn bedrock_profile_override_rejects_codex() {
-        let err =
-            resolve_run_bedrock_setup(AgentKind::Codex, None, Some("sandbox".into())).unwrap_err();
+        let err = resolve_run_bedrock_setup(
+            AgentKind::Codex,
+            None,
+            Some("sandbox".into()),
+            None,
+            "ap-northeast-1",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("only supported when running Claude Code"));
+    }
+
+    #[test]
+    fn bedrock_region_override_rejects_codex() {
+        let err = resolve_run_bedrock_setup(
+            AgentKind::Codex,
+            None,
+            None,
+            Some("us-west-2".into()),
+            "ap-northeast-1",
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("only supported when running Claude Code"));
     }
 }
