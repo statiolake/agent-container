@@ -48,10 +48,14 @@ impl McpServer {
     }
 }
 
-/// Read every MCP server definition out of the top-level `mcpServers` key
-/// of `~/.claude.json`. Entries the parser cannot classify are logged and
-/// skipped rather than returned as errors.
-pub fn load_servers(claude_json: &Path) -> Result<Vec<McpServer>> {
+/// Read every MCP server definition that Claude Code would apply to the
+/// current workspace: top-level `mcpServers` plus
+/// `projects.<workspace>.mcpServers`. Project-local entries override
+/// top-level entries with the same name.
+///
+/// Entries the parser cannot classify are logged and skipped rather than
+/// returned as errors.
+pub fn load_servers(claude_json: &Path, workspace: &Path) -> Result<Vec<McpServer>> {
     if !claude_json.is_file() {
         return Ok(Vec::new());
     }
@@ -60,24 +64,24 @@ pub fn load_servers(claude_json: &Path) -> Result<Vec<McpServer>> {
     let cfg: Value = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse {} as JSON", claude_json.display()))?;
 
-    let Some(map) = cfg.get("mcpServers").and_then(Value::as_object) else {
-        return Ok(Vec::new());
-    };
-
-    let mut out = Vec::new();
-    for (name, value) in map {
-        match parse_entry(name, value) {
-            Ok(Some(server)) => out.push(server),
-            Ok(None) => {
-                tracing::debug!(name, "skipping unrecognised MCP server entry");
-            }
-            Err(e) => {
-                tracing::warn!(name, error = %e, "failed to parse MCP server entry; skipping");
-            }
-        }
+    let mut out = BTreeMap::new();
+    if let Some(map) = cfg.get("mcpServers").and_then(Value::as_object) {
+        insert_servers_from_map(&mut out, map, "top-level");
     }
-    out.sort_by(|a, b| a.name().cmp(b.name()));
-    Ok(out)
+
+    let workspace_key = workspace.display().to_string();
+    if let Some(map) = cfg
+        .get("projects")
+        .and_then(Value::as_object)
+        .and_then(|projects| projects.get(&workspace_key))
+        .and_then(Value::as_object)
+        .and_then(|project| project.get("mcpServers"))
+        .and_then(Value::as_object)
+    {
+        insert_servers_from_map(&mut out, map, "project");
+    }
+
+    Ok(out.into_values().collect())
 }
 
 /// Read every MCP server definition out of Codex's `~/.codex/config.toml`
@@ -133,6 +137,26 @@ fn parse_entry(name: &str, value: &Value) -> Result<Option<McpServer>> {
     let mut entry: RawEntry =
         serde_json::from_value(value.clone()).context("entry is not a valid MCP server object")?;
     parse_raw_entry(name, &mut entry)
+}
+
+fn insert_servers_from_map(
+    out: &mut BTreeMap<String, McpServer>,
+    map: &serde_json::Map<String, Value>,
+    source: &str,
+) {
+    for (name, value) in map {
+        match parse_entry(name, value) {
+            Ok(Some(server)) => {
+                out.insert(name.clone(), server);
+            }
+            Ok(None) => {
+                tracing::debug!(name, source, "skipping unrecognised MCP server entry");
+            }
+            Err(e) => {
+                tracing::warn!(name, source, error = %e, "failed to parse MCP server entry; skipping");
+            }
+        }
+    }
 }
 
 fn parse_toml_entry(name: &str, value: &toml::Value) -> Result<Option<McpServer>> {
@@ -282,7 +306,7 @@ mod tests {
               }
             }"#,
         );
-        let servers = load_servers(f.path()).unwrap();
+        let servers = load_servers(f.path(), std::path::Path::new("/workspace")).unwrap();
         let pairs: Vec<_> = servers
             .iter()
             .map(|s| (s.name(), s.transport_label()))
@@ -337,7 +361,7 @@ args = ["server.js"]
               }
             }"#,
         );
-        let servers = load_servers(f.path()).unwrap();
+        let servers = load_servers(f.path(), std::path::Path::new("/workspace")).unwrap();
         let McpServer::Stdio(server) = &servers[0] else {
             panic!("expected stdio server");
         };
@@ -356,12 +380,76 @@ args = ["server.js"]
     #[test]
     fn empty_when_no_mcp_servers() {
         let f = write(r#"{"hasCompletedOnboarding": true}"#);
-        assert!(load_servers(f.path()).unwrap().is_empty());
+        assert!(
+            load_servers(f.path(), std::path::Path::new("/workspace"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn missing_file_is_fine() {
         let p = std::env::temp_dir().join("definitely-missing-claude.json");
-        assert!(load_servers(&p).unwrap().is_empty());
+        assert!(
+            load_servers(&p, std::path::Path::new("/workspace"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn loads_current_project_mcp_servers() {
+        let f = write(
+            r#"{
+              "mcpServers": {
+                "global": {"command": "global-cmd"}
+              },
+              "projects": {
+                "/workspace": {
+                  "mcpServers": {
+                    "project": {"type": "http", "url": "https://project.example/mcp"}
+                  }
+                },
+                "/other": {
+                  "mcpServers": {
+                    "other": {"command": "other-cmd"}
+                  }
+                }
+              }
+            }"#,
+        );
+
+        let servers = load_servers(f.path(), std::path::Path::new("/workspace")).unwrap();
+        let pairs: Vec<_> = servers
+            .iter()
+            .map(|s| (s.name(), s.transport_label()))
+            .collect();
+        assert_eq!(pairs, vec![("global", "stdio"), ("project", "http")]);
+    }
+
+    #[test]
+    fn project_mcp_server_overrides_top_level_same_name() {
+        let f = write(
+            r#"{
+              "mcpServers": {
+                "shared": {"command": "global-cmd"}
+              },
+              "projects": {
+                "/workspace": {
+                  "mcpServers": {
+                    "shared": {"command": "project-cmd", "args": ["--local"]}
+                  }
+                }
+              }
+            }"#,
+        );
+
+        let servers = load_servers(f.path(), std::path::Path::new("/workspace")).unwrap();
+        assert_eq!(servers.len(), 1);
+        let McpServer::Stdio(server) = &servers[0] else {
+            panic!("expected stdio server");
+        };
+        assert_eq!(server.command, "project-cmd");
+        assert_eq!(server.args, vec!["--local"]);
     }
 }

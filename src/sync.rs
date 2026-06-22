@@ -3,12 +3,13 @@
 //!
 //! What moves across:
 //! - `~/.claude.json` — top-level preferences, onboarding flags, per-project
-//!   settings for the current workspace. MCP server definitions are stripped
-//!   (Phase 3 will reintroduce them via an in-container proxy). Other
-//!   `projects.<path>` entries are dropped so the container only sees its
-//!   own workspace. The container uses the same absolute workspace path as
-//!   the host so Claude Code resume keys stay stable across native and
-//!   containerised runs.
+//!   settings for the current workspace. MCP server definitions from both
+//!   top-level and the current project are collected separately and
+//!   reintroduced via the broker; raw MCP definitions are stripped from the
+//!   staged copy. Other `projects.<path>` entries are dropped so the
+//!   container only sees its own workspace. The container uses the same
+//!   absolute workspace path as the host so Claude Code resume keys stay
+//!   stable across native and containerised runs.
 //! - `~/.claude/settings.json` — user-level settings, copied as-is.
 //! - `~/.claude/skills/`, `~/.claude/commands/`, `~/.claude/agents/` — user-
 //!   authored extensions (custom skills, slash commands, subagents).

@@ -55,7 +55,7 @@ pub fn resolve_scope_opt(global: bool, workspace: bool) -> Option<Scope> {
 pub async fn run_editor(initial_scope: Scope) -> Result<()> {
     let host = HostPaths::detect()?;
 
-    let claude_servers = mcp::load_servers(&host.home.join(".claude.json"))
+    let claude_servers = mcp::load_servers(&host.home.join(".claude.json"), &host.workspace)
         .context("failed to load MCP servers from ~/.claude.json")?;
     let codex_servers = mcp::load_codex_servers(&host.home.join(".codex/config.toml"))
         .context("failed to load MCP servers from ~/.codex/config.toml")?;
@@ -79,7 +79,7 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
 
     if claude_servers.is_empty() {
         eprintln!(
-            "[agent-container] note: no MCP servers declared in ~/.claude.json; the Claude Code MCP tab will be empty."
+            "[agent-container] note: no MCP servers declared in ~/.claude.json top-level or current project; the Claude Code MCP tab will be empty."
         );
     }
     if codex_servers.is_empty() {

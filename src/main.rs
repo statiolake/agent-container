@@ -302,7 +302,7 @@ fn load_agent_mcp_servers(
     agent: AgentKind,
 ) -> Result<Vec<mcp::McpServer>> {
     match agent {
-        AgentKind::Claude => mcp::load_servers(&host.home.join(".claude.json"))
+        AgentKind::Claude => mcp::load_servers(&host.home.join(".claude.json"), &host.workspace)
             .context("failed to load MCP servers from ~/.claude.json"),
         AgentKind::Codex => mcp::load_codex_servers(&host.home.join(".codex/config.toml"))
             .context("failed to load MCP servers from ~/.codex/config.toml"),
@@ -568,7 +568,7 @@ async fn run_cmd(
         &host.home.join(".claude.json"),
     )
     .context("failed to read awsAuthRefresh from ~/.claude/settings.json or ~/.claude.json")?;
-    let claude_mcp_servers = mcp::load_servers(&host.home.join(".claude.json"))
+    let claude_mcp_servers = mcp::load_servers(&host.home.join(".claude.json"), &host.workspace)
         .context("failed to load MCP servers from ~/.claude.json")?;
     let codex_mcp_servers = mcp::load_codex_servers(&host.home.join(".codex/config.toml"))
         .context("failed to load MCP servers from ~/.codex/config.toml")?;
@@ -798,7 +798,8 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     )
     .ok()
     .flatten();
-    let claude_mcp_servers = mcp::load_servers(&host.home.join(".claude.json")).unwrap_or_default();
+    let claude_mcp_servers =
+        mcp::load_servers(&host.home.join(".claude.json"), &host.workspace).unwrap_or_default();
     let codex_mcp_servers =
         mcp::load_codex_servers(&host.home.join(".codex/config.toml")).unwrap_or_default();
     let merged_settings = settings::Settings::load_merged(&host.workspace).unwrap_or_default();

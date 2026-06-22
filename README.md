@@ -158,10 +158,10 @@ Codex, with a checkbox per tool:
 
 Tools default to the upstream's `readOnlyHint` annotation (read-only on,
 destructive off). The allowlist lives in agent-container `settings.toml`:
-Claude Code uses `[claude_code.mcp]` for servers from `~/.claude.json`,
-Codex uses `[codex.mcp]` for servers from `~/.codex/config.toml`, and
-legacy top-level `[mcp]` is still read as Claude Code policy then migrated
-on save.
+Claude Code uses `[claude_code.mcp]` for servers from `~/.claude.json`
+(top-level plus the current project's entry), Codex uses `[codex.mcp]` for
+servers from `~/.codex/config.toml`, and legacy top-level `[mcp]` is still
+read as Claude Code policy then migrated on save.
 
 ### Drop into the container for troubleshooting
 
@@ -251,9 +251,11 @@ created agent container with `docker cp -`, and bind-mounts only the explicit
 host history/auth paths into the container's ephemeral `$HOME`:
 
 - `~/.claude.json` — top-level preferences and the current workspace's
-  project entry, with `mcpServers` / `env` / `hooks` / `permissions` /
-  `sandbox` stripped. Every other project entry is dropped because
-  their keys are host-absolute paths.
+  project entry. Top-level and current-project `mcpServers` are collected
+  and rewritten through the agent-container broker; raw `mcpServers` /
+  `env` / `hooks` / `permissions` / `sandbox` values are stripped from the
+  staged copy. Every other project entry is dropped because their keys are
+  host-absolute paths.
 - `~/.claude/settings.json` — same stripping.
 - `~/.claude/commands/`, `~/.claude/agents/`, `~/.claude/skills/` —
   user-authored slash commands, subagents and skills are mirrored.
