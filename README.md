@@ -36,6 +36,7 @@ shrinks the blast radius to "whatever is in the current workspace":
 │   │   concurrent containers via flock — the last container out │
 │   │   writes refreshed tokens back and unlinks the shared copy │
 │   ├─ bind-mounts host ~/.codex/auth.json directly for Codex    │
+│   ├─ bind-mounts host ~/.cursor for Cursor Agent state         │
 │   ├─ spawns a broker HTTP server on 127.0.0.1:<random>         │
 │   │   serving /aws/credentials + /mcp/<name>/...               │
 │   └─ runs `docker compose -p agent-container-<pid>` with:      │
@@ -53,7 +54,8 @@ shrinks the blast radius to "whatever is in the current workspace":
 │   │   [jail bridge, --internal]                           │    │
 │   │     │                                                 │    │
 │   │   ┌─┴─────────┐                                       │    │
-│   │   │  agent    │  claude / codex, workspace bind-mount │    │
+│   │   │  agent    │  claude / codex / cursor, workspace   │    │
+│   │   │           │  bind-mount                           │    │
 │   │   │           │  HTTPS_PROXY → proxy                  │    │
 │   │   └───────────┘                                       │    │
 │   └───────────────────────────────────────────────────────┘    │
@@ -73,8 +75,8 @@ coordinates that exist on their side of the bridge.
 
 - macOS with Docker Desktop (primary test target)
 - Rust toolchain to build the CLI
-- Claude Code and/or Codex installed on the host, already logged in
-  (`claude /login`, `codex login`)
+- Claude Code, Codex, and/or Cursor Agent installed on the host, already
+  logged in (`claude /login`, `codex login`, `cursor agent login`)
 - `aws` CLI on `PATH` if you use the Bedrock pathway
 
 Linux with native Docker probably works too — `host.docker.internal` is
@@ -99,18 +101,20 @@ The container images (`agent-container:dev` and
 ```sh
 agent-container run                         # Claude Code
 agent-container run --agent codex           # Codex
+agent-container run --agent cursor          # Cursor Agent with --yolo
 agent-container run --rebuild-image         # rebuild agent-container:dev first
 agent-container run --tmux                  # run the agent inside tmux
 agent-container run --agent codex -- exec "what does this repo do?"
 ```
 
 `agent-container run` defaults to Claude Code unless
-`[general] default_agent = "codex"` is set with `agent-container config`.
+`[general] default_agent = "codex"` or `"cursor"` is set with
+`agent-container config`.
 An explicit `--agent` flag always wins over the setting.
 
-Both agents' auth is bind-mounted regardless of which one is the
-primary, so a Claude session can call `codex exec …` as a shell tool
-and vice versa. In either mode the workspace is the current directory,
+Supported agents' auth/state is prepared regardless of which one is the
+primary, so a Claude session can call `codex exec …` or `cursor agent …`
+as a shell tool and vice versa. In either mode the workspace is the current directory,
 mounted at the same absolute path inside the container, and the host
 `~/.claude/projects/` tree keeps Claude Code session history visible
 even if Claude Code changes how it names per-workspace session
@@ -120,6 +124,15 @@ directories. Codex history/resume files under `~/.codex/sessions`,
 the host, so sessions created in the container are visible to host Codex too.
 The agent image also includes Python 3 as `python`, plus `openpyxl` for
 basic XLSX inspection and generation inside the container.
+
+Cursor Agent runs as `cursor-agent --yolo`. Host `~/.cursor` is mounted at
+`/home/agent/.cursor`, with `CURSOR_CONFIG_DIR` and `CURSOR_DATA_DIR` pointing
+there. Cursor's macOS login stores secret tokens in Keychain, which a Linux
+container cannot read by bind-mounting files. For non-interactive inherited
+auth, set `CURSOR_API_KEY` on the host; agent-container forwards Cursor-only
+auth env vars (`CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`) when they are explicitly
+set. The Cursor Agent bundle also accepts `--api-key`/`--auth-token` if you
+prefer passing credentials for a single run.
 
 The workspace mount is writable, but `<workspace>/.agent-container` is
 read-only by default. It is overlaid as read-only at the same path inside
@@ -291,6 +304,9 @@ host history/auth paths into the container's ephemeral `$HOME`:
   `~/.codex/session_index.jsonl`, and `~/.codex/history.jsonl` are mounted
   at Codex's normal history paths. Container-created sessions are written
   back to the host history.
+- Cursor Agent state — host `~/.cursor` is mounted at `/home/agent/.cursor`
+  so CLI config, chats, project trust, plugins and skills are visible to the
+  in-container Cursor Agent.
 
 Everything else your agents need is left to the container itself and is
 discarded with the container. Host-visible state only persists when it is
@@ -337,7 +353,9 @@ task-runner timeout.
   a `flock` decides which process writes the refreshed token back to
   Keychain on exit. Codex mounts `~/.codex/auth.json` directly, so host
   and container stay on the same file instead of carrying separate
-  refresh-token copies.
+  refresh-token copies. Cursor's normal macOS login also uses Keychain, so
+  container auth should use an explicit Cursor API key unless Cursor exposes
+  a portable token store in a future CLI release.
 
 ## License
 

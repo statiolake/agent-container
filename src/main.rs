@@ -4,6 +4,7 @@ mod codex;
 mod config_cmd;
 mod container_notice;
 mod creds;
+mod cursor;
 mod docker;
 mod host_fs;
 mod host_kind;
@@ -237,6 +238,11 @@ async fn mcp_list_cmd(host: &paths::HostPaths, agent: AgentKind) -> Result<()> {
     let policy = match agent {
         AgentKind::Claude => &settings.claude_code.mcp,
         AgentKind::Codex => &settings.codex.mcp,
+        AgentKind::Cursor => {
+            println!("MCP servers for {agent:?}:");
+            println!("  (Cursor MCP policy is not managed by agent-container yet)");
+            return Ok(());
+        }
     };
     let oauth_entries = oauth::load_from_keychain().unwrap_or_else(|e| {
         eprintln!("[agent-container] warning: failed to read MCP OAuth records: {e:#}");
@@ -318,6 +324,7 @@ fn load_agent_mcp_servers(
             .context("failed to load MCP servers from ~/.claude.json"),
         AgentKind::Codex => mcp::load_codex_servers(&host.home.join(".codex/config.toml"))
             .context("failed to load MCP servers from ~/.codex/config.toml"),
+        AgentKind::Cursor => Ok(Vec::new()),
     }
 }
 
@@ -650,8 +657,21 @@ async fn run_cmd(
     // (e.g. Claude's bash tool calling `codex exec ...` or vice versa).
     let claude_is_primary = matches!(agent, AgentKind::Claude);
     let codex_is_primary = matches!(agent, AgentKind::Codex);
+    let cursor_is_primary = matches!(agent, AgentKind::Cursor);
     let claude_creds = prepare_claude_credentials(&host, claude_is_primary, bedrock.is_some())?;
     let codex_auth = prepare_codex_auth(&host, codex_is_primary)?;
+    if cursor_is_primary && !cursor::has_portable_auth_env() {
+        let config_note = if cursor::has_host_cli_config(&host.home) {
+            " Host ~/.cursor/cli-config.json is present, but Cursor's macOS CLI tokens are stored in Keychain and cannot be bind-mounted into the Linux container."
+        } else {
+            " Host ~/.cursor/cli-config.json was not found either."
+        };
+        eprintln!(
+            "[agent-container] note: Cursor portable auth env was not detected.{config_note} cursor-agent may ask you to run `cursor-agent login` in the container or set CURSOR_API_KEY/CURSOR_AUTH_TOKEN on the host."
+        );
+    }
+    let cursor_state =
+        cursor::prepare_state(&host.home).context("failed to prepare Cursor state directory")?;
 
     docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
         .await
@@ -706,6 +726,7 @@ async fn run_cmd(
         credentials_path,
         codex_auth_path,
         codex_history,
+        cursor_state_path: cursor_state.path,
         bedrock_setup: bedrock,
         broker_url_from_container: brokers.claude_url_from_container.clone(),
         agent_command,
@@ -769,6 +790,7 @@ fn agent_kind_from_default(agent: settings::DefaultAgent) -> AgentKind {
     match agent {
         settings::DefaultAgent::Claude => AgentKind::Claude,
         settings::DefaultAgent::Codex => AgentKind::Codex,
+        settings::DefaultAgent::Cursor => AgentKind::Cursor,
     }
 }
 
@@ -780,8 +802,10 @@ fn agent_command(agent: AgentKind, tmux: bool, tmux_prefix: &str) -> Result<Vec<
             "bypassPermissions".to_string(),
         ]),
         (AgentKind::Codex, false) => Ok(vec!["codex".to_string()]),
+        (AgentKind::Cursor, false) => Ok(vec!["cursor-agent".to_string(), "--yolo".to_string()]),
         (AgentKind::Claude, true) => claude_tmux_agent_command(tmux_prefix),
         (AgentKind::Codex, true) => codex_tmux_agent_command(tmux_prefix),
+        (AgentKind::Cursor, true) => cursor_tmux_agent_command(tmux_prefix),
     }
 }
 
@@ -830,6 +854,30 @@ fn codex_tmux_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
         ]
         .join(" "),
         "agent-container-codex".to_string(),
+    ])
+}
+
+fn cursor_tmux_agent_command(tmux_prefix: &str) -> Result<Vec<String>> {
+    validate_tmux_key(tmux_prefix)?;
+    Ok(vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        [
+            "exec tmux -f /dev/null",
+            "start-server \\;",
+            "set-option -s escape-time 0 \\;",
+            "set-option -g default-terminal tmux-256color \\;",
+            "set-option -g focus-events on \\;",
+            "set-option -g mouse on \\;",
+            &format!("set-option -g prefix {tmux_prefix} \\;"),
+            &format!("bind-key {tmux_prefix} send-prefix \\;"),
+            "bind-key -T root WheelUpPane send-keys -M \\;",
+            "bind-key -T root WheelDownPane send-keys -M \\;",
+            "bind-key -T root MouseDrag1Pane send-keys -M \\;",
+            "new-session -A -s cursor-agent -- cursor-agent --yolo \"$@\"",
+        ]
+        .join(" "),
+        "agent-container-cursor".to_string(),
     ])
 }
 
@@ -894,6 +942,8 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
             None
         }
     };
+    let cursor_state =
+        cursor::prepare_state(&host.home).context("failed to prepare Cursor state directory")?;
 
     docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
         .await
@@ -955,6 +1005,7 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         credentials_path,
         codex_auth_path,
         codex_history,
+        cursor_state_path: cursor_state.path,
         bedrock_setup: bedrock,
         broker_url_from_container: brokers.claude_url_from_container.clone(),
         agent_command,
@@ -1086,6 +1137,13 @@ mod tests {
     }
 
     #[test]
+    fn cursor_runs_directly_with_yolo() {
+        let command = agent_command(AgentKind::Cursor, false, "C-q;touch").unwrap();
+
+        assert_eq!(command, ["cursor-agent", "--yolo"]);
+    }
+
+    #[test]
     fn claude_runs_in_tmux_with_mouse_and_configured_prefix() {
         let command = agent_command(AgentKind::Claude, true, "C-q").unwrap();
         let script = &command[2];
@@ -1119,6 +1177,19 @@ mod tests {
         assert!(script.contains("bind-key -T root WheelDownPane send-keys -M"));
         assert!(script.contains("bind-key -T root MouseDrag1Pane send-keys -M"));
         assert!(script.contains("new-session -A -s codex"));
+    }
+
+    #[test]
+    fn cursor_runs_in_tmux_with_mouse_and_configured_prefix() {
+        let command = agent_command(AgentKind::Cursor, true, "C-q").unwrap();
+        let script = &command[2];
+
+        assert!(script.contains("exec tmux -f /dev/null"));
+        assert!(script.contains("set-option -g mouse on"));
+        assert!(script.contains("set-option -s escape-time 0"));
+        assert!(script.contains("set-option -g prefix C-q"));
+        assert!(script.contains("bind-key C-q send-prefix"));
+        assert!(script.contains("new-session -A -s cursor-agent -- cursor-agent --yolo"));
     }
 
     #[test]

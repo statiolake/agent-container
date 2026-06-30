@@ -483,8 +483,12 @@ impl TaskField {
     }
 }
 
-const DEFAULT_AGENT_CHOICES: [Option<DefaultAgent>; 3] =
-    [None, Some(DefaultAgent::Claude), Some(DefaultAgent::Codex)];
+const DEFAULT_AGENT_CHOICES: [Option<DefaultAgent>; 4] = [
+    None,
+    Some(DefaultAgent::Claude),
+    Some(DefaultAgent::Codex),
+    Some(DefaultAgent::Cursor),
+];
 
 const BYPASS_WARNING_CHOICES: [Option<bool>; 3] = [None, Some(false), Some(true)];
 

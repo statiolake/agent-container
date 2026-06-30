@@ -81,6 +81,7 @@ pub struct RunOptions {
     pub credentials_path: PathBuf,
     pub codex_auth_path: PathBuf,
     pub codex_history: crate::codex::CodexHistoryMounts,
+    pub cursor_state_path: PathBuf,
     pub bedrock_setup: Option<BedrockSetup>,
     /// Pre-built `http://<host>:<port>` URL the container should use to
     /// reach the broker. The hostname encodes the engine-flavour choice
@@ -171,6 +172,10 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
             "CODEX_HISTORY_PATH",
             opts.codex_history.history_path.display().to_string(),
         ),
+        (
+            "HOST_CURSOR_DIR",
+            opts.cursor_state_path.display().to_string(),
+        ),
         ("ALLOWLIST_PATH", allowlist_path.display().to_string()),
         ("HOST_UID", uid.to_string()),
         ("HOST_GID", gid.to_string()),
@@ -226,6 +231,17 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         "AWS_DEFAULT_REGION",
     ] {
         env.entry(key.to_string()).or_default();
+    }
+
+    // Cursor Agent supports API-key and direct token envs. Unlike generic
+    // AWS env, these are scoped to Cursor authentication and are only
+    // forwarded when the host explicitly set them.
+    for key in ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"] {
+        if let Ok(v) = std::env::var(key) {
+            env.insert(key.to_string(), v);
+        } else {
+            env.entry(key.to_string()).or_default();
+        }
     }
 
     let ctx = ComposeCtx {
@@ -973,5 +989,23 @@ mod tests {
             compose.contains("AWS_PROFILE=${AWS_PROFILE:-}"),
             "agent service should receive the selected Bedrock profile"
         );
+    }
+
+    #[test]
+    fn compose_mounts_cursor_state_and_auth_env() {
+        let compose = include_str!("../docker/compose.yml");
+        assert!(compose.contains("${HOST_CURSOR_DIR}:/home/agent/.cursor"));
+        assert!(compose.contains("CURSOR_CONFIG_DIR=/home/agent/.cursor"));
+        assert!(compose.contains("CURSOR_API_KEY=${CURSOR_API_KEY:-}"));
+        assert!(compose.contains("CURSOR_AUTH_TOKEN=${CURSOR_AUTH_TOKEN:-}"));
+        assert!(!compose.contains("CURSOR_OAUTH2_AUTH_TOKEN"));
+    }
+
+    #[test]
+    fn agent_image_installs_cursor_agent() {
+        let dockerfile = include_str!("../docker/Dockerfile");
+        assert!(dockerfile.contains("https://cursor.com/install"));
+        assert!(dockerfile.contains("/usr/local/bin/cursor-agent"));
+        assert!(dockerfile.contains("exec cursor-agent"));
     }
 }

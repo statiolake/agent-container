@@ -112,6 +112,7 @@ pub enum Commands {
 pub enum AgentKind {
     Claude,
     Codex,
+    Cursor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -155,6 +156,7 @@ const TOP_LEVEL_EXAMPLES: &str = r#"Examples:
   agent-container run
   agent-container run --rebuild-image
   agent-container run --agent codex
+  agent-container run --agent cursor
   agent-container run --agent claude --bedrock-profile sandbox-bedrock
   agent-container run --agent claude --bedrock-profile sandbox-bedrock --bedrock-region us-west-2
   agent-container run --tmux
@@ -388,6 +390,28 @@ mod tests {
             panic!("expected run command");
         };
         assert_eq!(bedrock_region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn run_cursor_agent_is_a_real_option() {
+        let cli = Cli::try_parse_from([
+            "agent-container",
+            "run",
+            "--agent",
+            "cursor",
+            "--",
+            "fix it",
+        ])
+        .unwrap();
+
+        let Commands::Run {
+            agent, passthrough, ..
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert_eq!(agent, Some(AgentKind::Cursor));
+        assert_eq!(passthrough, ["fix it"]);
     }
 
     #[test]

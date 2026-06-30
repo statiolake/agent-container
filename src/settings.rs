@@ -99,6 +99,7 @@ pub enum DefaultAgent {
     #[default]
     Claude,
     Codex,
+    Cursor,
 }
 
 impl DefaultAgent {
@@ -106,6 +107,7 @@ impl DefaultAgent {
         match self {
             DefaultAgent::Claude => "Claude Code",
             DefaultAgent::Codex => "Codex",
+            DefaultAgent::Cursor => "Cursor Agent",
         }
     }
 }

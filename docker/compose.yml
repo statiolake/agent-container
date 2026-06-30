@@ -51,6 +51,10 @@ services:
       - AWS_PROFILE=${AWS_PROFILE:-}
       - AWS_REGION=${AWS_REGION:-}
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-}
+      - CURSOR_CONFIG_DIR=/home/agent/.cursor
+      - CURSOR_DATA_DIR=/home/agent/.cursor
+      - CURSOR_API_KEY=${CURSOR_API_KEY:-}
+      - CURSOR_AUTH_TOKEN=${CURSOR_AUTH_TOKEN:-}
       - AGENT_CONTAINER_HOST_ENDPOINT=${AGENT_CONTAINER_HOST_ENDPOINT}
     volumes:
       # /home/agent is the container image's ephemeral home. Only explicit
@@ -66,6 +70,7 @@ services:
       - "${CODEX_SHELL_SNAPSHOTS_DIR}:/home/agent/.codex/shell_snapshots"
       - "${CODEX_SESSION_INDEX_PATH}:/home/agent/.codex/session_index.jsonl"
       - "${CODEX_HISTORY_PATH}:/home/agent/.codex/history.jsonl"
+      - "${HOST_CURSOR_DIR}:/home/agent/.cursor"
     user: "${HOST_UID}:${HOST_GID}"
     working_dir: "${CONTAINER_WORKSPACE_PATH}"
     stdin_open: true

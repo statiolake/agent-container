@@ -23,12 +23,27 @@ RUN apt-get update \
 RUN npm install -g @anthropic-ai/claude-code@latest @openai/codex \
     && npm cache clean --force
 
+RUN curl -fsSL https://cursor.com/install | HOME=/opt/cursor-agent bash \
+    && chmod -R a+rX /opt/cursor-agent/.local \
+    && ln -sf /opt/cursor-agent/.local/bin/cursor-agent /usr/local/bin/cursor-agent \
+    && printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -euo pipefail' \
+        'if [ "${1:-}" = "agent" ]; then' \
+        '  shift' \
+        '  exec cursor-agent "$@"' \
+        'fi' \
+        'echo "Only Cursor Agent is available in this container; use: cursor agent ..." >&2' \
+        'exit 64' \
+        > /usr/local/bin/cursor \
+    && chmod +x /usr/local/bin/cursor
+
 # Writable home for an arbitrary UID passed via `docker run --user`.
 # Pre-create /home/agent/.claude so that bind-mounts of its children (e.g.
 # .credentials.json, project history, CLAUDE.md) don't leave the parent
 # owned by root and blocking Claude Code from creating sibling dirs like
 # session-env at runtime.
-RUN mkdir -p /home/agent/.claude /home/agent/.codex \
+RUN mkdir -p /home/agent/.claude /home/agent/.codex /home/agent/.cursor \
     && chmod -R 1777 /home/agent
 
 ENV HOME=/home/agent
