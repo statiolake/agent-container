@@ -4,8 +4,20 @@ pub const CLAUDE_CODE_CREDENTIALS_SERVICE: &str = "Claude Code-credentials";
 
 #[cfg(target_os = "macos")]
 pub fn read_generic_password(service: &str) -> Result<Option<String>> {
-    let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-w", "-s", service])
+    read_generic_password_for_account(service, None)
+}
+
+#[cfg(target_os = "macos")]
+pub fn read_generic_password_for_account(
+    service: &str,
+    account: Option<&str>,
+) -> Result<Option<String>> {
+    let mut cmd = std::process::Command::new("security");
+    cmd.args(["find-generic-password", "-w", "-s", service]);
+    if let Some(account) = account {
+        cmd.args(["-a", account]);
+    }
+    let output = cmd
         .output()
         .context("failed to invoke `security` command")?;
     if !output.status.success() {

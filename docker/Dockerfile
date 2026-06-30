@@ -43,7 +43,7 @@ RUN curl -fsSL https://cursor.com/install | HOME=/opt/cursor-agent bash \
 # .credentials.json, project history, CLAUDE.md) don't leave the parent
 # owned by root and blocking Claude Code from creating sibling dirs like
 # session-env at runtime.
-RUN mkdir -p /home/agent/.claude /home/agent/.codex /home/agent/.cursor \
+RUN mkdir -p /home/agent/.claude /home/agent/.codex /home/agent/.cursor /home/agent/.config/cursor \
     && chmod -R 1777 /home/agent
 
 ENV HOME=/home/agent

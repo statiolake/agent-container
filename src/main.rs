@@ -660,7 +660,12 @@ async fn run_cmd(
     let cursor_is_primary = matches!(agent, AgentKind::Cursor);
     let claude_creds = prepare_claude_credentials(&host, claude_is_primary, bedrock.is_some())?;
     let codex_auth = prepare_codex_auth(&host, codex_is_primary)?;
-    if cursor_is_primary && !cursor::has_portable_auth_env() {
+    let cursor_files =
+        cursor::prepare(&host.home).context("failed to prepare Cursor state and auth files")?;
+    if cursor_is_primary
+        && !cursor::has_portable_auth_env()
+        && !cursor_files.auth_file.host_auth_found
+    {
         let config_note = if cursor::has_host_cli_config(&host.home) {
             " Host ~/.cursor/cli-config.json is present, but Cursor's macOS CLI tokens are stored in Keychain and cannot be bind-mounted into the Linux container."
         } else {
@@ -670,8 +675,6 @@ async fn run_cmd(
             "[agent-container] note: Cursor portable auth env was not detected.{config_note} cursor-agent may ask you to run `cursor-agent login` in the container or set CURSOR_API_KEY/CURSOR_AUTH_TOKEN on the host."
         );
     }
-    let cursor_state =
-        cursor::prepare_state(&host.home).context("failed to prepare Cursor state directory")?;
 
     docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
         .await
@@ -726,7 +729,8 @@ async fn run_cmd(
         credentials_path,
         codex_auth_path,
         codex_history,
-        cursor_state_path: cursor_state.path,
+        cursor_state_path: cursor_files.state_dir.path,
+        cursor_auth_path: cursor_files.auth_file.path,
         bedrock_setup: bedrock,
         broker_url_from_container: brokers.claude_url_from_container.clone(),
         agent_command,
@@ -942,8 +946,8 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
             None
         }
     };
-    let cursor_state =
-        cursor::prepare_state(&host.home).context("failed to prepare Cursor state directory")?;
+    let cursor_files =
+        cursor::prepare(&host.home).context("failed to prepare Cursor state and auth files")?;
 
     docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
         .await
@@ -1005,7 +1009,8 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         credentials_path,
         codex_auth_path,
         codex_history,
-        cursor_state_path: cursor_state.path,
+        cursor_state_path: cursor_files.state_dir.path,
+        cursor_auth_path: cursor_files.auth_file.path,
         bedrock_setup: bedrock,
         broker_url_from_container: brokers.claude_url_from_container.clone(),
         agent_command,

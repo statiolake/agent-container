@@ -82,6 +82,7 @@ pub struct RunOptions {
     pub codex_auth_path: PathBuf,
     pub codex_history: crate::codex::CodexHistoryMounts,
     pub cursor_state_path: PathBuf,
+    pub cursor_auth_path: PathBuf,
     pub bedrock_setup: Option<BedrockSetup>,
     /// Pre-built `http://<host>:<port>` URL the container should use to
     /// reach the broker. The hostname encodes the engine-flavour choice
@@ -175,6 +176,10 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         (
             "HOST_CURSOR_DIR",
             opts.cursor_state_path.display().to_string(),
+        ),
+        (
+            "CURSOR_AUTH_PATH",
+            opts.cursor_auth_path.display().to_string(),
         ),
         ("ALLOWLIST_PATH", allowlist_path.display().to_string()),
         ("HOST_UID", uid.to_string()),
@@ -995,6 +1000,7 @@ mod tests {
     fn compose_mounts_cursor_state_and_auth_env() {
         let compose = include_str!("../docker/compose.yml");
         assert!(compose.contains("${HOST_CURSOR_DIR}:/home/agent/.cursor"));
+        assert!(compose.contains("${CURSOR_AUTH_PATH}:/home/agent/.config/cursor/auth.json"));
         assert!(compose.contains("CURSOR_CONFIG_DIR=/home/agent/.cursor"));
         assert!(compose.contains("CURSOR_API_KEY=${CURSOR_API_KEY:-}"));
         assert!(compose.contains("CURSOR_AUTH_TOKEN=${CURSOR_AUTH_TOKEN:-}"));

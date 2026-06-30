@@ -71,6 +71,7 @@ services:
       - "${CODEX_SESSION_INDEX_PATH}:/home/agent/.codex/session_index.jsonl"
       - "${CODEX_HISTORY_PATH}:/home/agent/.codex/history.jsonl"
       - "${HOST_CURSOR_DIR}:/home/agent/.cursor"
+      - "${CURSOR_AUTH_PATH}:/home/agent/.config/cursor/auth.json"
     user: "${HOST_UID}:${HOST_GID}"
     working_dir: "${CONTAINER_WORKSPACE_PATH}"
     stdin_open: true

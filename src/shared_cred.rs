@@ -39,6 +39,15 @@ pub enum HostSync {
         service: String,
         account: Option<String>,
     },
+    /// macOS Cursor Agent: update the individual Keychain items that
+    /// Cursor's credential manager uses, from the Linux-side auth.json.
+    #[cfg(target_os = "macos")]
+    CursorKeychain {
+        account: String,
+        access_token_service: String,
+        refresh_token_service: String,
+        api_key_service: String,
+    },
     /// Linux: atomically replace the host file.
     #[cfg(any(not(target_os = "macos"), test))]
     File(PathBuf),
@@ -186,6 +195,19 @@ impl HostSync {
             HostSync::Keychain { service, account } => {
                 crate::keychain::write_generic_password(service, account.as_deref(), raw)
             }
+            #[cfg(target_os = "macos")]
+            HostSync::CursorKeychain {
+                account,
+                access_token_service,
+                refresh_token_service,
+                api_key_service,
+            } => crate::cursor::write_keychain_auth(
+                account,
+                access_token_service,
+                refresh_token_service,
+                api_key_service,
+                raw,
+            ),
             #[cfg(any(not(target_os = "macos"), test))]
             HostSync::File(path) => {
                 if let Some(parent) = path.parent() {

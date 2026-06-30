@@ -127,12 +127,13 @@ basic XLSX inspection and generation inside the container.
 
 Cursor Agent runs as `cursor-agent --yolo`. Host `~/.cursor` is mounted at
 `/home/agent/.cursor`, with `CURSOR_CONFIG_DIR` and `CURSOR_DATA_DIR` pointing
-there. Cursor's macOS login stores secret tokens in Keychain, which a Linux
-container cannot read by bind-mounting files. For non-interactive inherited
-auth, set `CURSOR_API_KEY` on the host; agent-container forwards Cursor-only
-auth env vars (`CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`) when they are explicitly
-set. The Cursor Agent bundle also accepts `--api-key`/`--auth-token` if you
-prefer passing credentials for a single run.
+there. Cursor's macOS CLI stores secret tokens in Keychain, while the Linux
+agent reads `$XDG_CONFIG_HOME/cursor/auth.json`; agent-container bridges that
+split by materialising a per-run auth.json from the host Keychain and writing
+refreshed values back when the last container exits. It also forwards
+Cursor-only auth env vars (`CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`) when they are
+explicitly set. The Cursor Agent bundle accepts `--api-key`/`--auth-token` if
+you prefer passing credentials for a single run.
 
 The workspace mount is writable, but `<workspace>/.agent-container` is
 read-only by default. It is overlaid as read-only at the same path inside
@@ -304,9 +305,11 @@ host history/auth paths into the container's ephemeral `$HOME`:
   `~/.codex/session_index.jsonl`, and `~/.codex/history.jsonl` are mounted
   at Codex's normal history paths. Container-created sessions are written
   back to the host history.
-- Cursor Agent state — host `~/.cursor` is mounted at `/home/agent/.cursor`
+- Cursor Agent state/auth — host `~/.cursor` is mounted at `/home/agent/.cursor`
   so CLI config, chats, project trust, plugins and skills are visible to the
-  in-container Cursor Agent.
+  in-container Cursor Agent. Cursor auth is separately mounted at
+  `/home/agent/.config/cursor/auth.json`, because that is where the Linux
+  Cursor credential manager reads it.
 
 Everything else your agents need is left to the container itself and is
 discarded with the container. Host-visible state only persists when it is
@@ -353,9 +356,9 @@ task-runner timeout.
   a `flock` decides which process writes the refreshed token back to
   Keychain on exit. Codex mounts `~/.codex/auth.json` directly, so host
   and container stay on the same file instead of carrying separate
-  refresh-token copies. Cursor's normal macOS login also uses Keychain, so
-  container auth should use an explicit Cursor API key unless Cursor exposes
-  a portable token store in a future CLI release.
+  refresh-token copies. Cursor's macOS login also uses Keychain, but its
+  Linux credential manager reads `auth.json`, so agent-container converts
+  between those stores at container start/last exit.
 
 ## License
 
