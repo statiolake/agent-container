@@ -378,6 +378,15 @@ fn strip_keys(obj: &mut serde_json::Map<String, Value>) {
     }
 }
 
+pub fn sanitize_claude_config_for_container(raw: &str) -> Result<String> {
+    let mut value: Value =
+        serde_json::from_str(raw).context("failed to parse Claude JSON config")?;
+    if let Some(obj) = value.as_object_mut() {
+        strip_keys(obj);
+    }
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
 fn inject_agent_teams_env(obj: &mut serde_json::Map<String, Value>) {
     let env = obj
         .entry("env".to_string())

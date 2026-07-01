@@ -591,7 +591,50 @@ fn prepare_secret_shadow_mounts(
             &mut mounts,
         )?;
     }
+    append_claude_project_config_shadow_mounts(
+        workspace,
+        container_workspace,
+        &shadow_root,
+        &mut mounts,
+    )?;
     Ok(mounts)
+}
+
+fn append_claude_project_config_shadow_mounts(
+    workspace: &Path,
+    container_workspace: &Path,
+    shadow_root: &Path,
+    mounts: &mut Vec<SecretShadowMount>,
+) -> Result<()> {
+    for relative in [
+        ".mcp.json",
+        ".claude/settings.json",
+        ".claude/settings.local.json",
+    ] {
+        let src = workspace.join(relative);
+        if !src.is_file() {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&src)
+            .with_context(|| format!("failed to read {}", src.display()))?;
+        let sanitized = crate::sync::sanitize_claude_config_for_container(&raw)
+            .with_context(|| format!("failed to sanitize {}", src.display()))?;
+        let dest = shadow_root
+            .join("sanitized-claude-project-config")
+            .join(relative);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to prepare {}", parent.display()))?;
+        }
+        std::fs::write(&dest, sanitized)
+            .with_context(|| format!("failed to write {}", dest.display()))?;
+        mounts.push(SecretShadowMount {
+            source: dest,
+            target: container_workspace.join(relative),
+            read_only: true,
+        });
+    }
+    Ok(())
 }
 
 fn collect_secret_shadow_mounts(
@@ -885,8 +928,17 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".agent-container")).unwrap();
         std::fs::create_dir_all(workspace.join(".claude")).unwrap();
         std::fs::write(workspace.join(".env"), "secret").unwrap();
+        std::fs::write(
+            workspace.join(".mcp.json"),
+            r#"{"mcpServers":{"local":{"command":"/opt/host/bin/server"}},"allowed":"keep"}"#,
+        )
+        .unwrap();
         std::fs::write(workspace.join("private/token.txt"), "secret").unwrap();
-        std::fs::write(workspace.join(".claude/settings.json"), "{}").unwrap();
+        std::fs::write(
+            workspace.join(".claude/settings.json"),
+            r#"{"mcpServers":{"local":{"command":"/opt/host/bin/server"}},"theme":"dark"}"#,
+        )
+        .unwrap();
         std::fs::write(workspace.join("README.md"), "ok").unwrap();
 
         let policy = crate::settings::FilesystemPolicy {
@@ -912,6 +964,8 @@ mod tests {
         assert!(targets.contains(&"/workspace/blocked-dir".to_string()));
         assert!(targets.contains(&"/workspace/.agent-container".to_string()));
         assert!(targets.contains(&"/workspace/.claude".to_string()));
+        assert!(targets.contains(&"/workspace/.mcp.json".to_string()));
+        assert!(targets.contains(&"/workspace/.claude/settings.json".to_string()));
         assert!(!targets.contains(&"/workspace/README.md".to_string()));
         let file_mount = mounts
             .iter()
@@ -939,6 +993,20 @@ mod tests {
             agent_container_mount.source,
             std::fs::canonicalize(workspace.join(".agent-container")).unwrap()
         );
+        let mcp_json_mount = mounts
+            .iter()
+            .find(|mount| mount.target == Path::new("/workspace/.mcp.json"))
+            .unwrap();
+        let mcp_json = std::fs::read_to_string(&mcp_json_mount.source).unwrap();
+        assert!(!mcp_json.contains("mcpServers"));
+        assert!(mcp_json.contains("allowed"));
+        let settings_mount = mounts
+            .iter()
+            .find(|mount| mount.target == Path::new("/workspace/.claude/settings.json"))
+            .unwrap();
+        let settings = std::fs::read_to_string(&settings_mount.source).unwrap();
+        assert!(!settings.contains("mcpServers"));
+        assert!(settings.contains("theme"));
     }
 
     #[test]

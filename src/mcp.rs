@@ -49,37 +49,48 @@ impl McpServer {
 }
 
 /// Read every MCP server definition that Claude Code would apply to the
-/// current workspace: top-level `mcpServers` plus
-/// `projects.<workspace>.mcpServers`. Project-local entries override
-/// top-level entries with the same name.
+/// current workspace: top-level `mcpServers`,
+/// `projects.<workspace>.mcpServers`, and project-local config files in the
+/// workspace. Project-local entries override top-level entries with the same
+/// name.
 ///
 /// Entries the parser cannot classify are logged and skipped rather than
 /// returned as errors.
 pub fn load_servers(claude_json: &Path, workspace: &Path) -> Result<Vec<McpServer>> {
-    if !claude_json.is_file() {
-        return Ok(Vec::new());
-    }
-    let raw = fs::read_to_string(claude_json)
-        .with_context(|| format!("failed to read {}", claude_json.display()))?;
-    let cfg: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {} as JSON", claude_json.display()))?;
-
     let mut out = BTreeMap::new();
-    if let Some(map) = cfg.get("mcpServers").and_then(Value::as_object) {
-        insert_servers_from_map(&mut out, map, "top-level");
-    }
+    if claude_json.is_file() {
+        let raw = fs::read_to_string(claude_json)
+            .with_context(|| format!("failed to read {}", claude_json.display()))?;
+        let cfg: Value = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {} as JSON", claude_json.display()))?;
 
-    let workspace_key = workspace.display().to_string();
-    if let Some(map) = cfg
-        .get("projects")
-        .and_then(Value::as_object)
-        .and_then(|projects| projects.get(&workspace_key))
-        .and_then(Value::as_object)
-        .and_then(|project| project.get("mcpServers"))
-        .and_then(Value::as_object)
-    {
-        insert_servers_from_map(&mut out, map, "project");
+        if let Some(map) = cfg.get("mcpServers").and_then(Value::as_object) {
+            insert_servers_from_map(&mut out, map, "top-level");
+        }
+
+        let workspace_key = workspace.display().to_string();
+        if let Some(map) = cfg
+            .get("projects")
+            .and_then(Value::as_object)
+            .and_then(|projects| projects.get(&workspace_key))
+            .and_then(Value::as_object)
+            .and_then(|project| project.get("mcpServers"))
+            .and_then(Value::as_object)
+        {
+            insert_servers_from_map(&mut out, map, "project");
+        }
     }
+    insert_servers_from_json_file(&mut out, &workspace.join(".mcp.json"), "project .mcp.json")?;
+    insert_servers_from_json_file(
+        &mut out,
+        &workspace.join(".claude/settings.json"),
+        "project .claude/settings.json",
+    )?;
+    insert_servers_from_json_file(
+        &mut out,
+        &workspace.join(".claude/settings.local.json"),
+        "project .claude/settings.local.json",
+    )?;
 
     Ok(out.into_values().collect())
 }
@@ -157,6 +168,24 @@ fn insert_servers_from_map(
             }
         }
     }
+}
+
+fn insert_servers_from_json_file(
+    out: &mut BTreeMap<String, McpServer>,
+    path: &Path,
+    source: &str,
+) -> Result<()> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let cfg: Value = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {} as JSON", path.display()))?;
+    if let Some(map) = cfg.get("mcpServers").and_then(Value::as_object) {
+        insert_servers_from_map(out, map, source);
+    }
+    Ok(())
 }
 
 fn parse_toml_entry(name: &str, value: &toml::Value) -> Result<Option<McpServer>> {
@@ -451,5 +480,47 @@ args = ["server.js"]
         };
         assert_eq!(server.command, "project-cmd");
         assert_eq!(server.args, vec!["--local"]);
+    }
+
+    #[test]
+    fn loads_project_local_mcp_json_and_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join(".claude")).unwrap();
+        let claude_json = dir.path().join(".claude.json");
+        fs::write(
+            &claude_json,
+            r#"{"mcpServers": {"shared": {"command": "global-cmd"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.join(".mcp.json"),
+            r#"{"mcpServers": {"shared": {"command": "mcp-json-cmd"}, "from-mcp-json": {"url": "https://example.com/mcp"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            workspace.join(".claude/settings.json"),
+            r#"{"mcpServers": {"from-settings": {"command": "settings-cmd"}}}"#,
+        )
+        .unwrap();
+
+        let servers = load_servers(&claude_json, &workspace).unwrap();
+        let pairs: Vec<_> = servers
+            .iter()
+            .map(|s| (s.name().to_string(), s.transport_label().to_string()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("from-mcp-json".into(), "http".into()),
+                ("from-settings".into(), "stdio".into()),
+                ("shared".into(), "stdio".into()),
+            ]
+        );
+        let shared = servers.iter().find(|s| s.name() == "shared").unwrap();
+        let McpServer::Stdio(shared) = shared else {
+            panic!("expected stdio server");
+        };
+        assert_eq!(shared.command, "mcp-json-cmd");
     }
 }
