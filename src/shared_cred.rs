@@ -2,7 +2,8 @@
 //!
 //! Several `agent-container` invocations on the same host need to share
 //! a single credential file so that an OAuth refresh inside one
-//! container is visible to the others (and to the host on shutdown).
+//! container is visible to the others and written back to the host while
+//! the session is still alive.
 //! A sidecar lock file, not the credential file's existence, is the
 //! source of truth: if a new invocation can take `LOCK_EX | LOCK_NB`,
 //! there are no live siblings and any leftover shared credential is
@@ -10,8 +11,11 @@
 //! `LOCK_SH` for its lifetime. On exit it tries to upgrade back to
 //! `LOCK_EX | LOCK_NB`; if the upgrade succeeds, no sibling is still
 //! alive, so the process owns the cleanup pass — read the possibly
-//! refreshed shared file, write it back to the host, then unlink the
-//! shared copy.
+//! refreshed shared file, write it back one last time, then unlink the
+//! shared copy. During the session, each holder also watches the shared
+//! file and writes stable changes back to the host, so host-side clients
+//! do not have to wait for every container to exit before seeing a token
+//! refresh.
 //!
 //! The OS releases the shared lock automatically when the FD is closed
 //! (including on `SIGKILL`), so PID-based ref-counting isn't needed.
@@ -25,12 +29,19 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rustix::fs::{FlockOperation, flock};
 
 /// Where to write the credential bytes back to the host when the last
 /// container exits.
+#[derive(Clone)]
 pub enum HostSync {
     /// macOS: update a `generic-password` Keychain item via `security
     /// add-generic-password -U`.
@@ -60,6 +71,8 @@ pub struct SharedCredFile {
     /// it releases the OS-level shared lock — see `Drop`.
     lock_file: Option<File>,
     host_sync: HostSync,
+    sync_stop: Arc<AtomicBool>,
+    sync_thread: Option<JoinHandle<()>>,
 }
 
 impl SharedCredFile {
@@ -114,12 +127,22 @@ impl SharedCredFile {
             })?;
         }
 
+        let sync_stop = Arc::new(AtomicBool::new(false));
+        let sync_thread = Some(spawn_change_sync_thread(
+            shared_path.clone(),
+            host_sync.clone(),
+            raw.trim().to_string(),
+            Arc::clone(&sync_stop),
+        ));
+
         Ok((
             Self {
                 path: shared_path,
                 lock_path,
                 lock_file: Some(lock_file),
                 host_sync,
+                sync_stop,
+                sync_thread,
             },
             raw,
         ))
@@ -158,8 +181,62 @@ fn write_secret_atomic(path: &Path, raw: &str) -> Result<()> {
     Ok(())
 }
 
+fn spawn_change_sync_thread(
+    path: PathBuf,
+    host_sync: HostSync,
+    initial_raw: String,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut last_synced = initial_raw;
+        let mut pending: Option<String> = None;
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(sync_poll_interval());
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let raw = raw.trim().to_string();
+            if raw == last_synced {
+                pending = None;
+                continue;
+            }
+            if pending.as_deref() != Some(raw.as_str()) {
+                pending = Some(raw);
+                continue;
+            }
+            let Some(raw) = pending.take() else {
+                continue;
+            };
+            match host_sync.apply(&raw) {
+                Ok(()) => last_synced = raw,
+                Err(e) => {
+                    tracing::warn!(
+                        %e,
+                        "failed to write refreshed credentials back to host",
+                    );
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+fn sync_poll_interval() -> Duration {
+    Duration::from_millis(20)
+}
+
+#[cfg(not(test))]
+fn sync_poll_interval() -> Duration {
+    Duration::from_secs(1)
+}
+
 impl Drop for SharedCredFile {
     fn drop(&mut self) {
+        self.sync_stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.sync_thread.take() {
+            let _ = thread.join();
+        }
+
         // Try to upgrade our own shared lock to exclusive on the same
         // FD. EWOULDBLOCK means a sibling agent-container still holds a
         // shared lock, so we leave the cleanup pass to whoever exits
@@ -314,6 +391,34 @@ mod tests {
             "shared file should be removed on last exit"
         );
         assert!(!lock.exists(), "lock file should be removed on last exit");
+    }
+
+    #[test]
+    fn changed_shared_file_is_written_back_before_last_drop() {
+        let _guard = shared_cred_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("creds.json");
+        let dest = dir.path().join("host.json");
+
+        let (_handle, _raw) =
+            SharedCredFile::open(shared.clone(), HostSync::File(dest.clone()), || {
+                Ok("first".to_string())
+            })
+            .unwrap();
+        fs::write(&shared, "refreshed").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if fs::read_to_string(&dest).ok().as_deref() == Some("refreshed") {
+                assert!(
+                    shared.exists(),
+                    "shared file must remain while the container is alive"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for refreshed credentials to be written back");
     }
 
     #[test]
