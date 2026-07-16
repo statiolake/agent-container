@@ -27,6 +27,8 @@ mod task_runner;
 mod tui;
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -579,6 +581,12 @@ async fn run_cmd(
     passthrough: Vec<String>,
 ) -> Result<()> {
     let host = paths::HostPaths::detect()?;
+    let merged_settings = settings::Settings::load_merged(&host.workspace)
+        .context("failed to load agent-container settings (global + workspace)")?;
+    let agent = agent_override
+        .unwrap_or_else(|| agent_kind_from_default(merged_settings.general.default_agent()));
+    maybe_reexec_with_herdr_agent(agent)?;
+
     let image_task = tokio::spawn(async move {
         docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
             .await
@@ -598,10 +606,6 @@ async fn run_cmd(
         .context("failed to load MCP servers from ~/.claude.json")?;
     let codex_mcp_servers = mcp::load_codex_servers(&host.home.join(".codex/config.toml"))
         .context("failed to load MCP servers from ~/.codex/config.toml")?;
-    let merged_settings = settings::Settings::load_merged(&host.workspace)
-        .context("failed to load agent-container settings (global + workspace)")?;
-    let agent = agent_override
-        .unwrap_or_else(|| agent_kind_from_default(merged_settings.general.default_agent()));
     let bedrock = resolve_run_bedrock_setup(
         agent,
         detected_bedrock,
@@ -807,6 +811,36 @@ fn agent_kind_from_default(agent: settings::DefaultAgent) -> AgentKind {
         settings::DefaultAgent::Codex => AgentKind::Codex,
         settings::DefaultAgent::Cursor => AgentKind::Cursor,
     }
+}
+
+fn maybe_reexec_with_herdr_agent(agent: AgentKind) -> Result<()> {
+    if std::env::var_os("HERDR_ENV").is_none() || std::env::var_os("HERDR_AGENT").is_some() {
+        return Ok(());
+    }
+    reexec_with_herdr_agent(herdr_agent_label(agent))
+}
+
+fn herdr_agent_label(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Claude => "claude",
+        AgentKind::Codex => "codex",
+        AgentKind::Cursor => "cursor",
+    }
+}
+
+#[cfg(unix)]
+fn reexec_with_herdr_agent(label: &str) -> Result<()> {
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    let err = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("HERDR_AGENT", label)
+        .exec();
+    Err(err).context("failed to re-exec agent-container with HERDR_AGENT")
+}
+
+#[cfg(not(unix))]
+fn reexec_with_herdr_agent(_label: &str) -> Result<()> {
+    Ok(())
 }
 
 fn agent_command(agent: AgentKind, tmux: bool, tmux_prefix: &str) -> Result<Vec<String>> {
@@ -1212,6 +1246,13 @@ mod tests {
         let command = agent_command(AgentKind::Cursor, false, "C-q;touch").unwrap();
 
         assert_eq!(command, ["cursor-agent", "--yolo"]);
+    }
+
+    #[test]
+    fn herdr_agent_labels_match_known_agents() {
+        assert_eq!(herdr_agent_label(AgentKind::Claude), "claude");
+        assert_eq!(herdr_agent_label(AgentKind::Codex), "codex");
+        assert_eq!(herdr_agent_label(AgentKind::Cursor), "cursor");
     }
 
     #[test]
