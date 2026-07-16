@@ -14,16 +14,19 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use anyhow::{Context, Result, bail};
-use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::mcp::{self, McpServer};
 use crate::oauth::{OAuthStore, load_from_keychain};
 use crate::paths::HostPaths;
 use crate::policy::McpPolicy;
 use crate::settings::{self, Scope, Settings};
-use crate::tui::{self, Outcome, ToolEntry, TuiInput};
+use crate::tui::{
+    self, McpAgent, McpCatalogCommand, McpCatalogEvent, McpServerEntry, Outcome, ToolEntry,
+    TuiInput,
+};
 
 pub fn stdio_is_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
@@ -74,9 +77,6 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
     let merged = Settings::load_merged(&host.workspace)
         .context("failed to load agent-container settings")?;
 
-    let claude_entries = fetch_tool_catalog("Claude Code", &claude_servers, &oauth).await;
-    let codex_entries = fetch_tool_catalog("Codex", &codex_servers, &oauth).await;
-
     if claude_servers.is_empty() {
         eprintln!(
             "[agent-container] note: no MCP servers declared in ~/.claude.json top-level or current project; the Claude Code MCP tab will be empty."
@@ -88,12 +88,20 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
         );
     }
 
+    let (event_tx, event_rx) = mpsc::channel();
+    let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+    spawn_mcp_catalog_workers(
+        claude_servers.clone(),
+        codex_servers.clone(),
+        oauth.clone(),
+        event_tx,
+        command_rx,
+    );
+
     // The TUI keeps two complete McpPolicy / tasks views in memory and
     // edits the active scope's view directly. Keep a copy of the catalog
     // here so the post-save minimisation can inspect every (server,
     // tool) pair regardless of which scope the user wound up saving.
-    let claude_catalog = claude_entries.clone();
-    let codex_catalog = codex_entries.clone();
     let input = TuiInput {
         workspace: host.workspace.clone(),
         initial_scope,
@@ -105,8 +113,12 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
         proxy_allow_workspace: workspace_settings.proxy.allow.clone(),
         filesystem_global: global_settings.filesystem.clone(),
         filesystem_workspace: workspace_settings.filesystem.clone(),
-        claude_tool_catalog: claude_entries,
-        codex_tool_catalog: codex_entries,
+        claude_servers: server_entries(&claude_servers),
+        codex_servers: server_entries(&codex_servers),
+        claude_tool_catalog: Vec::new(),
+        codex_tool_catalog: Vec::new(),
+        mcp_events: Some(event_rx),
+        mcp_commands: Some(command_tx),
         mcp_global: global_settings.claude_code.mcp.clone(),
         mcp_workspace: workspace_settings.claude_code.mcp.clone(),
         codex_mcp_global: global_settings.codex.mcp.clone(),
@@ -120,6 +132,8 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
         Outcome::Save(out) => {
             let out = *out;
             let saved_scope = out.saved_scope;
+            let claude_catalog = out.claude_tool_catalog.clone();
+            let codex_catalog = out.codex_tool_catalog.clone();
             // Base for MCP/task minimisation is the *other* scope. For
             // Global there is no lower layer, so base falls back to the
             // policy default.
@@ -272,67 +286,137 @@ fn template_for(scope: Scope) -> String {
     )
 }
 
-async fn fetch_tool_catalog(
-    label: &str,
-    servers: &[McpServer],
-    oauth: &Arc<OAuthStore>,
-) -> Vec<ToolEntry> {
-    let mut entries = Vec::new();
-    if servers.is_empty() {
-        return entries;
+fn server_entries(servers: &[McpServer]) -> Vec<McpServerEntry> {
+    servers
+        .iter()
+        .map(|server| McpServerEntry {
+            name: server.name().to_string(),
+            transport: server.transport_label().to_string(),
+        })
+        .collect()
+}
+
+fn spawn_mcp_catalog_workers(
+    claude_servers: Vec<McpServer>,
+    codex_servers: Vec<McpServer>,
+    oauth: Arc<OAuthStore>,
+    events: mpsc::Sender<McpCatalogEvent>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<McpCatalogCommand>,
+) {
+    for server in claude_servers.iter().cloned() {
+        spawn_fetch(McpAgent::Claude, server, oauth.clone(), events.clone());
+    }
+    for server in codex_servers.iter().cloned() {
+        spawn_fetch(McpAgent::Codex, server, oauth.clone(), events.clone());
     }
 
-    println!(
-        "Fetching {label} tools from {} MCP server(s) in parallel...",
-        servers.len()
-    );
-    let mut fetches = FuturesUnordered::new();
-    for server in servers {
-        let oauth = oauth.clone();
-        fetches.push(async move {
-            let name = server.name().to_string();
-            let transport = server.transport_label().to_string();
-            let result = crate::mcp_client::fetch_tools_any_with_timeout(
-                server,
-                &oauth,
-                crate::mcp_client::DEFAULT_FETCH_TIMEOUT,
-            )
-            .await;
-            (name, transport, result)
-        });
-    }
-
-    while let Some((name, transport, result)) = fetches.next().await {
-        match result {
-            Ok(tools) => {
-                println!(
-                    "  {label}: {} ({})... {} tool(s)",
-                    name,
-                    transport,
-                    tools.len()
-                );
-                for tool in tools {
-                    let read_only_hint = tool.read_only_hint();
-                    entries.push(ToolEntry {
-                        server_name: name.clone(),
-                        tool_name: tool.name,
-                        description: tool.description.unwrap_or_default(),
-                        read_only_hint,
+    tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            match command {
+                McpCatalogCommand::Reload { agent, server_name } => {
+                    if let Some(server) =
+                        find_server(agent, &server_name, &claude_servers, &codex_servers)
+                    {
+                        spawn_fetch(agent, server, oauth.clone(), events.clone());
+                    }
+                }
+                McpCatalogCommand::Auth { agent, server_name } => {
+                    let Some(server) =
+                        find_server(agent, &server_name, &claude_servers, &codex_servers)
+                    else {
+                        continue;
+                    };
+                    let events = events.clone();
+                    let oauth = oauth.clone();
+                    tokio::spawn(async move {
+                        let _ = events.send(McpCatalogEvent::Loading {
+                            agent,
+                            server_name: server.name().to_string(),
+                        });
+                        if let McpServer::Http(http) = &server
+                            && let Err(e) = crate::mcp_auth::authenticate(http).await
+                        {
+                            let _ = events.send(McpCatalogEvent::Failed {
+                                agent,
+                                server_name: server.name().to_string(),
+                                message: format!("{e:#}"),
+                                can_auth: true,
+                            });
+                            return;
+                        }
+                        spawn_fetch(agent, server, oauth, events);
                     });
                 }
             }
+        }
+    });
+}
+
+fn find_server(
+    agent: McpAgent,
+    server_name: &str,
+    claude_servers: &[McpServer],
+    codex_servers: &[McpServer],
+) -> Option<McpServer> {
+    let servers = match agent {
+        McpAgent::Claude => claude_servers,
+        McpAgent::Codex => codex_servers,
+    };
+    servers
+        .iter()
+        .find(|server| server.name() == server_name)
+        .cloned()
+}
+
+fn spawn_fetch(
+    agent: McpAgent,
+    server: McpServer,
+    oauth: Arc<OAuthStore>,
+    events: mpsc::Sender<McpCatalogEvent>,
+) {
+    tokio::spawn(async move {
+        let server_name = server.name().to_string();
+        let can_auth = matches!(server, McpServer::Http(_));
+        let _ = events.send(McpCatalogEvent::Loading {
+            agent,
+            server_name: server_name.clone(),
+        });
+        match crate::mcp_client::fetch_tools_any_with_timeout(
+            &server,
+            &oauth,
+            crate::mcp_client::DEFAULT_FETCH_TIMEOUT,
+        )
+        .await
+        {
+            Ok(tools) => {
+                let entries = tools
+                    .into_iter()
+                    .map(|tool| {
+                        let read_only_hint = tool.read_only_hint();
+                        ToolEntry {
+                            server_name: server_name.clone(),
+                            tool_name: tool.name,
+                            description: tool.description.unwrap_or_default(),
+                            read_only_hint,
+                        }
+                    })
+                    .collect();
+                let _ = events.send(McpCatalogEvent::Loaded {
+                    agent,
+                    server_name,
+                    tools: entries,
+                });
+            }
             Err(e) => {
-                let reason = format!("{e:#}");
-                println!("  {label}: {} ({})... FAILED ({reason})", name, transport);
+                let _ = events.send(McpCatalogEvent::Failed {
+                    agent,
+                    server_name,
+                    message: format!("{e:#}"),
+                    can_auth,
+                });
             }
         }
-    }
-    entries.sort_by(|a, b| {
-        a.server_name
-            .cmp(&b.server_name)
-            .then_with(|| a.tool_name.cmp(&b.tool_name))
     });
-    entries
 }
 
 /// Strip task entries from `final_tasks` whose value matches what the

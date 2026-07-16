@@ -1,6 +1,10 @@
 services:
   proxy:
     image: agent-container-proxy:dev
+    labels:
+      - "dev.statiolake.agent-container=true"
+      - "dev.statiolake.agent-container.project=${AGENT_CONTAINER_PROJECT}"
+      - "dev.statiolake.agent-container.owner-pid=${AGENT_CONTAINER_OWNER_PID}"
     networks:
       - jail
       - egress
@@ -21,6 +25,10 @@ services:
 
   agent:
     image: agent-container:dev
+    labels:
+      - "dev.statiolake.agent-container=true"
+      - "dev.statiolake.agent-container.project=${AGENT_CONTAINER_PROJECT}"
+      - "dev.statiolake.agent-container.owner-pid=${AGENT_CONTAINER_OWNER_PID}"
     depends_on:
       proxy:
         condition: service_started
@@ -82,5 +90,13 @@ networks:
   jail:
     driver: bridge
     internal: true
+    labels:
+      - "dev.statiolake.agent-container=true"
+      - "dev.statiolake.agent-container.project=${AGENT_CONTAINER_PROJECT}"
+      - "dev.statiolake.agent-container.owner-pid=${AGENT_CONTAINER_OWNER_PID}"
   egress:
     driver: bridge
+    labels:
+      - "dev.statiolake.agent-container=true"
+      - "dev.statiolake.agent-container.project=${AGENT_CONTAINER_PROJECT}"
+      - "dev.statiolake.agent-container.owner-pid=${AGENT_CONTAINER_OWNER_PID}"

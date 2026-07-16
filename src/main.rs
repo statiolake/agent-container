@@ -579,6 +579,11 @@ async fn run_cmd(
     passthrough: Vec<String>,
 ) -> Result<()> {
     let host = paths::HostPaths::detect()?;
+    let image_task = tokio::spawn(async move {
+        docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
+            .await
+            .context("failed to build or locate container images")
+    });
 
     // Host-side discovery — always performed so broker/sync can populate
     // correctly regardless of which agent is the session primary.
@@ -658,10 +663,16 @@ async fn run_cmd(
     let claude_is_primary = matches!(agent, AgentKind::Claude);
     let codex_is_primary = matches!(agent, AgentKind::Codex);
     let cursor_is_primary = matches!(agent, AgentKind::Cursor);
-    let claude_creds = prepare_claude_credentials(&host, claude_is_primary, bedrock.is_some())?;
-    let codex_auth = prepare_codex_auth(&host, codex_is_primary)?;
-    let cursor_files =
-        cursor::prepare(&host.home).context("failed to prepare Cursor state and auth files")?;
+    let auths = prepare_agent_auths(
+        host.clone(),
+        claude_is_primary,
+        codex_is_primary,
+        bedrock.is_some(),
+    )
+    .await?;
+    let claude_creds = auths.claude;
+    let codex_auth = auths.codex;
+    let cursor_files = auths.cursor;
     if cursor_is_primary
         && !cursor::has_portable_auth_env()
         && !cursor_files.auth_file.host_auth_found
@@ -676,9 +687,9 @@ async fn run_cmd(
         );
     }
 
-    docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
+    image_task
         .await
-        .context("failed to build or locate container images")?;
+        .context("image preparation task failed")??;
 
     let brokers = spawn_agent_brokers(BrokerInputs {
         host: &host,
@@ -900,6 +911,11 @@ fn validate_tmux_key(key: &str) -> Result<()> {
 
 async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> {
     let host = paths::HostPaths::detect()?;
+    let image_task = tokio::spawn(async move {
+        docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
+            .await
+            .context("failed to build or locate container images")
+    });
 
     // Discovery is the same as `run`, except we downgrade every auth
     // failure to a warning — if the user is dropping into a shell it's
@@ -932,26 +948,14 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
         oauth::load_from_keychain().unwrap_or_default(),
     ));
 
-    let claude_creds = match creds::prepare(&host.claude_root) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!("[agent-container] note: Claude credentials unavailable: {e:#}");
-            None
-        }
-    };
-    let codex_auth = match codex::prepare_auth(&host.home) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!("[agent-container] note: Codex auth unavailable: {e:#}");
-            None
-        }
-    };
-    let cursor_files =
-        cursor::prepare(&host.home).context("failed to prepare Cursor state and auth files")?;
+    let auths = prepare_shell_auths(host.clone()).await?;
+    let claude_creds = auths.claude;
+    let codex_auth = auths.codex;
+    let cursor_files = auths.cursor;
 
-    docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
+    image_task
         .await
-        .context("failed to build or locate container images")?;
+        .context("image preparation task failed")??;
 
     let brokers = spawn_agent_brokers(BrokerInputs {
         host: &host,
@@ -1032,6 +1036,68 @@ async fn exec_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> {
         bail!("agent-container exec requires a command after `--`");
     }
     shell_cmd(rebuild_image, passthrough).await
+}
+
+struct PreparedAuths {
+    claude: Option<creds::CredentialFile>,
+    codex: Option<codex::CodexAuthFile>,
+    cursor: cursor::CursorFiles,
+}
+
+async fn prepare_agent_auths(
+    host: paths::HostPaths,
+    claude_is_primary: bool,
+    codex_is_primary: bool,
+    has_bedrock: bool,
+) -> Result<PreparedAuths> {
+    let claude_host = host.clone();
+    let codex_host = host.clone();
+    let cursor_host = host;
+    let claude = tokio::task::spawn_blocking(move || {
+        prepare_claude_credentials(&claude_host, claude_is_primary, has_bedrock)
+    });
+    let codex =
+        tokio::task::spawn_blocking(move || prepare_codex_auth(&codex_host, codex_is_primary));
+    let cursor = tokio::task::spawn_blocking(move || cursor::prepare(&cursor_host.home));
+
+    let (claude, codex, cursor) = tokio::join!(claude, codex, cursor);
+    Ok(PreparedAuths {
+        claude: claude.context("Claude credential preparation task failed")??,
+        codex: codex.context("Codex auth preparation task failed")??,
+        cursor: cursor
+            .context("Cursor state preparation task failed")?
+            .context("failed to prepare Cursor state and auth files")?,
+    })
+}
+
+async fn prepare_shell_auths(host: paths::HostPaths) -> Result<PreparedAuths> {
+    let claude_host = host.clone();
+    let codex_host = host.clone();
+    let cursor_host = host;
+    let claude =
+        tokio::task::spawn_blocking(move || match creds::prepare(&claude_host.claude_root) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("[agent-container] note: Claude credentials unavailable: {e:#}");
+                None
+            }
+        });
+    let codex = tokio::task::spawn_blocking(move || match codex::prepare_auth(&codex_host.home) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("[agent-container] note: Codex auth unavailable: {e:#}");
+            None
+        }
+    });
+    let cursor = tokio::task::spawn_blocking(move || cursor::prepare(&cursor_host.home));
+    let (claude, codex, cursor) = tokio::join!(claude, codex, cursor);
+    Ok(PreparedAuths {
+        claude: claude.context("Claude credential preparation task failed")?,
+        codex: codex.context("Codex auth preparation task failed")?,
+        cursor: cursor
+            .context("Cursor state preparation task failed")?
+            .context("failed to prepare Cursor state and auth files")?,
+    })
 }
 
 fn prepare_claude_credentials(

@@ -32,6 +32,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -247,6 +248,49 @@ pub struct ToolEntry {
     pub read_only_hint: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpAgent {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerEntry {
+    pub name: String,
+    pub transport: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum McpCatalogEvent {
+    Loading {
+        agent: McpAgent,
+        server_name: String,
+    },
+    Loaded {
+        agent: McpAgent,
+        server_name: String,
+        tools: Vec<ToolEntry>,
+    },
+    Failed {
+        agent: McpAgent,
+        server_name: String,
+        message: String,
+        can_auth: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum McpCatalogCommand {
+    Reload {
+        agent: McpAgent,
+        server_name: String,
+    },
+    Auth {
+        agent: McpAgent,
+        server_name: String,
+    },
+}
+
 pub struct TuiInput {
     pub workspace: PathBuf,
     /// Scope the editor starts on. `t` flips it to the other scope.
@@ -262,9 +306,14 @@ pub struct TuiInput {
     pub proxy_allow_workspace: Vec<String>,
     pub filesystem_global: FilesystemPolicy,
     pub filesystem_workspace: FilesystemPolicy,
-    /// Static catalogs of every (server, tool) each agent knows about.
+    /// Declared MCP servers. Tool catalogs may arrive asynchronously.
+    pub claude_servers: Vec<McpServerEntry>,
+    pub codex_servers: Vec<McpServerEntry>,
+    /// Initial catalogs of every (server, tool) each agent knows about.
     pub claude_tool_catalog: Vec<ToolEntry>,
     pub codex_tool_catalog: Vec<ToolEntry>,
+    pub mcp_events: Option<mpsc::Receiver<McpCatalogEvent>>,
+    pub mcp_commands: Option<tokio::sync::mpsc::UnboundedSender<McpCatalogCommand>>,
     /// Each scope's MCP policy as it lives on disk. The TUI displays the
     /// effective enabled state (Workspace view = global ∪ workspace at
     /// the tool granularity, Global view = global only) and writes
@@ -295,6 +344,8 @@ pub struct TuiOutput {
     pub mcp_workspace: McpPolicy,
     pub codex_mcp_global: McpPolicy,
     pub codex_mcp_workspace: McpPolicy,
+    pub claude_tool_catalog: Vec<ToolEntry>,
+    pub codex_tool_catalog: Vec<ToolEntry>,
     pub tasks_global: BTreeMap<String, String>,
     pub tasks_workspace: BTreeMap<String, String>,
 }
@@ -427,6 +478,12 @@ enum Mode {
         target: ItemActionTarget,
         cursor: usize,
     },
+    McpServerAction {
+        agent: McpAgent,
+        server_name: String,
+        can_auth: bool,
+        cursor: usize,
+    },
     /// Confirmation prompt before leaving the settings editor. Displayed
     /// when the user hits `q` or ^C.
     ConfirmQuit {
@@ -448,6 +505,12 @@ enum ItemAction {
 }
 
 const ITEM_ACTION_CHOICES: [ItemAction; 2] = [ItemAction::Edit, ItemAction::Remove];
+
+#[derive(Clone, Copy)]
+enum McpServerAction {
+    Reload,
+    Reauthenticate,
+}
 
 #[derive(Clone, Copy)]
 enum QuitAction {
@@ -1091,6 +1154,13 @@ enum McpRow {
     Tool(usize),
 }
 
+#[derive(Clone)]
+enum McpServerStatus {
+    Loading,
+    Ready,
+    Failed { message: String, can_auth: bool },
+}
+
 struct McpState {
     /// Per-scope tasks. The visible list is derived: for `Workspace` we
     /// merge `tasks_global` ∪ `tasks_workspace` (workspace wins); for
@@ -1104,6 +1174,8 @@ struct McpState {
     mcp_workspace: McpPolicy,
     task_runner_expanded: bool,
     server_names: Vec<String>,
+    server_transports: HashMap<String, String>,
+    server_status: HashMap<String, McpServerStatus>,
     /// Per-server collapse state. The config UI starts with only
     /// top-level MCP rows visible; `Enter` expands the focused server.
     expanded: Vec<bool>,
@@ -1118,6 +1190,7 @@ struct McpState {
 
 impl McpState {
     fn new(
+        servers: Vec<McpServerEntry>,
         mut catalog: Vec<ToolEntry>,
         mcp_global: McpPolicy,
         mcp_workspace: McpPolicy,
@@ -1130,17 +1203,31 @@ impl McpState {
                 .then_with(|| a.tool_name.cmp(&b.tool_name))
         });
 
-        let mut server_names: Vec<String> = Vec::new();
+        let mut server_names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+        server_names.sort();
+        server_names.dedup();
+        let server_transports: HashMap<String, String> = servers
+            .iter()
+            .map(|s| (s.name.clone(), s.transport.clone()))
+            .collect();
+        let mut server_status: HashMap<String, McpServerStatus> = servers
+            .iter()
+            .map(|s| (s.name.clone(), McpServerStatus::Loading))
+            .collect();
         let mut server_ranges: HashMap<String, (usize, usize)> = HashMap::new();
         for (i, e) in catalog.iter().enumerate() {
             match server_ranges.get_mut(&e.server_name) {
                 Some((_, count)) => *count += 1,
                 None => {
                     server_ranges.insert(e.server_name.clone(), (i, 1));
-                    server_names.push(e.server_name.clone());
+                    if !server_names.contains(&e.server_name) {
+                        server_names.push(e.server_name.clone());
+                    }
                 }
             }
+            server_status.insert(e.server_name.clone(), McpServerStatus::Ready);
         }
+        server_names.sort();
 
         let expanded = vec![false; server_names.len()];
         Self {
@@ -1150,11 +1237,73 @@ impl McpState {
             mcp_workspace,
             task_runner_expanded: false,
             server_names,
+            server_transports,
+            server_status,
             expanded,
             catalog,
             server_ranges,
             cursor: 0,
         }
+    }
+
+    fn apply_catalog_event(&mut self, event: McpCatalogEvent) {
+        let (server_name, status, tools) = match event {
+            McpCatalogEvent::Loading { server_name, .. } => {
+                (server_name, McpServerStatus::Loading, None)
+            }
+            McpCatalogEvent::Loaded {
+                server_name, tools, ..
+            } => (server_name, McpServerStatus::Ready, Some(tools)),
+            McpCatalogEvent::Failed {
+                server_name,
+                message,
+                can_auth,
+                ..
+            } => (
+                server_name,
+                McpServerStatus::Failed { message, can_auth },
+                Some(Vec::new()),
+            ),
+        };
+        if !self.server_names.contains(&server_name) {
+            self.server_names.push(server_name.clone());
+            self.server_names.sort();
+        }
+        self.server_status.insert(server_name.clone(), status);
+        if let Some(mut tools) = tools {
+            self.catalog
+                .retain(|entry| entry.server_name != server_name);
+            self.catalog.append(&mut tools);
+            self.rebuild_catalog_index();
+        }
+    }
+
+    fn rebuild_catalog_index(&mut self) {
+        let expanded_by_name: HashMap<String, bool> = self
+            .server_names
+            .iter()
+            .cloned()
+            .zip(self.expanded.iter().copied())
+            .collect();
+        self.catalog.sort_by(|a, b| {
+            a.server_name
+                .cmp(&b.server_name)
+                .then_with(|| a.tool_name.cmp(&b.tool_name))
+        });
+        self.server_ranges.clear();
+        for (i, e) in self.catalog.iter().enumerate() {
+            match self.server_ranges.get_mut(&e.server_name) {
+                Some((_, count)) => *count += 1,
+                None => {
+                    self.server_ranges.insert(e.server_name.clone(), (i, 1));
+                }
+            }
+        }
+        self.expanded = self
+            .server_names
+            .iter()
+            .map(|name| expanded_by_name.get(name).copied().unwrap_or(false))
+            .collect();
     }
 
     /// Tasks visible for `scope`. Workspace shows the merged view
@@ -1294,8 +1443,17 @@ impl McpState {
                 RowAction::Handled
             }
             Some(McpRow::Server(si)) => {
-                self.expanded[si] = !self.expanded[si];
-                RowAction::Handled
+                let name = self.server_names[si].clone();
+                match self.server_status.get(&name) {
+                    Some(McpServerStatus::Failed { can_auth, .. }) => RowAction::McpServerAction {
+                        server_name: name,
+                        can_auth: *can_auth,
+                    },
+                    _ => {
+                        self.expanded[si] = !self.expanded[si];
+                        RowAction::Handled
+                    }
+                }
             }
             Some(McpRow::Tool(ti)) => {
                 let cur = self.effective_tool_allowed(scope, ti);
@@ -1369,6 +1527,7 @@ enum RowAction {
     Handled,
     EditTask(String),
     AddTask,
+    McpServerAction { server_name: String, can_auth: bool },
 }
 
 /// Frozen snapshot of every editable buffer at TUI launch. Used to
@@ -1403,6 +1562,8 @@ struct App {
     filesystem: FilesystemState,
     mcp_claude: McpState,
     mcp_codex: McpState,
+    mcp_events: Option<mpsc::Receiver<McpCatalogEvent>>,
+    mcp_commands: Option<tokio::sync::mpsc::UnboundedSender<McpCatalogCommand>>,
     mode: Mode,
     list_state: ListState,
     #[cfg(test)]
@@ -1445,6 +1606,7 @@ impl App {
             proxy: ProxyState::new(input.proxy_allow_global, input.proxy_allow_workspace),
             filesystem: FilesystemState::new(input.filesystem_global, input.filesystem_workspace),
             mcp_claude: McpState::new(
+                input.claude_servers,
                 input.claude_tool_catalog,
                 input.mcp_global,
                 input.mcp_workspace,
@@ -1452,12 +1614,15 @@ impl App {
                 tasks_workspace.clone(),
             ),
             mcp_codex: McpState::new(
+                input.codex_servers,
                 input.codex_tool_catalog,
                 input.codex_mcp_global,
                 input.codex_mcp_workspace,
                 tasks_global,
                 tasks_workspace,
             ),
+            mcp_events: input.mcp_events,
+            mcp_commands: input.mcp_commands,
             mode: Mode::Normal,
             list_state,
             #[cfg(test)]
@@ -1533,6 +1698,8 @@ impl App {
             mcp_workspace: self.mcp_claude.mcp_workspace,
             codex_mcp_global: self.mcp_codex.mcp_global,
             codex_mcp_workspace: self.mcp_codex.mcp_workspace,
+            claude_tool_catalog: self.mcp_claude.catalog,
+            codex_tool_catalog: self.mcp_codex.catalog,
             tasks_global: self.mcp_claude.tasks_global,
             tasks_workspace: self.mcp_claude.tasks_workspace,
         }
@@ -1566,6 +1733,47 @@ impl App {
         match self.tab {
             TopTab::McpCodex => self.sync_tasks_from_codex(),
             _ => self.sync_tasks_from_claude(),
+        }
+    }
+
+    fn drain_mcp_events(&mut self) {
+        let Some(rx) = self.mcp_events.take() else {
+            return;
+        };
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                event @ McpCatalogEvent::Loading {
+                    agent: McpAgent::Claude,
+                    ..
+                }
+                | event @ McpCatalogEvent::Loaded {
+                    agent: McpAgent::Claude,
+                    ..
+                }
+                | event @ McpCatalogEvent::Failed {
+                    agent: McpAgent::Claude,
+                    ..
+                } => self.mcp_claude.apply_catalog_event(event),
+                event @ McpCatalogEvent::Loading {
+                    agent: McpAgent::Codex,
+                    ..
+                }
+                | event @ McpCatalogEvent::Loaded {
+                    agent: McpAgent::Codex,
+                    ..
+                }
+                | event @ McpCatalogEvent::Failed {
+                    agent: McpAgent::Codex,
+                    ..
+                } => self.mcp_codex.apply_catalog_event(event),
+            }
+        }
+        self.mcp_events = Some(rx);
+    }
+
+    fn send_mcp_command(&self, command: McpCatalogCommand) {
+        if let Some(tx) = &self.mcp_commands {
+            let _ = tx.send(command);
         }
     }
 }
@@ -2084,6 +2292,57 @@ fn handle_item_action_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
     app.mode = Mode::ItemAction { target, cursor };
 }
 
+fn mcp_server_action_choices(can_auth: bool) -> Vec<McpServerAction> {
+    let mut choices = vec![McpServerAction::Reload];
+    if can_auth {
+        choices.push(McpServerAction::Reauthenticate);
+    }
+    choices
+}
+
+fn handle_mcp_server_action_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    let Mode::McpServerAction {
+        agent,
+        server_name,
+        can_auth,
+        mut cursor,
+    } = std::mem::replace(&mut app.mode, Mode::Normal)
+    else {
+        return;
+    };
+    let choices = mcp_server_action_choices(can_auth);
+    match code {
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return,
+        KeyCode::Esc => return,
+        KeyCode::Up | KeyCode::Char('k') => {
+            cursor = cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab if cursor + 1 < choices.len() => {
+            cursor += 1;
+        }
+        KeyCode::Home => cursor = 0,
+        KeyCode::End => cursor = choices.len().saturating_sub(1),
+        KeyCode::Enter => match choices.get(cursor).copied() {
+            Some(McpServerAction::Reload) => {
+                app.send_mcp_command(McpCatalogCommand::Reload { agent, server_name });
+                return;
+            }
+            Some(McpServerAction::Reauthenticate) => {
+                app.send_mcp_command(McpCatalogCommand::Auth { agent, server_name });
+                return;
+            }
+            None => {}
+        },
+        _ => {}
+    }
+    app.mode = Mode::McpServerAction {
+        agent,
+        server_name,
+        can_auth,
+        cursor,
+    };
+}
+
 pub fn run_selection(input: TuiInput) -> Result<Outcome> {
     enable_raw_mode().context("enabling raw mode")?;
     let mut stdout = io::stdout();
@@ -2101,6 +2360,7 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
 
     let mut app = App::new(input);
     let outcome = loop {
+        app.drain_mcp_events();
         app.sync_list_state();
         terminal.draw(|f| render(f, &mut app))?;
         if !event::poll(Duration::from_millis(200))? {
@@ -2140,6 +2400,10 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
         }
         if matches!(app.mode, Mode::ItemAction { .. }) {
             handle_item_action_key(&mut app, key.code, key.modifiers);
+            continue;
+        }
+        if matches!(app.mode, Mode::McpServerAction { .. }) {
+            handle_mcp_server_action_key(&mut app, key.code, key.modifiers);
             continue;
         }
         if let Mode::ConfirmQuit { mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal) {
@@ -2297,6 +2561,22 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                         };
                     }
                     RowAction::AddTask => start_task_add(&mut app),
+                    RowAction::McpServerAction {
+                        server_name,
+                        can_auth,
+                    } => {
+                        let agent = if app.tab == TopTab::McpCodex {
+                            McpAgent::Codex
+                        } else {
+                            McpAgent::Claude
+                        };
+                        app.mode = Mode::McpServerAction {
+                            agent,
+                            server_name,
+                            can_auth,
+                            cursor: 0,
+                        };
+                    }
                 },
             },
             _ => {}
@@ -2383,6 +2663,16 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
 
     if let Mode::ItemAction { ref target, cursor } = app.mode {
         render_item_action_modal(f, area, target, cursor);
+    }
+
+    if let Mode::McpServerAction {
+        ref server_name,
+        can_auth,
+        cursor,
+        ..
+    } = app.mode
+    {
+        render_mcp_server_action_modal(f, area, server_name, can_auth, cursor);
     }
 
     if let Mode::ConfirmQuit { cursor } = app.mode {
@@ -2618,9 +2908,23 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 let name = &mcp.server_names[si];
                 let (enabled, total) = mcp.enabled_count_for(scope, si);
                 let marker = if mcp.expanded[si] { "▾" } else { "▸" };
+                let transport = mcp
+                    .server_transports
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or("mcp");
+                let status = match mcp.server_status.get(name) {
+                    Some(McpServerStatus::Loading) => Span::styled("  loading...", muted()),
+                    Some(McpServerStatus::Failed { message, .. }) => Span::styled(
+                        format!("  failed: {}", message.lines().next().unwrap_or("error")),
+                        danger(),
+                    ),
+                    _ => Span::styled(format!("  ({enabled}/{total} enabled)"), muted()),
+                };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{marker} {name}"), heading()),
-                    Span::styled(format!("  ({enabled}/{total} enabled)"), muted()),
+                    Span::styled(format!("  {transport}"), muted()),
+                    status,
                 ]))
             }
             McpRow::Tool(ti) => render_tool_row(
@@ -3084,6 +3388,55 @@ fn render_item_action_modal(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+fn render_mcp_server_action_modal(
+    f: &mut ratatui::Frame<'_>,
+    parent: Rect,
+    server_name: &str,
+    can_auth: bool,
+    cursor: usize,
+) {
+    let w = parent.width.clamp(44, 64);
+    let h: u16 = if can_auth { 8 } else { 7 };
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    let y = parent.y + (parent.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" MCP server ")
+        .border_style(muted())
+        .title_style(heading());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(server_name.to_string(), plain())),
+        Line::from(""),
+    ];
+    let choices = mcp_server_action_choices(can_auth);
+    for (idx, action) in choices.iter().copied().enumerate() {
+        let selected = idx == cursor;
+        let marker = if selected { ">" } else { " " };
+        let label = match action {
+            McpServerAction::Reload => "Reload tools",
+            McpServerAction::Reauthenticate => "Re-authenticate",
+        };
+        let style = if selected { heading() } else { plain() };
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::raw(" "),
+            Span::styled(label, style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ j/k move · Enter select · Esc cancel",
+        muted(),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_task_input_modal(
     f: &mut ratatui::Frame<'_>,
     parent: Rect,
@@ -3300,12 +3653,29 @@ mod tests {
         tasks_workspace: BTreeMap<String, String>,
     ) -> McpState {
         McpState::new(
+            servers_from_catalog(&catalog),
             catalog,
             mcp_global,
             mcp_workspace,
             tasks_global,
             tasks_workspace,
         )
+    }
+
+    fn servers_from_catalog(catalog: &[ToolEntry]) -> Vec<McpServerEntry> {
+        let mut names: Vec<String> = catalog
+            .iter()
+            .map(|entry| entry.server_name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .map(|name| McpServerEntry {
+                name,
+                transport: "stdio".into(),
+            })
+            .collect()
     }
 
     fn entry(server: &str, tool: &str, ro: Option<bool>) -> ToolEntry {
@@ -3452,8 +3822,18 @@ mod tests {
                 hide: vec![r"^secrets(/|$)".into()],
                 readonly: Vec::new(),
             },
+            claude_servers: vec![McpServerEntry {
+                name: "s".into(),
+                transport: "stdio".into(),
+            }],
+            codex_servers: vec![McpServerEntry {
+                name: "local-tools".into(),
+                transport: "stdio".into(),
+            }],
             claude_tool_catalog: vec![entry("s", "t", Some(true))],
             codex_tool_catalog: vec![entry("local-tools", "search", Some(true))],
+            mcp_events: None,
+            mcp_commands: None,
             mcp_global: McpPolicy::default(),
             mcp_workspace: McpPolicy::default(),
             codex_mcp_global: McpPolicy::default(),

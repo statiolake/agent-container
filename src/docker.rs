@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::future;
 use std::io::{ErrorKind, IsTerminal};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as StdCommandExt;
@@ -7,8 +8,11 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+#[cfg(unix)]
+use tokio::signal::unix::Signal;
 
 use crate::aws::BedrockSetup;
 use crate::paths::HostPaths;
@@ -16,6 +20,9 @@ use crate::paths::HostPaths;
 const AGENT_IMAGE_TAG: &str = "agent-container:dev";
 const PROXY_IMAGE_TAG: &str = "agent-container-proxy:dev";
 const DOCKER_ATTACH_DETACH_KEYS: &str = "ctrl-],ctrl-]";
+const OWNER_LABEL: &str = "dev.statiolake.agent-container";
+const PROJECT_LABEL: &str = "dev.statiolake.agent-container.project";
+const OWNER_PID_LABEL: &str = "dev.statiolake.agent-container.owner-pid";
 
 /// Build required images. The agent image can be force-built on demand;
 /// the proxy image is still only built when missing.
@@ -117,6 +124,7 @@ struct RunArtifacts {
 pub async fn run(opts: RunOptions) -> Result<i32> {
     let pid = std::process::id();
     let project = format!("agent-container-{pid}");
+    spawn_stale_stack_cleanup();
     let mut agent_argv = opts.agent_command.clone();
     agent_argv.extend(opts.extra_args.clone());
     let RunArtifacts {
@@ -186,6 +194,8 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         ("ALLOWLIST_PATH", allowlist_path.display().to_string()),
         ("HOST_UID", uid.to_string()),
         ("HOST_GID", gid.to_string()),
+        ("AGENT_CONTAINER_PROJECT", project.clone()),
+        ("AGENT_CONTAINER_OWNER_PID", pid.to_string()),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -493,11 +503,8 @@ async fn wait_compose_child_or_interrupt(
             let status = status.with_context(|| format!("failed to wait for {label}"))?;
             Ok(ChildExit::Exited(status))
         }
-        signal = tokio::signal::ctrl_c() => {
-            if let Err(e) = signal {
-                eprintln!("[agent-container] warning: failed to install Ctrl+C handler: {e}");
-            }
-            eprintln!("[agent-container] interrupt received; cleaning up compose stack...");
+        signal = shutdown_signal() => {
+            eprintln!("[agent-container] {signal} received; cleaning up compose stack...");
 
             match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
                 Ok(Ok(_)) => {}
@@ -525,6 +532,41 @@ async fn wait_compose_child_or_interrupt(
     }
 }
 
+#[cfg(unix)]
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut term = signal(SignalKind::terminate()).ok();
+    let mut hup = signal(SignalKind::hangup()).ok();
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            if let Err(e) = signal {
+                eprintln!("[agent-container] warning: failed to install Ctrl+C handler: {e}");
+            }
+            "interrupt"
+        }
+        _ = recv_optional_signal(&mut term) => "SIGTERM",
+        _ = recv_optional_signal(&mut hup) => "SIGHUP",
+    }
+}
+
+#[cfg(unix)]
+async fn recv_optional_signal(signal: &mut Option<Signal>) {
+    if let Some(signal) = signal {
+        let _ = signal.recv().await;
+    } else {
+        future::pending::<()>().await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> &'static str {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        eprintln!("[agent-container] warning: failed to install Ctrl+C handler: {e}");
+    }
+    "interrupt"
+}
+
 fn compose_down_sync(ctx: &ComposeCtx) -> Result<()> {
     let mut cmd = std::process::Command::new("docker");
     cmd.args(["compose", "-p", &ctx.project])
@@ -541,6 +583,158 @@ fn compose_down_sync(ctx: &ComposeCtx) -> Result<()> {
         bail!("`docker compose down` failed with status {status}");
     }
     Ok(())
+}
+
+fn spawn_stale_stack_cleanup() {
+    tokio::spawn(async {
+        if let Err(e) = cleanup_stale_agent_container_stacks().await {
+            eprintln!("[agent-container] warning: failed to cleanup stale compose stacks: {e:#}");
+        }
+    });
+}
+
+async fn cleanup_stale_agent_container_stacks() -> Result<()> {
+    let ids = docker_list_ids("container", &[("label", OWNER_LABEL)])
+        .await
+        .context("failed to list agent-container containers")?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut stale_projects = BTreeSet::new();
+    for object in docker_inspect(&ids)
+        .await
+        .context("failed to inspect agent-container containers")?
+    {
+        let Some(labels) = object.config.and_then(|config| config.labels) else {
+            continue;
+        };
+        let Some(project) = labels.get(PROJECT_LABEL).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let Some(pid) = labels
+            .get(OWNER_PID_LABEL)
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !owner_process_alive(pid) {
+            stale_projects.insert(project.clone());
+        }
+    }
+
+    for project in stale_projects {
+        eprintln!("[agent-container] cleaning up stale compose stack {project}");
+        remove_labeled_objects("container", "rm", &["-f"], &project)
+            .await
+            .with_context(|| format!("failed to remove stale containers for {project}"))?;
+        remove_labeled_objects("network", "rm", &[], &project)
+            .await
+            .with_context(|| format!("failed to remove stale networks for {project}"))?;
+    }
+    Ok(())
+}
+
+async fn remove_labeled_objects(
+    kind: &str,
+    remove_subcommand: &str,
+    remove_args: &[&str],
+    project: &str,
+) -> Result<()> {
+    let project_filter = project_filter(project);
+    let ids = docker_list_ids(kind, &[("label", OWNER_LABEL), ("label", &project_filter)]).await?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = Command::new("docker");
+    cmd.arg(kind)
+        .arg(remove_subcommand)
+        .args(remove_args)
+        .args(&ids)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = cmd
+        .status()
+        .await
+        .with_context(|| format!("failed to spawn docker {kind} {remove_subcommand}"))?;
+    if !status.success() {
+        bail!("docker {kind} {remove_subcommand} failed with status {status}");
+    }
+    Ok(())
+}
+
+async fn docker_list_ids(kind: &str, filters: &[(&str, &str)]) -> Result<Vec<String>> {
+    let mut cmd = Command::new("docker");
+    cmd.arg(kind)
+        .arg("ls")
+        .arg("-q")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    if kind == "container" {
+        cmd.arg("-a");
+    }
+    for (name, value) in filters {
+        cmd.arg("--filter").arg(format!("{name}={value}"));
+    }
+    let output = cmd
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn docker {kind} ls"))?;
+    if !output.status.success() {
+        bail!("docker {kind} ls failed with status {}", output.status);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+async fn docker_inspect(ids: &[String]) -> Result<Vec<DockerInspectObject>> {
+    let output = Command::new("docker")
+        .arg("inspect")
+        .args(ids)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .context("failed to spawn docker inspect")?;
+    if !output.status.success() {
+        bail!("docker inspect failed with status {}", output.status);
+    }
+    serde_json::from_slice(&output.stdout).context("failed to parse docker inspect output")
+}
+
+fn project_filter(project: &str) -> String {
+    format!("{PROJECT_LABEL}={project}")
+}
+
+#[derive(Deserialize)]
+struct DockerInspectObject {
+    #[serde(rename = "Config")]
+    config: Option<DockerInspectConfig>,
+}
+
+#[derive(Deserialize)]
+struct DockerInspectConfig {
+    #[serde(rename = "Labels")]
+    labels: Option<HashMap<String, String>>,
+}
+
+fn owner_process_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn detach_from_terminal_interrupts(cmd: &mut std::process::Command) {
@@ -1076,6 +1270,21 @@ mod tests {
         assert!(compose.contains("CURSOR_API_KEY=${CURSOR_API_KEY:-}"));
         assert!(compose.contains("CURSOR_AUTH_TOKEN=${CURSOR_AUTH_TOKEN:-}"));
         assert!(!compose.contains("CURSOR_OAUTH2_AUTH_TOKEN"));
+    }
+
+    #[test]
+    fn compose_labels_agent_container_objects_for_stale_cleanup() {
+        let compose = include_str!("../docker/compose.yml");
+        assert!(compose.contains("dev.statiolake.agent-container=true"));
+        assert!(
+            compose.contains("dev.statiolake.agent-container.project=${AGENT_CONTAINER_PROJECT}")
+        );
+        assert!(
+            compose
+                .contains("dev.statiolake.agent-container.owner-pid=${AGENT_CONTAINER_OWNER_PID}")
+        );
+        assert!(compose.contains("jail:\n    driver: bridge\n    internal: true\n    labels:"));
+        assert!(compose.contains("egress:\n    driver: bridge\n    labels:"));
     }
 
     #[test]

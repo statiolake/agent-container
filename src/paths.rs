@@ -5,6 +5,7 @@ use directories::UserDirs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[derive(Clone)]
 pub struct HostPaths {
     pub home: PathBuf,
     pub claude_root: PathBuf,
