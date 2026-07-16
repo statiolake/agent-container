@@ -330,6 +330,7 @@ async fn run_command(task: &TaskSpec, invocation: &CmdInvocation) -> Result<CmdO
     cmd.arg("-c").arg(&task.command);
     cmd.envs(&invocation.env);
     cmd.env("CONFIG_ROOT", &task.config_root);
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);

@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -132,8 +132,9 @@ fn read_refresh_from(path: &Path) -> Result<Option<String>> {
 ///    short-term session via `aws sts get-session-token --profile P`.
 ///
 /// If the first attempt fails and `refresh` is provided, the refresh
-/// command is run (stdio inherited so SSO prompts are visible) and the
-/// resolution is retried once.
+/// command is run with stdin closed and the resolution is retried once.
+/// This broker path can execute while the agent is attached to the user's
+/// terminal, so refresh commands must not compete for interactive input.
 pub fn resolve_credentials(
     setup: &BedrockSetup,
     refresh: Option<&str>,
@@ -178,6 +179,7 @@ fn try_export(setup: &BedrockSetup) -> Result<BedrockCredentials> {
             "--format",
             "process",
         ])
+        .stdin(Stdio::null())
         .output()
         .context("failed to invoke `aws` CLI; is it installed and on PATH?")?;
     if !output.status.success() {
@@ -224,6 +226,7 @@ fn upgrade_to_session_token(setup: &BedrockSetup) -> Result<BedrockCredentials> 
             "--output",
             "json",
         ])
+        .stdin(Stdio::null())
         .output()
         .context("failed to invoke `aws sts get-session-token`")?;
     if !output.status.success() {
@@ -264,6 +267,7 @@ fn upgrade_to_session_token(setup: &BedrockSetup) -> Result<BedrockCredentials> 
 fn run_refresh(cmd: &str) -> Result<()> {
     let status = Command::new("sh")
         .args(["-c", cmd])
+        .stdin(Stdio::null())
         .status()
         .with_context(|| format!("failed to spawn `sh -c {cmd}`"))?;
     if !status.success() {

@@ -40,6 +40,7 @@ async fn ensure_one(
     if !force_build {
         let status = Command::new("docker")
             .args(["image", "inspect", tag])
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -67,6 +68,7 @@ async fn ensure_one(
                 .to_str()
                 .context("non-utf8 build context path")?,
         ])
+        .stdin(Stdio::null())
         .status()
         .await
         .context("failed to spawn docker build")?;
@@ -871,7 +873,8 @@ impl ComposeCtx {
         cmd.args(["compose", "-p", &self.project])
             .args(self.compose_file_args())
             .args(tail)
-            .envs(&self.env);
+            .envs(&self.env)
+            .stdin(Stdio::null());
         cmd
     }
 

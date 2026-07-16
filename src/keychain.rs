@@ -1,3 +1,6 @@
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
+
 use anyhow::{Context, Result, bail};
 
 pub const CLAUDE_CODE_CREDENTIALS_SERVICE: &str = "Claude Code-credentials";
@@ -17,6 +20,7 @@ pub fn read_generic_password_for_account(
     if let Some(account) = account {
         cmd.args(["-a", account]);
     }
+    cmd.stdin(Stdio::null());
     let output = cmd
         .output()
         .context("failed to invoke `security` command")?;
@@ -31,6 +35,7 @@ pub fn read_generic_password_for_account(
 pub fn read_generic_password_account(service: &str) -> Result<Option<String>> {
     let output = std::process::Command::new("security")
         .args(["find-generic-password", "-s", service])
+        .stdin(Stdio::null())
         .output()
         .context("failed to invoke `security` command")?;
     if !output.status.success() {
@@ -55,6 +60,7 @@ pub fn write_generic_password(service: &str, account: Option<&str>, raw: &str) -
     if let Some(account) = account {
         cmd.args(["-a", account]);
     }
+    cmd.stdin(Stdio::null());
     let status = cmd
         .status()
         .context("failed to invoke `security` command")?;

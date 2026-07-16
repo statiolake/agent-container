@@ -23,6 +23,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::Stdio;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -141,6 +142,7 @@ fn host_git_config(workspace: &Path, key: &str) -> Option<String> {
         .args(["-C"])
         .arg(workspace)
         .args(["config", "--get", key])
+        .stdin(Stdio::null())
         .output()
         .ok()?;
     if !output.status.success() {
