@@ -948,7 +948,7 @@ fn write_secret_shadow_compose_override(
     std::fs::write(&path, out)
         .with_context(|| format!("failed to write compose override {}", path.display()))?;
     eprintln!(
-        "[agent-container] shadowing {} existing denied workspace path(s)",
+        "[agent-container] filesystem guard: hiding {} denied workspace path(s)",
         mounts.len()
     );
     Ok(Some(path))

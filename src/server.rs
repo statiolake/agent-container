@@ -190,7 +190,7 @@ pub async fn spawn(config: SpawnConfig) -> Result<RunningServer> {
                 }
                 Err(e) => {
                     eprintln!(
-                        "[agent-container] failed to start stdio MCP server '{}': {e:#}",
+                        "[agent-container] warning: MCP server '{}' is unavailable ({e:#})",
                         s.name
                     );
                     notifications.insert(name.clone(), new_notification_channel());

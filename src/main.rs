@@ -172,6 +172,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    maybe_reexec_run_with_herdr_agent(&cli)?;
+
     let (_log_guard, log_path) = init_tracing();
     if let Some(p) = &log_path {
         eprintln!(
@@ -215,6 +217,21 @@ async fn main() -> Result<()> {
         } => dispatch_config(command, global, workspace, editor).await,
         Commands::Mcp { agent, command } => dispatch_mcp(agent, command).await,
     }
+}
+
+fn maybe_reexec_run_with_herdr_agent(cli: &Cli) -> Result<()> {
+    let Commands::Run { agent, .. } = &cli.command else {
+        return Ok(());
+    };
+    if !needs_herdr_agent_reexec() {
+        return Ok(());
+    }
+    let host = paths::HostPaths::detect()?;
+    let merged_settings = settings::Settings::load_merged(&host.workspace)
+        .context("failed to load agent-container settings (global + workspace)")?;
+    let agent =
+        agent.unwrap_or_else(|| agent_kind_from_default(merged_settings.general.default_agent()));
+    reexec_with_herdr_agent(herdr_agent_label(agent))
 }
 
 async fn dispatch_mcp(agent: Option<AgentKind>, command: McpCommands) -> Result<()> {
@@ -585,7 +602,6 @@ async fn run_cmd(
         .context("failed to load agent-container settings (global + workspace)")?;
     let agent = agent_override
         .unwrap_or_else(|| agent_kind_from_default(merged_settings.general.default_agent()));
-    maybe_reexec_with_herdr_agent(agent)?;
 
     let image_task = tokio::spawn(async move {
         docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
@@ -631,33 +647,15 @@ async fn run_cmd(
             setup.profile
         );
     }
-    if !claude_mcp_servers.is_empty() {
-        let labels: Vec<_> = claude_mcp_servers
-            .iter()
-            .map(|s| format!("{}({})", s.name(), s.transport_label()))
-            .collect();
-        eprintln!(
-            "[agent-container] proxying {} MCP server(s) through broker: {}",
-            claude_mcp_servers.len(),
-            labels.join(", ")
-        );
-    }
-    if !codex_mcp_servers.is_empty() {
-        let labels: Vec<_> = codex_mcp_servers
-            .iter()
-            .map(|s| format!("{}({})", s.name(), s.transport_label()))
-            .collect();
-        eprintln!(
-            "[agent-container] proxying {} Codex MCP server(s) through broker: {}",
-            codex_mcp_servers.len(),
-            labels.join(", ")
-        );
-    }
+    print_mcp_summary(&claude_mcp_servers, &codex_mcp_servers);
     if let Some(runner) = &services.claude_task_runner {
         eprintln!(
-            "[agent-container] task-runner MCP exposing {} task(s): {}",
-            runner.tasks.len(),
-            runner.tasks.keys().cloned().collect::<Vec<_>>().join(", ")
+            "[agent-container] task-runner: {} task(s)",
+            runner.tasks.len()
+        );
+        tracing::info!(
+            tasks = %runner.tasks.keys().cloned().collect::<Vec<_>>().join(", "),
+            "task-runner MCP tasks"
         );
     }
 
@@ -813,11 +811,8 @@ fn agent_kind_from_default(agent: settings::DefaultAgent) -> AgentKind {
     }
 }
 
-fn maybe_reexec_with_herdr_agent(agent: AgentKind) -> Result<()> {
-    if std::env::var_os("HERDR_ENV").is_none() || std::env::var_os("HERDR_AGENT").is_some() {
-        return Ok(());
-    }
-    reexec_with_herdr_agent(herdr_agent_label(agent))
+fn needs_herdr_agent_reexec() -> bool {
+    std::env::var_os("HERDR_ENV").is_some() && std::env::var_os("HERDR_AGENT").is_none()
 }
 
 fn herdr_agent_label(agent: AgentKind) -> &'static str {
@@ -841,6 +836,30 @@ fn reexec_with_herdr_agent(label: &str) -> Result<()> {
 #[cfg(not(unix))]
 fn reexec_with_herdr_agent(_label: &str) -> Result<()> {
     Ok(())
+}
+
+fn print_mcp_summary(claude_mcp_servers: &[mcp::McpServer], codex_mcp_servers: &[mcp::McpServer]) {
+    if claude_mcp_servers.is_empty() && codex_mcp_servers.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[agent-container] MCP broker: Claude Code {} server(s), Codex {} server(s)",
+        claude_mcp_servers.len(),
+        codex_mcp_servers.len()
+    );
+    tracing::info!(
+        claude_servers = %mcp_server_summary(claude_mcp_servers),
+        codex_servers = %mcp_server_summary(codex_mcp_servers),
+        "MCP broker server summary"
+    );
+}
+
+fn mcp_server_summary(servers: &[mcp::McpServer]) -> String {
+    servers
+        .iter()
+        .map(|s| format!("{}({})", s.name(), s.transport_label()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn agent_command(agent: AgentKind, tmux: bool, tmux_prefix: &str) -> Result<Vec<String>> {
