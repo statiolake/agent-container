@@ -24,6 +24,7 @@ mod staging_archive;
 mod stdio_mcp;
 mod sync;
 mod task_runner;
+mod terminal_output;
 mod tui;
 
 use std::collections::BTreeMap;
@@ -175,6 +176,7 @@ async fn main() -> Result<()> {
     maybe_reexec_run_with_herdr_agent(&cli)?;
 
     let (_log_guard, log_path) = init_tracing();
+    terminal_output::set_child_log_path(log_path.clone());
     if let Some(p) = &log_path {
         eprintln!(
             "[agent-container] logs: {} (set AGENT_CONTAINER_LOG_FILE=- to route to stderr instead)",

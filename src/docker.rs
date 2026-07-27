@@ -276,16 +276,18 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
     impl<'a> Drop for Cleanup<'a> {
         fn drop(&mut self) {
             if let Err(e) = compose_down_sync(self.compose) {
-                eprintln!("[agent-container] warning: compose down failed: {e:#}");
+                crate::terminal_output::line(format_args!(
+                    "[agent-container] warning: compose down failed: {e:#}"
+                ));
             }
             for path in &self.paths {
                 if let Err(e) = remove_path_any(path)
                     && e.kind() != ErrorKind::NotFound
                 {
-                    eprintln!(
+                    crate::terminal_output::line(format_args!(
                         "[agent-container] warning: failed to remove temporary path {}: {e}",
                         path.display()
-                    );
+                    ));
                 }
             }
         }
@@ -343,8 +345,11 @@ pub async fn run(opts: RunOptions) -> Result<i32> {
         &agent_container_id,
         is_stdin_tty(),
     ));
-    let child = cmd.spawn().context("failed to spawn docker start")?;
-    let status = wait_compose_child_or_interrupt(child, ctx.clone(), "docker start").await;
+    let status = {
+        let _terminal = crate::terminal_output::ChildTerminalGuard::acquire();
+        let child = cmd.spawn().context("failed to spawn docker start")?;
+        wait_compose_child_or_interrupt(child, ctx.clone(), "docker start").await
+    };
     proxy_reload.abort();
     let exit = match status? {
         ChildExit::Exited(status) => status.code().unwrap_or(1),
@@ -504,28 +509,38 @@ async fn wait_compose_child_or_interrupt(
             Ok(ChildExit::Exited(status))
         }
         signal = shutdown_signal() => {
-            eprintln!("[agent-container] {signal} received; cleaning up compose stack...");
+            crate::terminal_output::line(format_args!(
+                "[agent-container] {signal} received; cleaning up compose stack..."
+            ));
 
             match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
-                    eprintln!("[agent-container] warning: failed to wait for interrupted {label}: {e}");
+                    crate::terminal_output::line(format_args!(
+                        "[agent-container] warning: failed to wait for interrupted {label}: {e}"
+                    ));
                 }
                 Err(_) => {
                     match tokio::time::timeout(Duration::from_secs(2), child.kill()).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            eprintln!("[agent-container] warning: failed to stop {label} after interrupt: {e}");
+                            crate::terminal_output::line(format_args!(
+                                "[agent-container] warning: failed to stop {label} after interrupt: {e}"
+                            ));
                         }
                         Err(_) => {
-                            eprintln!("[agent-container] warning: timed out stopping {label} after interrupt");
+                            crate::terminal_output::line(format_args!(
+                                "[agent-container] warning: timed out stopping {label} after interrupt"
+                            ));
                         }
                     }
                 }
             }
 
             if let Err(e) = compose_down_sync(&ctx) {
-                eprintln!("[agent-container] warning: compose down after interrupt failed: {e:#}");
+                crate::terminal_output::line(format_args!(
+                    "[agent-container] warning: compose down after interrupt failed: {e:#}"
+                ));
             }
             Ok(ChildExit::Interrupted)
         }
@@ -541,7 +556,9 @@ async fn shutdown_signal() -> &'static str {
     tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             if let Err(e) = signal {
-                eprintln!("[agent-container] warning: failed to install Ctrl+C handler: {e}");
+                crate::terminal_output::line(format_args!(
+                    "[agent-container] warning: failed to install Ctrl+C handler: {e}"
+                ));
             }
             "interrupt"
         }
@@ -562,7 +579,9 @@ async fn recv_optional_signal(signal: &mut Option<Signal>) {
 #[cfg(not(unix))]
 async fn shutdown_signal() -> &'static str {
     if let Err(e) = tokio::signal::ctrl_c().await {
-        eprintln!("[agent-container] warning: failed to install Ctrl+C handler: {e}");
+        crate::terminal_output::line(format_args!(
+            "[agent-container] warning: failed to install Ctrl+C handler: {e}"
+        ));
     }
     "interrupt"
 }
@@ -588,7 +607,9 @@ fn compose_down_sync(ctx: &ComposeCtx) -> Result<()> {
 fn spawn_stale_stack_cleanup() {
     tokio::spawn(async {
         if let Err(e) = cleanup_stale_agent_container_stacks().await {
-            eprintln!("[agent-container] warning: failed to cleanup stale compose stacks: {e:#}");
+            crate::terminal_output::line(format_args!(
+                "[agent-container] warning: failed to cleanup stale compose stacks: {e:#}"
+            ));
         }
     });
 }
@@ -624,7 +645,9 @@ async fn cleanup_stale_agent_container_stacks() -> Result<()> {
     }
 
     for project in stale_projects {
-        eprintln!("[agent-container] cleaning up stale compose stack {project}");
+        crate::terminal_output::line(format_args!(
+            "[agent-container] cleaning up stale compose stack {project}"
+        ));
         remove_labeled_objects("container", "rm", &["-f"], &project)
             .await
             .with_context(|| format!("failed to remove stale containers for {project}"))?;
@@ -844,10 +867,10 @@ fn collect_secret_shadow_mounts(
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-            eprintln!(
+            crate::terminal_output::line(format_args!(
                 "[agent-container] warning: skipping unreadable filesystem path {}: {e}",
                 path.display()
-            );
+            ));
             return Ok(());
         }
         Err(e) => return Err(e).with_context(|| format!("failed to stat {}", path.display())),
@@ -886,10 +909,10 @@ fn collect_secret_shadow_mounts(
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                eprintln!(
+                crate::terminal_output::line(format_args!(
                     "[agent-container] warning: skipping unreadable filesystem directory {}: {e}",
                     path.display()
-                );
+                ));
                 return Ok(());
             }
             Err(e) => return Err(e).with_context(|| format!("failed to list {}", path.display())),
@@ -898,10 +921,10 @@ fn collect_secret_shadow_mounts(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                    eprintln!(
+                    crate::terminal_output::line(format_args!(
                         "[agent-container] warning: skipping unreadable filesystem entry under {}: {e}",
                         path.display()
-                    );
+                    ));
                     continue;
                 }
                 Err(e) => {
@@ -947,10 +970,10 @@ fn write_secret_shadow_compose_override(
     }
     std::fs::write(&path, out)
         .with_context(|| format!("failed to write compose override {}", path.display()))?;
-    eprintln!(
+    crate::terminal_output::line(format_args!(
         "[agent-container] filesystem guard: hiding {} denied workspace path(s)",
         mounts.len()
-    );
+    ));
     Ok(Some(path))
 }
 
@@ -1000,11 +1023,15 @@ async fn watch_proxy_settings(
         match reload_proxy_settings(&ctx, &workspace, &allowlist_path, &last_allowlist).await {
             Ok(Some(next_allowlist)) => {
                 last_allowlist = next_allowlist;
-                eprintln!("[agent-container] proxy allowlist reloaded");
+                crate::terminal_output::line(format_args!(
+                    "[agent-container] proxy allowlist reloaded"
+                ));
             }
             Ok(None) => {}
             Err(e) => {
-                eprintln!("[agent-container] warning: failed to reload proxy allowlist: {e:#}")
+                crate::terminal_output::line(format_args!(
+                    "[agent-container] warning: failed to reload proxy allowlist: {e:#}"
+                ));
             }
         }
     }

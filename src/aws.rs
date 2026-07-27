@@ -145,9 +145,9 @@ pub fn resolve_credentials(
             let Some(cmd) = refresh else {
                 return Err(first_err);
             };
-            eprintln!(
+            crate::terminal_output::line(format_args!(
                 "[agent-container] AWS credentials resolution failed; running awsAuthRefresh: {cmd}"
-            );
+            ));
             run_refresh(cmd)
                 .context("awsAuthRefresh command failed; the original credential resolution error still stands")?;
             try_resolve(setup).with_context(|| {

@@ -189,10 +189,10 @@ pub async fn spawn(config: SpawnConfig) -> Result<RunningServer> {
                     );
                 }
                 Err(e) => {
-                    eprintln!(
+                    crate::terminal_output::line(format_args!(
                         "[agent-container] warning: MCP server '{}' is unavailable ({e:#})",
                         s.name
-                    );
+                    ));
                     notifications.insert(name.clone(), new_notification_channel());
                     mcp.insert(
                         name,
@@ -208,10 +208,10 @@ pub async fn spawn(config: SpawnConfig) -> Result<RunningServer> {
     }
     if let Some(runner) = task_runner {
         if mcp.contains_key(task_runner::NAME) {
-            eprintln!(
+            crate::terminal_output::line(format_args!(
                 "[agent-container] note: a user-declared MCP server named '{}' already exists — skipping the built-in task-runner",
                 task_runner::NAME
-            );
+            ));
         } else {
             notifications.insert(task_runner::NAME.to_string(), new_notification_channel());
             mcp.insert(
@@ -222,10 +222,10 @@ pub async fn spawn(config: SpawnConfig) -> Result<RunningServer> {
     }
     if let Some(host_fs) = host_fs {
         if mcp.contains_key(host_fs::NAME) {
-            eprintln!(
+            crate::terminal_output::line(format_args!(
                 "[agent-container] note: a user-declared MCP server named '{}' already exists — skipping the built-in host-fs",
                 host_fs::NAME
-            );
+            ));
         } else {
             notifications.insert(host_fs::NAME.to_string(), new_notification_channel());
             mcp.insert(
