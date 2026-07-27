@@ -255,9 +255,11 @@ Each task-runner entry becomes an MCP tool that runs on the host; MCP
 arguments are passed as environment variables, so a task command can refer to
 `$env`, `$value`, and similar names. `$CONFIG_ROOT` points at the host-side
 agent-container settings directory that defined the task, so global and
-workspace task scripts can use the same command shape. `timeout_seconds` is a
-reserved per-call argument that sets a task-runner timeout and is not passed to
-the command environment; omit it to run without a task-runner timeout.
+workspace task scripts can use the same command shape. `argv` is a reserved
+array argument that becomes the command's positional parameters, so commands can
+forward it with `"$@"`. `timeout_seconds` is a reserved per-call argument that
+sets a task-runner timeout and is not passed to the command environment; omit it
+to run without a task-runner timeout.
 
 `filesystem` controls both container bind mounts and the built-in host-fs MCP
 server. The current workspace is always mounted. `filesystem.mounts` adds more

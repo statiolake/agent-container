@@ -331,6 +331,10 @@ Each task also gets `CONFIG_ROOT`, pointing at the host-side
 `.agent-container` directory or global config directory that defined that
 task. Use it for commands such as `"$CONFIG_ROOT/scripts/foo.sh"` when
 global and workspace tasks share the same layout.
+The reserved argument `argv` accepts an ordered array and passes it as shell
+positional parameters, so a task command such as
+`"$CONFIG_ROOT/scripts/foo.sh" "$@"` can forward arbitrary arguments without
+inventing environment variable names.
 The reserved argument `timeout_seconds` sets a per-call task-runner timeout
 and is not forwarded to the command environment; omit it to run without a
 task-runner timeout.

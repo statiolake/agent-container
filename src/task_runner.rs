@@ -3,7 +3,9 @@
 //! becomes a tool; the model can call them via `tools/call` and receives
 //! the combined stdout/stderr plus exit code. Tool arguments are passed
 //! through as environment variables, so a configured command can use
-//! shell expansion such as `$value`.
+//! shell expansion such as `$value`. The reserved `argv` argument is
+//! passed as shell positional parameters instead, so commands can forward
+//! it with `"$@"`.
 //!
 //! The broker serves this entirely in-process — there is no upstream
 //! process to forward to — so it implements just enough of the MCP
@@ -34,6 +36,7 @@ pub const NAME: &str = "task-runner";
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const TIMEOUT_ARGUMENT: &str = "timeout_seconds";
+const ARGV_ARGUMENT: &str = "argv";
 const MAX_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, Default)]
@@ -168,7 +171,7 @@ impl TaskRunner {
                 json!({
                     "name": name,
                     "description": format!(
-                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. `$CONFIG_ROOT` points at the host-side agent-container settings directory that defined this task. Set `{TIMEOUT_ARGUMENT}` to a positive number of seconds when this host task needs an explicit timeout; omit it to run without a task-runner timeout."
+                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. Pass `{ARGV_ARGUMENT}` as an ordered array when the command should receive positional parameters; the shell can forward them with `\"$@\"`. `$CONFIG_ROOT` points at the host-side agent-container settings directory that defined this task. Set `{TIMEOUT_ARGUMENT}` to a positive number of seconds when this host task needs an explicit timeout; omit it to run without a task-runner timeout."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -177,6 +180,17 @@ impl TaskRunner {
                                 "type": "number",
                                 "exclusiveMinimum": 0,
                                 "description": "Optional task-runner timeout in seconds. This reserved argument is not passed to the host command as an environment variable."
+                            },
+                            ARGV_ARGUMENT: {
+                                "type": "array",
+                                "items": {
+                                    "oneOf": [
+                                        { "type": "string" },
+                                        { "type": "number" },
+                                        { "type": "boolean" }
+                                    ]
+                                },
+                                "description": "Optional ordered positional arguments for the host command. This reserved argument is available to the shell as \"$@\" and is not passed as an environment variable."
                             }
                         },
                         "additionalProperties": {
@@ -241,6 +255,7 @@ impl TaskRunner {
 #[derive(Debug, Default)]
 struct CmdInvocation {
     env: BTreeMap<String, String>,
+    argv: Vec<String>,
     timeout: Option<Duration>,
 }
 
@@ -265,6 +280,10 @@ fn parse_invocation(arguments: Option<&Value>) -> std::result::Result<CmdInvocat
             invocation.timeout = Some(parse_timeout(value)?);
             continue;
         }
+        if key == ARGV_ARGUMENT {
+            invocation.argv = parse_argv(value)?;
+            continue;
+        }
 
         if !is_valid_env_key(key) {
             return Err(format!(
@@ -286,6 +305,24 @@ fn parse_invocation(arguments: Option<&Value>) -> std::result::Result<CmdInvocat
     }
 
     Ok(invocation)
+}
+
+fn parse_argv(value: &Value) -> std::result::Result<Vec<String>, String> {
+    let Some(values) = value.as_array() else {
+        return Err(format!("argument `{ARGV_ARGUMENT}` must be an array"));
+    };
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| match value {
+            Value::String(s) => Ok(s.clone()),
+            Value::Number(n) => Ok(n.to_string()),
+            Value::Bool(b) => Ok(b.to_string()),
+            _ => Err(format!(
+                "argument `{ARGV_ARGUMENT}` item {index} must be a string, number, or boolean"
+            )),
+        })
+        .collect()
 }
 
 fn parse_timeout(value: &Value) -> std::result::Result<Duration, String> {
@@ -327,7 +364,10 @@ async fn run_command(task: &TaskSpec, invocation: &CmdInvocation) -> Result<CmdO
     // Wrap the user's command line in `sh -c` so pipes, quoting, and env
     // expansions behave the way the operator expects when they typed it.
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(&task.command);
+    cmd.arg("-c")
+        .arg(&task.command)
+        .arg("agent-container-task-runner")
+        .args(&invocation.argv);
     cmd.envs(&invocation.env);
     cmd.env("CONFIG_ROOT", &task.config_root);
     cmd.stdin(Stdio::null());
@@ -491,6 +531,7 @@ mod tests {
         let resp = r.handle(req).await.unwrap();
         let first = &resp["result"]["tools"].as_array().unwrap()[0];
         assert!(first["inputSchema"]["properties"][TIMEOUT_ARGUMENT].is_object());
+        assert!(first["inputSchema"]["properties"][ARGV_ARGUMENT].is_object());
         let names: Vec<_> = resp["result"]["tools"]
             .as_array()
             .unwrap()
@@ -551,6 +592,39 @@ mod tests {
         assert_eq!(resp["result"]["isError"], false);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("hello world/42/true/unset"));
+    }
+
+    #[tokio::test]
+    async fn argv_argument_is_exposed_as_shell_positionals() {
+        let mut tasks = BTreeMap::new();
+        tasks.insert(
+            "argv".into(),
+            task(
+                "printf '<%s>\\n' \"$@\"; printf 'argv-env=%s\\n' \"${argv:-unset}\"",
+                "/tmp/agent-container-test",
+            ),
+        );
+        let r = TaskRunner::new(tasks);
+        let req = br#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"argv","arguments":{"argv":["hello world",42,true]}}}"#;
+        let resp = r.handle(req).await.unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("<hello world>\n<42>\n<true>"));
+        assert!(text.contains("argv-env=unset"));
+    }
+
+    #[tokio::test]
+    async fn invalid_argv_is_rejected() {
+        let r = build();
+        let req = br#"{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"echo","arguments":{"argv":"not-array"}}}"#;
+        let resp = r.handle(req).await.unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("must be an array")
+        );
     }
 
     #[tokio::test]
