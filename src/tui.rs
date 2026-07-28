@@ -93,6 +93,13 @@ struct TextField {
     cursor: usize,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct WrappedText {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: u16,
+}
+
 impl TextField {
     fn from_str(s: &str) -> Self {
         let chars: Vec<char> = s.chars().collect();
@@ -199,6 +206,45 @@ impl TextField {
     fn prefix_width(&self) -> u16 {
         let prefix: String = self.chars[..self.cursor].iter().collect();
         Span::raw(prefix).width() as u16
+    }
+
+    /// Soft-wrap this field into terminal-cell-width lines while keeping
+    /// the logical value unchanged. The returned cursor position uses the
+    /// same layout as the returned lines, so callers can scroll a
+    /// multi-line viewport without losing the caret.
+    fn wrapped(&self, width: u16) -> WrappedText {
+        let width = width.max(1);
+        let mut lines = vec![String::new()];
+        let mut row = 0;
+        let mut col: u16 = 0;
+        let mut cursor_position = None;
+
+        for (index, ch) in self.chars.iter().copied().enumerate() {
+            let char_width = Span::raw(ch.to_string()).width() as u16;
+            if char_width > 0 && col > 0 && col.saturating_add(char_width) > width {
+                lines.push(String::new());
+                row += 1;
+                col = 0;
+            }
+            if index == self.cursor {
+                cursor_position = Some((row, col));
+            }
+
+            lines[row].push(ch);
+            col = col.saturating_add(char_width);
+            if col >= width {
+                lines.push(String::new());
+                row += 1;
+                col = 0;
+            }
+        }
+
+        let (cursor_row, cursor_col) = cursor_position.unwrap_or((row, col));
+        WrappedText {
+            lines,
+            cursor_row,
+            cursor_col,
+        }
     }
 }
 
@@ -3445,8 +3491,8 @@ fn render_task_input_modal(
     focus: TaskField,
     is_edit: bool,
 ) {
-    let w = parent.width.clamp(50, 80);
-    let h: u16 = 8;
+    let w = parent.width.min(80);
+    let h = parent.height.min(12);
     let x = parent.x + (parent.width.saturating_sub(w)) / 2;
     let y = parent.y + (parent.height.saturating_sub(h)) / 2;
     let area = Rect::new(x, y, w, h);
@@ -3474,29 +3520,56 @@ fn render_task_input_modal(
         Span::raw("  "),
         Span::raw(name.value()),
     ]);
-    let cmd_line = Line::from(vec![
-        Span::styled(" command ", focus_style(focus, TaskField::Command)),
-        Span::raw("  "),
-        Span::raw(command.value()),
-    ]);
-    let para = Paragraph::new(vec![
-        hint,
-        Line::from(""),
-        name_line,
-        Line::from(""),
-        cmd_line,
-    ]);
-    f.render_widget(para, inner);
+    f.render_widget(
+        Paragraph::new(vec![hint, Line::from(""), name_line]),
+        Rect::new(inner.x, inner.y, inner.width, inner.height.min(3)),
+    );
+
+    const FIELD_PREFIX_WIDTH: u16 = 11;
+    const COMMAND_ROW: u16 = 4;
+    if inner.height > COMMAND_ROW {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " command ",
+                focus_style(focus, TaskField::Command),
+            ))),
+            Rect::new(inner.x, inner.y + COMMAND_ROW, inner.width, 1),
+        );
+    }
+
+    let command_area = Rect::new(
+        inner.x.saturating_add(FIELD_PREFIX_WIDTH),
+        inner.y.saturating_add(COMMAND_ROW),
+        inner.width.saturating_sub(FIELD_PREFIX_WIDTH),
+        inner.height.saturating_sub(COMMAND_ROW),
+    );
+    let wrapped = command.wrapped(command_area.width);
+    let visible_height = usize::from(command_area.height.max(1));
+    let command_scroll = wrapped
+        .cursor_row
+        .saturating_sub(visible_height.saturating_sub(1));
+    let command_lines: Vec<Line<'_>> = wrapped
+        .lines
+        .iter()
+        .skip(command_scroll)
+        .take(visible_height)
+        .map(|line| Line::from(line.as_str()))
+        .collect();
+    f.render_widget(Paragraph::new(command_lines), command_area);
 
     // Field text starts 11 cells in from the modal's inner-left: 9-char
-    // label (" name    " / " command ") + 2-space separator. The hint sits
-    // on row 0, a blank row on 1, so the fields are at rows 2 and 4.
-    let (active_field, row) = match focus {
-        TaskField::Name => (name, 2),
-        TaskField::Command => (command, 4),
+    // label (" name    " / " command ") + 2-space separator. The command
+    // is a soft-wrapped viewport whose scroll follows the logical caret.
+    let (cursor_x, cursor_y) = match focus {
+        TaskField::Name => (
+            inner.x + FIELD_PREFIX_WIDTH + name.prefix_width(),
+            inner.y + 2,
+        ),
+        TaskField::Command => (
+            command_area.x + wrapped.cursor_col,
+            command_area.y + (wrapped.cursor_row - command_scroll) as u16,
+        ),
     };
-    let cursor_x = inner.x + 11 + active_field.prefix_width();
-    let cursor_y = inner.y + row;
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
@@ -3594,6 +3667,55 @@ mod tests {
         f.move_home();
         f.delete_forward();
         assert_eq!(f.value(), "本");
+    }
+
+    #[test]
+    fn text_field_wraps_without_changing_its_value() {
+        let f = TextField::from_str("0123456789abcdef");
+
+        assert_eq!(
+            f.wrapped(6),
+            WrappedText {
+                lines: vec!["012345".into(), "6789ab".into(), "cdef".into()],
+                cursor_row: 2,
+                cursor_col: 4,
+            }
+        );
+        assert_eq!(f.value(), "0123456789abcdef");
+    }
+
+    #[test]
+    fn wrapped_text_cursor_tracks_edits_and_wide_characters() {
+        let mut f = TextField::from_str("ab日本cd");
+        f.move_left();
+        f.move_left();
+
+        assert_eq!(
+            f.wrapped(5),
+            WrappedText {
+                lines: vec!["ab日".into(), "本cd".into()],
+                cursor_row: 1,
+                cursor_col: 2,
+            }
+        );
+
+        f.move_end();
+        assert_eq!(f.wrapped(5).cursor_row, 1);
+        assert_eq!(f.wrapped(5).cursor_col, 4);
+    }
+
+    #[test]
+    fn wrapped_text_places_caret_on_a_new_line_at_exact_boundary() {
+        let f = TextField::from_str("abcdef");
+
+        assert_eq!(
+            f.wrapped(3),
+            WrappedText {
+                lines: vec!["abc".into(), "def".into(), String::new()],
+                cursor_row: 2,
+                cursor_col: 0,
+            }
+        );
     }
 
     #[test]
