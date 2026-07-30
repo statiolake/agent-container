@@ -86,6 +86,34 @@ impl SharedCredFile {
         host_sync: HostSync,
         loader: impl FnOnce() -> Result<String>,
     ) -> Result<(Self, String)> {
+        Self::open_inner(
+            shared_path,
+            host_sync,
+            loader,
+            None::<fn(&str, &str) -> bool>,
+        )
+    }
+
+    /// Like [`Self::open`], but when a live sibling already owns the
+    /// shared credential generation, also read the host credential and
+    /// replace the shared copy if `host_is_newer(shared, host)` says the
+    /// host has a newer generation. This covers an operator refreshing
+    /// credentials on the host while an older container is still alive.
+    pub fn open_with_host_refresh(
+        shared_path: PathBuf,
+        host_sync: HostSync,
+        loader: impl FnOnce() -> Result<String>,
+        host_is_newer: impl Fn(&str, &str) -> bool,
+    ) -> Result<(Self, String)> {
+        Self::open_inner(shared_path, host_sync, loader, Some(host_is_newer))
+    }
+
+    fn open_inner(
+        shared_path: PathBuf,
+        host_sync: HostSync,
+        loader: impl FnOnce() -> Result<String>,
+        host_is_newer: Option<impl Fn(&str, &str) -> bool>,
+    ) -> Result<(Self, String)> {
         if let Some(parent) = shared_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -110,12 +138,29 @@ impl SharedCredFile {
             flock(&lock_file, FlockOperation::LockShared).with_context(|| {
                 format!("failed to take shared lock on {}", lock_path.display())
             })?;
-            fs::read_to_string(&shared_path).with_context(|| {
+            let shared_raw = fs::read_to_string(&shared_path).with_context(|| {
                 format!(
                     "failed to read shared credentials at {}",
                     shared_path.display()
                 )
-            })?
+            })?;
+            match host_is_newer {
+                Some(host_is_newer) => match loader() {
+                    Ok(host_raw) if host_is_newer(shared_raw.trim(), host_raw.trim()) => {
+                        write_secret_atomic(&shared_path, host_raw.trim())?;
+                        host_raw
+                    }
+                    Ok(_) => shared_raw,
+                    Err(e) => {
+                        tracing::debug!(
+                            %e,
+                            "failed to read host credentials while shared credentials are active",
+                        );
+                        shared_raw
+                    }
+                },
+                None => shared_raw,
+            }
         };
 
         if owns_fresh_session {
@@ -365,6 +410,58 @@ mod tests {
 
         assert_eq!(raw, "fresh");
         assert_eq!(fs::read_to_string(&shared).unwrap(), "fresh");
+    }
+
+    #[test]
+    fn active_shared_file_advances_when_host_is_newer() {
+        let _guard = shared_cred_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("creds.json");
+        let dest = dir.path().join("host.json");
+
+        let (_handle, raw) =
+            SharedCredFile::open(shared.clone(), HostSync::File(dest.clone()), || {
+                Ok("v1".to_string())
+            })
+            .unwrap();
+        assert_eq!(raw, "v1");
+
+        let (_handle2, raw2) = SharedCredFile::open_with_host_refresh(
+            shared.clone(),
+            HostSync::File(dest),
+            || Ok("v2".to_string()),
+            |shared, host| shared == "v1" && host == "v2",
+        )
+        .unwrap();
+
+        assert_eq!(raw2, "v2");
+        assert_eq!(fs::read_to_string(&shared).unwrap(), "v2");
+    }
+
+    #[test]
+    fn active_shared_file_ignores_older_host_generation() {
+        let _guard = shared_cred_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("creds.json");
+        let dest = dir.path().join("host.json");
+
+        let (_handle, raw) =
+            SharedCredFile::open(shared.clone(), HostSync::File(dest.clone()), || {
+                Ok("v2".to_string())
+            })
+            .unwrap();
+        assert_eq!(raw, "v2");
+
+        let (_handle2, raw2) = SharedCredFile::open_with_host_refresh(
+            shared.clone(),
+            HostSync::File(dest),
+            || Ok("v1".to_string()),
+            |shared, host| shared == "v1" && host == "v2",
+        )
+        .unwrap();
+
+        assert_eq!(raw2, "v2");
+        assert_eq!(fs::read_to_string(&shared).unwrap(), "v2");
     }
 
     #[test]

@@ -4,8 +4,12 @@
 //! shares one credentials file under `$XDG_DATA/agent-container/shared/`
 //! so that an OAuth refresh in one container is visible to the others
 //! and to the host. The file is materialised from the host on first
-//! use (Keychain on macOS, `~/.claude/.credentials.json` on Linux) and
-//! written back to the host when the last container exits.
+//! use (Keychain on macOS, `~/.claude/.credentials.json` on Linux).
+//! While sibling containers are alive, a newly started container still
+//! compares the host credentials' `expiresAt` with the shared copy and
+//! advances the shared generation when the host is clearly newer. The
+//! final shared value is written back to the host when the last
+//! container exits.
 
 use std::path::{Path, PathBuf};
 
@@ -42,9 +46,12 @@ pub fn prepare(claude_root: &Path) -> Result<CredentialFile> {
     let shared_path = shared_dir()?.join("claude-credentials.json");
     let host_sync = host_sync_target(claude_root);
     let claude_root = claude_root.to_path_buf();
-    let (shared, raw) = SharedCredFile::open(shared_path, host_sync, move || {
-        read_raw_credentials_from_host(&claude_root)
-    })?;
+    let (shared, raw) = SharedCredFile::open_with_host_refresh(
+        shared_path,
+        host_sync,
+        move || read_raw_credentials_from_host(&claude_root),
+        host_credentials_are_newer,
+    )?;
     let parsed: Envelope =
         serde_json::from_str(raw.trim()).context("failed to parse Claude Code credentials JSON")?;
     Ok(CredentialFile {
@@ -82,6 +89,22 @@ fn read_raw_credentials_from_host(claude_root: &Path) -> Result<String> {
         .with_context(|| format!("failed to read credentials file at {}", path.display()))
 }
 
+fn host_credentials_are_newer(shared_raw: &str, host_raw: &str) -> bool {
+    let Some(shared_expires_at) = expires_at_ms(shared_raw) else {
+        return false;
+    };
+    let Some(host_expires_at) = expires_at_ms(host_raw) else {
+        return false;
+    };
+    host_expires_at > shared_expires_at
+}
+
+fn expires_at_ms(raw: &str) -> Option<i64> {
+    serde_json::from_str::<Envelope>(raw)
+        .ok()
+        .and_then(|envelope| envelope.oauth.expires_at)
+}
+
 #[cfg(target_os = "macos")]
 fn read_from_keychain() -> Result<String> {
     crate::keychain::read_generic_password(CLAUDE_CODE_CREDENTIALS_SERVICE)?
@@ -98,4 +121,33 @@ struct Envelope {
 struct OAuth {
     #[serde(default, rename = "expiresAt")]
     expires_at: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credentials(expires_at: i64) -> String {
+        format!(r#"{{"claudeAiOauth":{{"expiresAt":{expires_at}}}}}"#)
+    }
+
+    #[test]
+    fn host_credentials_win_only_when_expiry_is_newer() {
+        assert!(host_credentials_are_newer(
+            &credentials(1000),
+            &credentials(2000)
+        ));
+        assert!(!host_credentials_are_newer(
+            &credentials(2000),
+            &credentials(1000)
+        ));
+        assert!(!host_credentials_are_newer(
+            &credentials(2000),
+            &credentials(2000)
+        ));
+        assert!(!host_credentials_are_newer(
+            r#"{"claudeAiOauth":{}}"#,
+            &credentials(2000)
+        ));
+    }
 }

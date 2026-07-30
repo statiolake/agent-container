@@ -1,10 +1,14 @@
 //! Helpers for the Codex pathway: mount the host's `~/.codex/auth.json`
 //! directly and mount the host-side Codex history paths needed for
-//! resume/history. The rest of `~/.codex` (trust_level lists, plugins,
-//! caches, …) stays outside the container. We also pin a minimal
-//! `config.toml` inside the container so Codex does not try to nest its
-//! own bubblewrap sandbox (which fails inside docker because user
-//! namespaces cannot be recreated).
+//! resume/history. The auth file deliberately does not go through
+//! `shared_cred`: Codex first-party auth already lives in a portable
+//! host file, and direct bind-mounting keeps host-side `codex login`
+//! changes visible even while older agent-container sessions are still
+//! running. The rest of `~/.codex` (trust_level lists, plugins, caches,
+//! …) stays outside the container. We also pin a minimal `config.toml`
+//! inside the container so Codex does not try to nest its own bubblewrap
+//! sandbox (which fails inside docker because user namespaces cannot be
+//! recreated).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -402,7 +406,7 @@ url = "http://example.invalid/custom-host-fs"
     }
 
     #[test]
-    fn prepares_auth_by_mounting_host_auth_directly() {
+    fn prepares_auth_by_mounting_host_auth_directly_without_shared_copy() {
         let host_home = tempfile::tempdir().unwrap();
         let codex_root = host_home.path().join(".codex");
         fs::create_dir_all(&codex_root).unwrap();
