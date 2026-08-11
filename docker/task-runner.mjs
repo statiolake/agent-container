@@ -11,8 +11,9 @@ function usage() {
     [
       "Usage: task-runner TASK [KEY=VALUE ...] [-- ARG ...]",
       "",
-      "Run one task declared under [task_runner.tasks] through the host broker.",
-      "This command cannot execute arbitrary commands or define new tasks.",
+      "Run a task exposed by the task-runner MCP server through the host broker.",
+      "The MCP server is authoritative for available task names; this command",
+      "cannot execute arbitrary commands or define new tasks.",
       "",
       "  KEY=VALUE          expose a named task argument as an environment variable",
       "  -- ARG ...         pass ordered positional arguments to the task's \"$@\"",

@@ -340,7 +340,8 @@ and is not forwarded to the command environment; omit it to run without a
 task-runner timeout.
 
 The container image also includes a task-runner CLI for scripts and shell
-pipelines. It accepts the same configured task names and argument model:
+pipelines. It accepts the same task names and argument model exposed by the
+task-runner MCP server; that MCP server is authoritative for task availability:
 
 ```sh
 printf '%s\n' "$PR_BODY" | task-runner review -- --format markdown
@@ -351,8 +352,8 @@ KEY=VALUE arguments become task environment variables, arguments after -- are
 forwarded as "$@", and --timeout-seconds has the same meaning as the MCP
 argument. stdin is streamed to the host broker over HTTP, while stdout and
 stderr are streamed back to their corresponding local streams. The CLI cannot
-run arbitrary commands; the task must already be declared under
-`[task_runner.tasks]`.
+run arbitrary commands; only tasks exposed by the task-runner MCP server can
+be run.
 
 ## Known limitations
 

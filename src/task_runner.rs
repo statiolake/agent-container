@@ -36,7 +36,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 /// in the container's `~/.claude.json` and in any Claude-Code-side UI
 /// (`mcp__task-runner__<tool>`).
 pub const NAME: &str = "task-runner";
-pub const CLI_GUIDANCE: &str = "The container image also includes a `task-runner` CLI for shell pipelines. Invoke `task-runner TASK [KEY=VALUE ...] [-- ARG ...]`; it streams stdin through the host broker and streams stdout/stderr back, while allowing only tasks declared under `[task_runner.tasks]`.";
+pub const CLI_GUIDANCE: &str = "The container image also includes a `task-runner` CLI for shell pipelines. Invoke `task-runner TASK [KEY=VALUE ...] [-- ARG ...]`; it streams stdin through the host broker and streams stdout/stderr back. The task-runner MCP server is authoritative for which task names are available, so this CLI cannot execute arbitrary commands or define new tasks.";
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const TIMEOUT_ARGUMENT: &str = "timeout_seconds";
@@ -305,7 +305,7 @@ impl TaskRunner {
             return tool_error(
                 id,
                 format!(
-                    "unknown task '{name}' — configure it under [task_runner.tasks] in settings.toml"
+                    "unknown task '{name}' — it is not currently exposed by the task-runner MCP server"
                 ),
             );
         };
