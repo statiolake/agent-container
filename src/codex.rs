@@ -335,6 +335,7 @@ trust_level = "trusted"
         assert!(out.starts_with("host codex instructions\n\n"));
         assert!(out.contains(crate::container_notice::MARKER));
         assert!(out.contains("task_runner MCP server"));
+        assert!(out.contains(crate::task_runner::CLI_GUIDANCE));
     }
 
     #[test]

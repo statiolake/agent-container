@@ -36,6 +36,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 /// in the container's `~/.claude.json` and in any Claude-Code-side UI
 /// (`mcp__task-runner__<tool>`).
 pub const NAME: &str = "task-runner";
+pub const CLI_GUIDANCE: &str = "The container image also includes a `task-runner` CLI for shell pipelines. Invoke `task-runner TASK [KEY=VALUE ...] [-- ARG ...]`; it streams stdin through the host broker and streams stdout/stderr back, while allowing only tasks declared under `[task_runner.tasks]`.";
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const TIMEOUT_ARGUMENT: &str = "timeout_seconds";
@@ -242,7 +243,7 @@ impl TaskRunner {
                 json!({
                     "name": name,
                     "description": format!(
-                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. Pass `{ARGV_ARGUMENT}` as an ordered array when the command should receive positional parameters; the shell can forward them with `\"$@\"`. Pass `{STDIN_PATH_ARGUMENT}` to feed a workspace-local file to stdin; relative paths are resolved from the workspace. If the file cannot be read from the shared workspace, move or copy it into the workspace and pass that path. `$CONFIG_ROOT` points at the host-side agent-container settings directory that defined this task. Set `{TIMEOUT_ARGUMENT}` to a positive number of seconds when this host task needs an explicit timeout; omit it to run without a task-runner timeout."
+                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. Pass `{ARGV_ARGUMENT}` as an ordered array when the command should receive positional parameters; the shell can forward them with \"$@\". Pass `{STDIN_PATH_ARGUMENT}` to feed a workspace-local file to stdin; relative paths are resolved from the workspace. If the file cannot be read from the shared workspace, move or copy it into the workspace and pass that path. `$CONFIG_ROOT` points at the host-side agent-container settings directory that defined this task. Set `{TIMEOUT_ARGUMENT}` to a positive number of seconds when this host task needs an explicit timeout; omit it to run without a task-runner timeout. {CLI_GUIDANCE}"
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -721,6 +722,12 @@ mod tests {
         let req = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
         let resp = r.handle(req).await.unwrap();
         let first = &resp["result"]["tools"].as_array().unwrap()[0];
+        assert!(
+            first["description"]
+                .as_str()
+                .unwrap()
+                .contains(CLI_GUIDANCE)
+        );
         assert!(first["inputSchema"]["properties"][TIMEOUT_ARGUMENT].is_object());
         assert!(first["inputSchema"]["properties"][ARGV_ARGUMENT].is_object());
         assert!(first["inputSchema"]["properties"][STDIN_PATH_ARGUMENT].is_object());

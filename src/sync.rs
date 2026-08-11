@@ -1076,6 +1076,7 @@ mod tests {
         assert!(out.starts_with("host instructions\n\n"));
         assert!(out.contains(crate::container_notice::MARKER));
         assert!(out.contains("Network access from this container is restricted."));
+        assert!(out.contains(crate::task_runner::CLI_GUIDANCE));
     }
 
     #[test]
@@ -1098,6 +1099,7 @@ mod tests {
         let out = fs::read_to_string(container_home.path().join(".claude/CLAUDE.md")).unwrap();
         assert!(out.starts_with(crate::container_notice::MARKER));
         assert!(out.contains("HostRead, HostList, HostWrite, and HostSearch"));
+        assert!(out.contains(crate::task_runner::CLI_GUIDANCE));
     }
 
     #[test]
