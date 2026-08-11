@@ -1,7 +1,8 @@
 //! Bedrock pathway: detect the host's Bedrock configuration from
-//! `~/.claude/settings.json`, resolve AWS credentials for the named profile
-//! on the host (static keys, SSO, assume-role — all via `aws configure
-//! export-credentials`), and surface them as env vars for the container.
+//! `~/.claude/settings.json` or the current process environment, resolve
+//! AWS credentials for the named profile on the host (static keys, SSO,
+//! assume-role — all via `aws configure export-credentials`), and surface
+//! them as env vars for the container.
 
 use std::fs;
 use std::path::Path;
@@ -73,15 +74,47 @@ pub fn detect_setup(settings_path: &Path) -> Result<Option<BedrockSetup>> {
     }))
 }
 
+/// Return a BedrockSetup from the host process environment, matching the
+/// environment variables Claude Code itself uses. This lets operators switch
+/// profiles per invocation without editing `~/.claude/settings.json`.
+pub fn detect_setup_from_process_env() -> Option<BedrockSetup> {
+    detect_setup_from_env(|name| std::env::var(name).ok())
+}
+
+fn detect_setup_from_env(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<BedrockSetup> {
+    let enabled = lookup("CLAUDE_CODE_USE_BEDROCK").is_some_and(|v| truthy_str(v.trim()));
+    if !enabled {
+        return None;
+    }
+    let profile = lookup("AWS_PROFILE")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())?;
+    let model = lookup("ANTHROPIC_MODEL")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let region = lookup("AWS_REGION")
+        .or_else(|| lookup("AWS_DEFAULT_REGION"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+
+    Some(BedrockSetup {
+        profile,
+        model,
+        region,
+    })
+}
+
 fn truthy(v: Option<&Value>) -> bool {
     match v {
-        Some(Value::String(s)) => {
-            matches!(s.as_str(), "1" | "true" | "TRUE" | "True" | "yes" | "YES")
-        }
+        Some(Value::String(s)) => truthy_str(s),
         Some(Value::Bool(b)) => *b,
         Some(Value::Number(n)) => n.as_i64().is_some_and(|v| v != 0),
         _ => false,
     }
+}
+
+fn truthy_str(s: &str) -> bool {
+    matches!(s, "1" | "true" | "TRUE" | "True" | "yes" | "YES")
 }
 
 /// Look up an optional `awsAuthRefresh` shell command from either
@@ -328,6 +361,44 @@ mod tests {
     fn no_bedrock_when_settings_missing() {
         let p = std::env::temp_dir().join("definitely-not-here-agent-container.json");
         assert!(detect_setup(&p).unwrap().is_none());
+    }
+
+    #[test]
+    fn detects_bedrock_from_process_style_env() {
+        let s = detect_setup_from_env(|name| match name {
+            "CLAUDE_CODE_USE_BEDROCK" => Some("true".into()),
+            "AWS_PROFILE" => Some("sandbox".into()),
+            "ANTHROPIC_MODEL" => Some("anthropic.claude-sonnet-4-20250514-v1:0".into()),
+            "AWS_REGION" => Some("us-west-2".into()),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(s.profile, "sandbox");
+        assert_eq!(
+            s.model.as_deref(),
+            Some("anthropic.claude-sonnet-4-20250514-v1:0")
+        );
+        assert_eq!(s.region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn process_style_env_requires_enabled_flag_and_profile() {
+        assert!(
+            detect_setup_from_env(|name| match name {
+                "CLAUDE_CODE_USE_BEDROCK" => Some("1".into()),
+                _ => None,
+            })
+            .is_none()
+        );
+        assert!(
+            detect_setup_from_env(|name| match name {
+                "CLAUDE_CODE_USE_BEDROCK" => Some("0".into()),
+                "AWS_PROFILE" => Some("sandbox".into()),
+                _ => None,
+            })
+            .is_none()
+        );
     }
 
     #[test]

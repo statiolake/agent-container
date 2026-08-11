@@ -177,14 +177,22 @@ filtered Claude Code / Codex config generated for this run is streamed into
 the created container before startup. Network egress goes through the bundled
 proxy allowlist. Host-only
 operations should be exposed through `[task_runner.tasks]` instead of relying
-on ordinary container shell access.
+on ordinary container shell access. The image also provides a
+task-runner TASK [KEY=VALUE ...] [-- argv ...] CLI: it streams stdin through
+the host broker and can invoke only those configured tasks.
 
 Arguments for the chosen agent are accepted only after `--`, for example
 `agent-container run -- --continue`. Pass `--tmux` when you want the agent
 wrapped in a tmux session for agent teams or pane attachment. Pass
 `--bedrock-profile PROFILE` with Claude Code to enable Bedrock for only that
 session without changing host AWS environment variables. Use `--bedrock-region
-REGION` to override `[general].bedrock_region` for that session."#;
+REGION` to override `[general].bedrock_region` for that session.
+
+Inside the container, task-runner uses the same configured task table and
+argument validation as the MCP server. KEY=VALUE arguments become task
+environment variables, arguments after -- become "$@", and
+--timeout-seconds sets the same per-call timeout. Its standard input is
+streamed to the host task over HTTP; it cannot execute an arbitrary command."#;
 
 const SHELL_HELP: &str = r#"Open an interactive shell inside the same container environment used by `run`.
 

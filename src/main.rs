@@ -559,8 +559,10 @@ fn build_agent_services(
     claude_mcp_servers: &[mcp::McpServer],
     codex_mcp_servers: &[mcp::McpServer],
 ) -> AgentServices {
-    let claude_task_runner = build_task_runner(task_runner_tasks, claude_mcp_servers);
-    let codex_task_runner = build_task_runner(task_runner_tasks, codex_mcp_servers);
+    let claude_task_runner =
+        build_task_runner(&host.workspace, task_runner_tasks, claude_mcp_servers);
+    let codex_task_runner =
+        build_task_runner(&host.workspace, task_runner_tasks, codex_mcp_servers);
     let claude_host_fs = build_host_fs(&host.workspace, claude_mcp_servers);
     let codex_host_fs = build_host_fs(&host.workspace, codex_mcp_servers);
 
@@ -615,6 +617,7 @@ async fn run_cmd(
     // correctly regardless of which agent is the session primary.
     let detected_bedrock = aws::detect_setup(&host.claude_root.join("settings.json"))
         .context("failed to read Bedrock settings from ~/.claude/settings.json")?;
+    let env_bedrock = aws::detect_setup_from_process_env();
     let refresh = aws::detect_refresh_command(
         &host.claude_root.join("settings.json"),
         &host.home.join(".claude.json"),
@@ -626,10 +629,10 @@ async fn run_cmd(
         .context("failed to load MCP servers from ~/.codex/config.toml")?;
     let bedrock = resolve_run_bedrock_setup(
         agent,
-        detected_bedrock,
+        env_bedrock.or(detected_bedrock),
         bedrock_profile,
         bedrock_region,
-        merged_settings.general.bedrock_region(),
+        merged_settings.general.bedrock_region.as_deref(),
     )?;
     let task_runner_tasks = task_runner::load_specs_from_settings(&host.workspace)?;
     let services = build_agent_services(
@@ -747,7 +750,10 @@ async fn run_cmd(
         cursor_state_path: cursor_files.state_dir.path,
         cursor_auth_path: cursor_files.auth_file.path,
         bedrock_setup: bedrock,
-        broker_url_from_container: brokers.claude_url_from_container.clone(),
+        broker_url_from_container: match agent {
+            AgentKind::Codex => brokers.codex_url_from_container.clone(),
+            AgentKind::Claude | AgentKind::Cursor => brokers.claude_url_from_container.clone(),
+        },
         agent_command,
         extra_args: passthrough,
         proxy_allow: services.proxy_allow,
@@ -767,37 +773,48 @@ fn resolve_run_bedrock_setup(
     detected: Option<aws::BedrockSetup>,
     profile_override: Option<String>,
     region_override: Option<String>,
-    configured_region: &str,
+    configured_region: Option<&str>,
 ) -> Result<Option<aws::BedrockSetup>> {
     let has_region_override = region_override.is_some();
-    let region = resolve_bedrock_region(region_override, configured_region)?;
     if (profile_override.is_some() || has_region_override) && agent != AgentKind::Claude {
         bail!("--bedrock-profile and --bedrock-region are only supported when running Claude Code");
     }
     let Some(profile) = profile_override else {
-        return Ok(detected.map(|mut setup| {
-            setup.region = Some(region);
-            setup
-        }));
+        return detected
+            .map(|mut setup| {
+                setup.region = Some(resolve_bedrock_region(
+                    region_override,
+                    configured_region,
+                    setup.region.as_deref(),
+                )?);
+                Ok::<_, anyhow::Error>(setup)
+            })
+            .transpose();
     };
+    let detected_model = detected.as_ref().and_then(|setup| setup.model.clone());
+    let detected_region = detected.as_ref().and_then(|setup| setup.region.as_deref());
+    let region = resolve_bedrock_region(region_override, configured_region, detected_region)?;
     let profile = profile.trim();
     if profile.is_empty() {
         bail!("--bedrock-profile requires a non-empty profile name");
     }
     Ok(Some(aws::BedrockSetup {
         profile: profile.to_string(),
-        model: detected.and_then(|setup| setup.model),
+        model: detected_model,
         region: Some(region),
     }))
 }
 
 fn resolve_bedrock_region(
     region_override: Option<String>,
-    configured_region: &str,
+    configured_region: Option<&str>,
+    detected_region: Option<&str>,
 ) -> Result<String> {
     let raw = region_override
         .as_deref()
-        .unwrap_or(configured_region)
+        .or(configured_region)
+        .or(detected_region)
+        .unwrap_or(settings::GeneralPolicy::DEFAULT_BEDROCK_REGION)
         .trim();
     if raw.is_empty() {
         bail!("Bedrock region must not be empty");
@@ -1193,6 +1210,7 @@ fn prepare_claude_credentials(
 /// tables still register an empty MCP server so a running session can
 /// discover tasks added later via settings reload.
 fn build_task_runner(
+    workspace: &std::path::Path,
     tasks: &std::collections::BTreeMap<String, task_runner::TaskSpec>,
     declared_servers: &[mcp::McpServer],
 ) -> Option<task_runner::TaskRunner> {
@@ -1206,7 +1224,10 @@ fn build_task_runner(
         );
         return None;
     }
-    Some(task_runner::TaskRunner::new(tasks.clone()))
+    Some(task_runner::TaskRunner::new(
+        tasks.clone(),
+        workspace.to_path_buf(),
+    ))
 }
 
 fn build_host_fs(
@@ -1344,7 +1365,7 @@ mod tests {
             Some(detected),
             Some("sandbox".into()),
             None,
-            "ap-northeast-1",
+            Some("ap-northeast-1"),
         )
         .unwrap()
         .unwrap();
@@ -1361,7 +1382,7 @@ mod tests {
             None,
             Some("sandbox".into()),
             None,
-            "us-east-1",
+            Some("us-east-1"),
         )
         .unwrap()
         .unwrap();
@@ -1383,7 +1404,7 @@ mod tests {
             Some(detected),
             None,
             Some("us-west-2".into()),
-            "ap-northeast-1",
+            Some("ap-northeast-1"),
         )
         .unwrap()
         .unwrap();
@@ -1399,7 +1420,7 @@ mod tests {
             None,
             Some("sandbox".into()),
             None,
-            "ap-northeast-1",
+            Some("ap-northeast-1"),
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("only supported when running Claude Code"));
@@ -1412,9 +1433,35 @@ mod tests {
             None,
             None,
             Some("us-west-2".into()),
-            "ap-northeast-1",
+            Some("ap-northeast-1"),
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("only supported when running Claude Code"));
+    }
+
+    #[test]
+    fn detected_bedrock_region_survives_without_config_override() {
+        let detected = aws::BedrockSetup {
+            profile: "from-env".to_string(),
+            model: None,
+            region: Some("us-west-2".to_string()),
+        };
+
+        let setup = resolve_run_bedrock_setup(AgentKind::Claude, Some(detected), None, None, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(setup.profile, "from-env");
+        assert_eq!(setup.region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn bedrock_region_falls_back_to_default() {
+        let setup =
+            resolve_run_bedrock_setup(AgentKind::Claude, None, Some("sandbox".into()), None, None)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(setup.region.as_deref(), Some("ap-northeast-1"));
     }
 }

@@ -5,7 +5,9 @@
 //! through as environment variables, so a configured command can use
 //! shell expansion such as `$value`. The reserved `argv` argument is
 //! passed as shell positional parameters instead, so commands can forward
-//! it with `"$@"`.
+//! it with `"$@"`. The reserved `stdin_path` argument can feed a
+//! workspace-local file into the command's standard input without forcing
+//! the model to paste large content into the conversation.
 //!
 //! The broker serves this entirely in-process — there is no upstream
 //! process to forward to — so it implements just enough of the MCP
@@ -17,17 +19,18 @@
 //! - The regular per-tool allowlist (the user opted in by writing the
 //!   task down — making them re-approve the same names in the MCP tab
 //!   would just be friction).
-//! - Streaming output. Commands run to completion and the full output
-//!   lands in a single JSON-RPC response.
+//! - MCP streaming output. MCP calls run to completion and the full output
+//!   lands in a single JSON-RPC response. The separate in-container CLI
+//!   uses the broker's streaming HTTP endpoint.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// Wire-visible name of the server. Surfaces as the MCP server name both
 /// in the container's `~/.claude.json` and in any Claude-Code-side UI
@@ -37,17 +40,30 @@ pub const NAME: &str = "task-runner";
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const TIMEOUT_ARGUMENT: &str = "timeout_seconds";
 const ARGV_ARGUMENT: &str = "argv";
+const STDIN_PATH_ARGUMENT: &str = "stdin_path";
 const MAX_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskRunner {
     pub tasks: BTreeMap<String, TaskSpec>,
+    workspace: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
     pub command: String,
     pub config_root: PathBuf,
+}
+
+/// A configured task process whose stdin and output streams are owned by the
+/// broker's streaming HTTP adapter. The task itself has already gone through
+/// the same lookup and argument validation as an MCP `tools/call`.
+pub(crate) struct StreamingTask {
+    pub(crate) stdin: ChildStdin,
+    pub(crate) stdout: ChildStdout,
+    pub(crate) stderr: tokio::process::ChildStderr,
+    pub(crate) child: Child,
+    pub(crate) timeout: Option<Duration>,
 }
 
 pub fn load_specs_from_settings(workspace: &Path) -> Result<BTreeMap<String, TaskSpec>> {
@@ -104,8 +120,63 @@ fn specs_from_scopes(
 }
 
 impl TaskRunner {
-    pub fn new(tasks: BTreeMap<String, TaskSpec>) -> Self {
-        Self { tasks }
+    pub fn new(tasks: BTreeMap<String, TaskSpec>, workspace: PathBuf) -> Self {
+        Self { tasks, workspace }
+    }
+
+    pub(crate) async fn spawn_streaming(
+        &self,
+        name: &str,
+        arguments: Option<&Value>,
+    ) -> Result<StreamingTask> {
+        let invocation = parse_invocation(arguments).map_err(|message| anyhow!(message))?;
+        if invocation.stdin.is_some() {
+            bail!(
+                "{STDIN_PATH_ARGUMENT} is only available to MCP calls; the task-runner CLI streams its own stdin"
+            );
+        }
+        let task = self
+            .tasks
+            .get(name)
+            .with_context(|| format!("unknown task '{name}'"))?
+            .clone();
+
+        let mut cmd = command_for(&task, &invocation);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to spawn task '{name}'"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("task process did not expose stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("task process did not expose stdout")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("task process did not expose stderr")?;
+
+        Ok(StreamingTask {
+            stdin,
+            stdout,
+            stderr,
+            child,
+            timeout: invocation.timeout,
+        })
+    }
+
+    pub(crate) async fn spawn_streaming_cli(
+        &self,
+        name: &str,
+        arguments: &[String],
+    ) -> Result<StreamingTask> {
+        let arguments = parse_cli_arguments(arguments).map_err(|message| anyhow!(message))?;
+        self.spawn_streaming(name, Some(&arguments)).await
     }
 
     /// Dispatch a JSON-RPC request body. Returns `None` for notifications
@@ -171,7 +242,7 @@ impl TaskRunner {
                 json!({
                     "name": name,
                     "description": format!(
-                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. Pass `{ARGV_ARGUMENT}` as an ordered array when the command should receive positional parameters; the shell can forward them with `\"$@\"`. `$CONFIG_ROOT` points at the host-side agent-container settings directory that defined this task. Set `{TIMEOUT_ARGUMENT}` to a positive number of seconds when this host task needs an explicit timeout; omit it to run without a task-runner timeout."
+                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. Pass `{ARGV_ARGUMENT}` as an ordered array when the command should receive positional parameters; the shell can forward them with `\"$@\"`. Pass `{STDIN_PATH_ARGUMENT}` to feed a workspace-local file to stdin; relative paths are resolved from the workspace. If the file cannot be read from the shared workspace, move or copy it into the workspace and pass that path. `$CONFIG_ROOT` points at the host-side agent-container settings directory that defined this task. Set `{TIMEOUT_ARGUMENT}` to a positive number of seconds when this host task needs an explicit timeout; omit it to run without a task-runner timeout."
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -191,6 +262,10 @@ impl TaskRunner {
                                     ]
                                 },
                                 "description": "Optional ordered positional arguments for the host command. This reserved argument is available to the shell as \"$@\" and is not passed as an environment variable."
+                            },
+                            STDIN_PATH_ARGUMENT: {
+                                "type": "string",
+                                "description": "Optional workspace-local file path whose bytes are fed to the host command's standard input. Relative paths are resolved from the workspace. This reserved argument is not passed as an environment variable."
                             }
                         },
                         "additionalProperties": {
@@ -236,7 +311,7 @@ impl TaskRunner {
 
         let env_keys: Vec<_> = invocation.env.keys().cloned().collect();
         tracing::info!(task = %name, command = %task.command, config_root = %task.config_root.display(), env_keys = ?env_keys, "task-runner dispatching");
-        match run_command(task, &invocation).await {
+        match run_command(task, &self.workspace, &invocation).await {
             Ok(output) => {
                 let text = format_output(&output);
                 success(
@@ -256,7 +331,13 @@ impl TaskRunner {
 struct CmdInvocation {
     env: BTreeMap<String, String>,
     argv: Vec<String>,
+    stdin: Option<CmdStdin>,
     timeout: Option<Duration>,
+}
+
+#[derive(Debug)]
+enum CmdStdin {
+    Path(PathBuf),
 }
 
 struct CmdOutput {
@@ -284,6 +365,10 @@ fn parse_invocation(arguments: Option<&Value>) -> std::result::Result<CmdInvocat
             invocation.argv = parse_argv(value)?;
             continue;
         }
+        if key == STDIN_PATH_ARGUMENT {
+            invocation.stdin = Some(CmdStdin::Path(parse_stdin_path(value)?));
+            continue;
+        }
 
         if !is_valid_env_key(key) {
             return Err(format!(
@@ -305,6 +390,65 @@ fn parse_invocation(arguments: Option<&Value>) -> std::result::Result<CmdInvocat
     }
 
     Ok(invocation)
+}
+
+fn parse_cli_arguments(arguments: &[String]) -> std::result::Result<Value, String> {
+    let mut parsed = serde_json::Map::new();
+    let mut positional = Vec::new();
+    let mut after_separator = false;
+    let mut index = 0;
+
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if !after_separator && argument == "--" {
+            after_separator = true;
+            index += 1;
+            continue;
+        }
+        if after_separator {
+            positional.push(Value::String(argument.clone()));
+            index += 1;
+            continue;
+        }
+
+        let timeout = if argument == "--timeout-seconds" {
+            index += 1;
+            arguments
+                .get(index)
+                .cloned()
+                .ok_or_else(|| "--timeout-seconds requires a value".to_string())?
+        } else if let Some(value) = argument.strip_prefix("--timeout-seconds=") {
+            value.to_string()
+        } else {
+            let Some((key, value)) = argument.split_once('=') else {
+                return Err(format!(
+                    "argument `{argument}` must be KEY=VALUE, or placed after `--`"
+                ));
+            };
+            if key == ARGV_ARGUMENT || key == STDIN_PATH_ARGUMENT {
+                return Err(format!(
+                    "`{key}` is reserved; use `--` for argv or the MCP stdin_path argument"
+                ));
+            }
+            parsed.insert(key.to_string(), Value::String(value.to_string()));
+            index += 1;
+            continue;
+        };
+        parsed.insert(TIMEOUT_ARGUMENT.to_string(), Value::String(timeout));
+        index += 1;
+    }
+
+    if !positional.is_empty() {
+        parsed.insert(ARGV_ARGUMENT.to_string(), Value::Array(positional));
+    }
+    Ok(Value::Object(parsed))
+}
+
+fn parse_stdin_path(value: &Value) -> std::result::Result<PathBuf, String> {
+    value
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("argument `{STDIN_PATH_ARGUMENT}` must be a string"))
 }
 
 fn parse_argv(value: &Value) -> std::result::Result<Vec<String>, String> {
@@ -360,17 +504,23 @@ fn is_valid_env_key(key: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-async fn run_command(task: &TaskSpec, invocation: &CmdInvocation) -> Result<CmdOutput> {
-    // Wrap the user's command line in `sh -c` so pipes, quoting, and env
-    // expansions behave the way the operator expects when they typed it.
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(&task.command)
-        .arg("agent-container-task-runner")
-        .args(&invocation.argv);
-    cmd.envs(&invocation.env);
-    cmd.env("CONFIG_ROOT", &task.config_root);
-    cmd.stdin(Stdio::null());
+async fn run_command(
+    task: &TaskSpec,
+    workspace: &Path,
+    invocation: &CmdInvocation,
+) -> Result<CmdOutput> {
+    let mut cmd = command_for(task, invocation);
+    match &invocation.stdin {
+        Some(CmdStdin::Path(path)) => {
+            let stdin_path = resolve_workspace_stdin_file(workspace, path)?;
+            let file = std::fs::File::open(&stdin_path)
+                .with_context(|| format!("failed to open stdin file {}", stdin_path.display()))?;
+            cmd.stdin(file);
+        }
+        None => {
+            cmd.stdin(Stdio::null());
+        }
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
@@ -391,6 +541,46 @@ async fn run_command(task: &TaskSpec, invocation: &CmdInvocation) -> Result<CmdO
         code: out.status.code(),
         success: out.status.success(),
     })
+}
+
+fn command_for(task: &TaskSpec, invocation: &CmdInvocation) -> Command {
+    // Wrap the user's command line in `sh -c` so pipes, quoting, and env
+    // expansions behave the way the operator expects when they typed it.
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(&task.command)
+        .arg("agent-container-task-runner")
+        .args(&invocation.argv);
+    cmd.envs(&invocation.env);
+    cmd.env("CONFIG_ROOT", &task.config_root);
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+fn resolve_workspace_stdin_file(workspace: &Path, path: &Path) -> Result<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+    let workspace = workspace
+        .canonicalize()
+        .with_context(|| format!("failed to resolve workspace {}", workspace.display()))?;
+    let candidate = candidate
+        .canonicalize()
+        .with_context(|| format!("failed to resolve stdin file {}", candidate.display()))?;
+    if !candidate.starts_with(&workspace) {
+        bail!(
+            "stdin_path must point inside the shared workspace so the host-side task-runner can read it (got {}). Move or copy the file into the workspace and pass that shared path instead.",
+            candidate.display()
+        );
+    }
+    let meta = std::fs::metadata(&candidate)
+        .with_context(|| format!("failed to stat stdin file {}", candidate.display()))?;
+    if !meta.is_file() {
+        bail!("stdin_path is not a regular file: {}", candidate.display());
+    }
+    Ok(candidate)
 }
 
 fn format_output(o: &CmdOutput) -> String {
@@ -467,6 +657,7 @@ fn tool_error(id: Value, msg: String) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn task(command: impl Into<String>, config_root: impl Into<PathBuf>) -> TaskSpec {
         TaskSpec {
@@ -480,7 +671,7 @@ mod tests {
         tasks.insert("echo".into(), task("echo hi", "/tmp/agent-container-test"));
         tasks.insert("succeed".into(), task("true", "/tmp/agent-container-test"));
         tasks.insert("fail".into(), task("false", "/tmp/agent-container-test"));
-        TaskRunner::new(tasks)
+        TaskRunner::new(tasks, PathBuf::from("/tmp/agent-container-test-workspace"))
     }
 
     #[test]
@@ -532,6 +723,7 @@ mod tests {
         let first = &resp["result"]["tools"].as_array().unwrap()[0];
         assert!(first["inputSchema"]["properties"][TIMEOUT_ARGUMENT].is_object());
         assert!(first["inputSchema"]["properties"][ARGV_ARGUMENT].is_object());
+        assert!(first["inputSchema"]["properties"][STDIN_PATH_ARGUMENT].is_object());
         let names: Vec<_> = resp["result"]["tools"]
             .as_array()
             .unwrap()
@@ -586,7 +778,7 @@ mod tests {
                 "/tmp/agent-container-test",
             ),
         );
-        let r = TaskRunner::new(tasks);
+        let r = TaskRunner::new(tasks, PathBuf::from("/tmp/agent-container-test-workspace"));
         let req = br#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"expand","arguments":{"value":"hello world","count":42,"enabled":true,"timeout_seconds":3}}}"#;
         let resp = r.handle(req).await.unwrap();
         assert_eq!(resp["result"]["isError"], false);
@@ -604,13 +796,94 @@ mod tests {
                 "/tmp/agent-container-test",
             ),
         );
-        let r = TaskRunner::new(tasks);
+        let r = TaskRunner::new(tasks, PathBuf::from("/tmp/agent-container-test-workspace"));
         let req = br#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"argv","arguments":{"argv":["hello world",42,true]}}}"#;
         let resp = r.handle(req).await.unwrap();
         assert_eq!(resp["result"]["isError"], false);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("<hello world>\n<42>\n<true>"));
         assert!(text.contains("argv-env=unset"));
+    }
+
+    #[tokio::test]
+    async fn stdin_path_feeds_workspace_file_to_command() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("pr.md"), "# title\nbody\n").unwrap();
+
+        let mut tasks = BTreeMap::new();
+        tasks.insert(
+            "stdin".into(),
+            task(
+                "cat; printf 'stdin_path=%s\\n' \"${stdin_path:-unset}\"",
+                "/tmp/task-root",
+            ),
+        );
+        let r = TaskRunner::new(tasks, workspace.path().to_path_buf());
+        let req = br#"{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"stdin","arguments":{"stdin_path":"pr.md"}}}"#;
+        let resp = r.handle(req).await.unwrap();
+
+        assert_eq!(resp["result"]["isError"], false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("# title\nbody\n"));
+        assert!(text.contains("stdin_path=unset"));
+    }
+
+    #[tokio::test]
+    async fn stdin_path_must_stay_inside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+
+        let mut tasks = BTreeMap::new();
+        tasks.insert("stdin".into(), task("cat", "/tmp/task-root"));
+        let r = TaskRunner::new(tasks, workspace.path().to_path_buf());
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{{"name":"stdin","arguments":{{"stdin_path":{}}}}}}}"#,
+            serde_json::to_string(outside.path().to_str().unwrap()).unwrap()
+        );
+        let resp = r.handle(req.as_bytes()).await.unwrap();
+
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("must point inside the shared workspace"));
+        assert!(text.contains("Move or copy the file into the workspace"));
+    }
+
+    #[tokio::test]
+    async fn streaming_task_uses_the_same_invocation_rules() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut tasks = BTreeMap::new();
+        tasks.insert(
+            "stream".into(),
+            task(
+                "cat; printf '%s:%s\\n' \"$value\" \"$CONFIG_ROOT\" >&2",
+                "/tmp/task-root",
+            ),
+        );
+        let runner = TaskRunner::new(tasks, workspace.path().to_path_buf());
+        let mut process = runner
+            .spawn_streaming_cli(
+                "stream",
+                &[
+                    "value=from-cli".to_string(),
+                    "--".to_string(),
+                    "unused".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        process.stdin.write_all(b"streamed input\n").await.unwrap();
+        process.stdin.shutdown().await.unwrap();
+        drop(process.stdin);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        process.stdout.read_to_end(&mut stdout).await.unwrap();
+        process.stderr.read_to_end(&mut stderr).await.unwrap();
+        let status = process.child.wait().await.unwrap();
+
+        assert!(status.success());
+        assert_eq!(stdout, b"streamed input\n");
+        assert_eq!(stderr, b"from-cli:/tmp/task-root\n");
     }
 
     #[tokio::test]
@@ -634,7 +907,7 @@ mod tests {
             "slow".into(),
             task("sleep 5; printf late", "/tmp/agent-container-test"),
         );
-        let r = TaskRunner::new(tasks);
+        let r = TaskRunner::new(tasks, PathBuf::from("/tmp/agent-container-test-workspace"));
         let req = br#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"slow","arguments":{"timeout_seconds":0.01}}}"#;
         let resp = r.handle(req).await.unwrap();
         assert_eq!(resp["result"]["isError"], true);
@@ -663,7 +936,7 @@ mod tests {
             "root".into(),
             task("printf '%s\\n' \"$CONFIG_ROOT\"", "/tmp/task-root"),
         );
-        let r = TaskRunner::new(tasks);
+        let r = TaskRunner::new(tasks, PathBuf::from("/tmp/agent-container-test-workspace"));
         let req = br#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"root","arguments":{"CONFIG_ROOT":"tool-argument-must-not-win"}}}"#;
         let resp = r.handle(req).await.unwrap();
         assert_eq!(resp["result"]["isError"], false);

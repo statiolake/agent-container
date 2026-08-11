@@ -339,6 +339,21 @@ The reserved argument `timeout_seconds` sets a per-call task-runner timeout
 and is not forwarded to the command environment; omit it to run without a
 task-runner timeout.
 
+The container image also includes a task-runner CLI for scripts and shell
+pipelines. It accepts the same configured task names and argument model:
+
+```sh
+printf '%s\n' "$PR_BODY" | task-runner review -- --format markdown
+task-runner deploy environment=staging
+```
+
+KEY=VALUE arguments become task environment variables, arguments after -- are
+forwarded as "$@", and --timeout-seconds has the same meaning as the MCP
+argument. stdin is streamed to the host broker over HTTP, while stdout and
+stderr are streamed back to their corresponding local streams. The CLI cannot
+run arbitrary commands; the task must already be declared under
+`[task_runner.tasks]`.
+
 ## Known limitations
 
 - macOS/Docker Desktop is the primary test target. Linux with native

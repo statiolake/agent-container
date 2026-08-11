@@ -20,6 +20,9 @@ RUN apt-get update \
         vim \
     && rm -rf /var/lib/apt/lists/*
 
+COPY task-runner.mjs /usr/local/bin/task-runner
+RUN chmod 0755 /usr/local/bin/task-runner
+
 RUN npm install -g @anthropic-ai/claude-code@latest @openai/codex \
     && npm cache clean --force
 

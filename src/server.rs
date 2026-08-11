@@ -14,8 +14,10 @@
 //! - Streaming (SSE) responses are passed through unfiltered for now.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,10 +27,14 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
+use base64::Engine;
+use futures::StreamExt;
 use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::aws::{BedrockCredentials, BedrockSetup, resolve_credentials};
 use crate::host_fs::{self, HostFs};
@@ -38,6 +44,11 @@ use crate::oauth::OAuthStore;
 use crate::policy::McpPolicy;
 use crate::stdio_mcp::{self, PathBridge, StdioHandle};
 use crate::task_runner::{self, TaskRunner};
+
+const TASK_RUNNER_ARGUMENTS_HEADER: &str = "x-agent-container-task-arguments";
+const TASK_RUNNER_STREAM_CONTENT_TYPE: &str =
+    "application/x-agent-container-task-runner-stream; version=1";
+const MAX_TASK_RUNNER_ARGUMENTS: usize = 64 * 1024;
 
 enum McpBackend {
     Http(HttpMcpServer),
@@ -256,6 +267,7 @@ pub async fn spawn(config: SpawnConfig) -> Result<RunningServer> {
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/aws/credentials", get(handle_aws))
+        .route("/task-runner/:name", post(handle_task_runner_cli))
         .route("/mcp/:name", any(handle_mcp_root))
         .route("/mcp/:name/*rest", any(handle_mcp_nested))
         .with_state(state);
@@ -267,6 +279,344 @@ pub async fn spawn(config: SpawnConfig) -> Result<RunningServer> {
     });
 
     Ok(RunningServer { addr, handle })
+}
+
+async fn handle_task_runner_cli(
+    AxumPath(name): AxumPath<String>,
+    State(state): State<Arc<BrokerState>>,
+    req: Request,
+) -> Response {
+    let runner = match state.mcp.read().await.get(task_runner::NAME) {
+        Some(McpBackend::TaskRunner(r)) => r.clone(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                "task-runner is not enabled for this agent",
+            )
+                .into_response();
+        }
+    };
+    if !runner.tasks.contains_key(&name) {
+        return (StatusCode::NOT_FOUND, format!("unknown task '{name}'")).into_response();
+    }
+
+    let arguments = match decode_task_runner_cli_arguments(req.headers()) {
+        Ok(arguments) => arguments,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid task arguments: {e:#}"),
+            )
+                .into_response();
+        }
+    };
+    let body = req.into_body();
+    let process = match runner.spawn_streaming_cli(&name, &arguments).await {
+        Ok(process) => process,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("cannot start task '{name}': {e:#}"),
+            )
+                .into_response();
+        }
+    };
+
+    let stream = stream_task_runner_process(process, body);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            TASK_RUNNER_STREAM_CONTENT_TYPE,
+        )
+        .header(axum::http::header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(stream))
+        .expect("task-runner stream response should be valid")
+        .into_response()
+}
+
+fn decode_task_runner_cli_arguments(headers: &HeaderMap) -> Result<Vec<String>> {
+    let Some(header) = headers.get(TASK_RUNNER_ARGUMENTS_HEADER) else {
+        return Ok(Vec::new());
+    };
+    let encoded = header
+        .to_str()
+        .context("task argument header is not valid ASCII")?;
+    if encoded.len() > MAX_TASK_RUNNER_ARGUMENTS {
+        bail!("task argument header is too large");
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .context("task argument header is not valid base64url")?;
+    let value: Value =
+        serde_json::from_slice(&bytes).context("task arguments are not valid JSON")?;
+    let values = value
+        .as_array()
+        .context("task arguments must be a JSON array")?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .with_context(|| format!("task argument {index} must be a string"))
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+enum TaskRunnerStreamEvent {
+    Data {
+        stream: TaskOutputStream,
+        bytes: Vec<u8>,
+    },
+    Finished,
+    StreamError(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TaskOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl TaskOutputStream {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+type TaskRunnerHttpStream = ReceiverStream<std::result::Result<Bytes, Infallible>>;
+
+fn stream_task_runner_process(
+    process: task_runner::StreamingTask,
+    body: Body,
+) -> TaskRunnerHttpStream {
+    let (tx, rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        produce_task_runner_stream(process, body, tx).await;
+    });
+    ReceiverStream::new(rx)
+}
+
+async fn produce_task_runner_stream(
+    process: task_runner::StreamingTask,
+    body: Body,
+    tx: mpsc::Sender<std::result::Result<Bytes, Infallible>>,
+) {
+    let task_runner::StreamingTask {
+        stdin,
+        stdout,
+        stderr,
+        child,
+        timeout,
+    } = process;
+    let (event_tx, mut event_rx) = mpsc::channel(32);
+    let mut input_task = tokio::spawn(forward_task_runner_stdin(body, stdin));
+    let stdout_task = tokio::spawn(read_task_runner_output(
+        stdout,
+        TaskOutputStream::Stdout,
+        event_tx.clone(),
+    ));
+    let stderr_task = tokio::spawn(read_task_runner_output(
+        stderr,
+        TaskOutputStream::Stderr,
+        event_tx,
+    ));
+    let mut wait_task = tokio::spawn(wait_for_task_runner_child(child, timeout));
+
+    let mut finished_readers = 0;
+    let mut input_finished = false;
+    let mut exit_result = None;
+    let mut stream_error = None;
+
+    while finished_readers < 2 || !input_finished || exit_result.is_none() {
+        tokio::select! {
+            _ = tx.closed() => {
+                input_task.abort();
+                stdout_task.abort();
+                stderr_task.abort();
+                wait_task.abort();
+                return;
+            }
+            event = event_rx.recv(), if finished_readers < 2 => {
+                match event {
+                    Some(TaskRunnerStreamEvent::Data { stream, bytes }) => {
+                        if !send_task_runner_frame(&tx, json!({
+                            "type": "data",
+                            "stream": stream.as_str(),
+                            "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                        })).await {
+                            input_task.abort();
+                            stdout_task.abort();
+                            stderr_task.abort();
+                            wait_task.abort();
+                            return;
+                        }
+                    }
+                    Some(TaskRunnerStreamEvent::Finished) => {
+                        finished_readers += 1;
+                    }
+                    Some(TaskRunnerStreamEvent::StreamError(message)) => {
+                        stream_error = Some(message);
+                    }
+                    None => {
+                        finished_readers = 2;
+                    }
+                }
+            }
+            result = &mut input_task, if !input_finished => {
+                input_finished = true;
+                if let Ok(Err(message)) = result {
+                    stream_error = Some(message);
+                }
+            }
+            result = &mut wait_task, if exit_result.is_none() => {
+                exit_result = Some(match result {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("task wait failed: {error}")),
+                });
+            }
+        }
+    }
+
+    stdout_task.abort();
+    stderr_task.abort();
+
+    if let Some(message) = stream_error
+        && !send_task_runner_frame(
+            &tx,
+            json!({
+                "type": "error",
+                "message": message,
+            }),
+        )
+        .await
+    {
+        input_task.abort();
+        stdout_task.abort();
+        stderr_task.abort();
+        wait_task.abort();
+        return;
+    }
+
+    let (code, success) = match exit_result.expect("task wait must complete") {
+        Ok(status) => (status.code(), status.success()),
+        Err(message) => {
+            if !send_task_runner_frame(
+                &tx,
+                json!({
+                    "type": "error",
+                    "message": message,
+                }),
+            )
+            .await
+            {
+                input_task.abort();
+                stdout_task.abort();
+                stderr_task.abort();
+                wait_task.abort();
+                return;
+            }
+            (None, false)
+        }
+    };
+    let _ = send_task_runner_frame(
+        &tx,
+        json!({
+            "type": "exit",
+            "code": code,
+            "success": success,
+        }),
+    )
+    .await;
+}
+
+async fn forward_task_runner_stdin(
+    body: Body,
+    mut stdin: tokio::process::ChildStdin,
+) -> std::result::Result<(), String> {
+    let mut body = body.into_data_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| format!("failed to read task stdin: {e}"))?;
+        stdin
+            .write_all(&chunk)
+            .await
+            .map_err(|e| format!("failed to forward task stdin: {e}"))?;
+    }
+    stdin
+        .shutdown()
+        .await
+        .map_err(|e| format!("failed to close task stdin: {e}"))?;
+    Ok(())
+}
+
+async fn read_task_runner_output<R>(
+    mut reader: R,
+    stream: TaskOutputStream,
+    event_tx: mpsc::Sender<TaskRunnerStreamEvent>,
+) where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = vec![0_u8; 16 * 1024];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(size) => {
+                if event_tx
+                    .send(TaskRunnerStreamEvent::Data {
+                        stream,
+                        bytes: buffer[..size].to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = event_tx
+                    .send(TaskRunnerStreamEvent::StreamError(format!(
+                        "failed to read task {stream:?}: {error}"
+                    )))
+                    .await;
+                return;
+            }
+        }
+    }
+    let _ = event_tx.send(TaskRunnerStreamEvent::Finished).await;
+}
+
+async fn wait_for_task_runner_child(
+    mut child: tokio::process::Child,
+    timeout: Option<Duration>,
+) -> std::result::Result<ExitStatus, String> {
+    let wait = child.wait();
+    match timeout {
+        Some(duration) => tokio::time::timeout(duration, wait)
+            .await
+            .map_err(|_| format!("task timed out after {} seconds", duration.as_secs_f64()))?
+            .map_err(|e| format!("failed to wait for task: {e}")),
+        None => wait
+            .await
+            .map_err(|e| format!("failed to wait for task: {e}")),
+    }
+}
+
+async fn send_task_runner_frame(
+    tx: &mpsc::Sender<std::result::Result<Bytes, Infallible>>,
+    value: Value,
+) -> bool {
+    let mut bytes = match serde_json::to_vec(&value) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    bytes.push(b'\n');
+    tx.send(Ok(Bytes::from(bytes))).await.is_ok()
 }
 
 fn new_notification_channel() -> broadcast::Sender<Value> {
@@ -306,7 +656,7 @@ async fn reload_mcp_settings(state: &BrokerState, config: &McpReloadConfig) -> R
         let mut mcp = state.mcp.write().await;
         mcp.insert(
             task_runner::NAME.to_string(),
-            McpBackend::TaskRunner(Arc::new(TaskRunner::new(tasks))),
+            McpBackend::TaskRunner(Arc::new(TaskRunner::new(tasks, config.workspace.clone()))),
         );
     }
 
@@ -1031,7 +1381,6 @@ async fn forward_stdio_get(
     server_name: &str,
     handle: StdioHandle,
 ) -> Result<Response> {
-    use tokio_stream::StreamExt;
     use tokio_stream::wrappers::BroadcastStream;
 
     tracing::debug!(
@@ -1042,11 +1391,13 @@ async fn forward_stdio_get(
     let upstream_rx = handle.subscribe();
     let local_rx = local_notification_receiver(&state, server_name).await?;
     let sn = server_name.to_string();
-    let stream = futures::stream::select(
-        BroadcastStream::new(upstream_rx),
-        BroadcastStream::new(local_rx),
-    )
-    .filter_map(move |item| sse_notification_frame(item, &sn));
+    let stream = tokio_stream::StreamExt::filter_map(
+        futures::stream::select(
+            BroadcastStream::new(upstream_rx),
+            BroadcastStream::new(local_rx),
+        ),
+        move |item| sse_notification_frame(item, &sn),
+    );
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1060,7 +1411,6 @@ async fn forward_local_notifications_get(
     state: Arc<BrokerState>,
     server_name: &str,
 ) -> Result<Response> {
-    use tokio_stream::StreamExt;
     use tokio_stream::wrappers::BroadcastStream;
 
     tracing::debug!(
@@ -1070,7 +1420,9 @@ async fn forward_local_notifications_get(
 
     let rx = local_notification_receiver(&state, server_name).await?;
     let sn = server_name.to_string();
-    let stream = BroadcastStream::new(rx).filter_map(move |item| sse_notification_frame(item, &sn));
+    let stream = tokio_stream::StreamExt::filter_map(BroadcastStream::new(rx), move |item| {
+        sse_notification_frame(item, &sn)
+    });
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -1879,6 +2231,106 @@ mod tests {
         assert_eq!(call.id, Value::from(7));
         // A `tools/list` is not a tool call.
         assert!(parse_tool_call(br#"{"method":"tools/list"}"#).is_none());
+    }
+
+    #[test]
+    fn task_runner_cli_arguments_are_raw_cli_arguments() {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"["value=from-cli","--timeout-seconds","5","--","one","two"]"#);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(TASK_RUNNER_ARGUMENTS_HEADER),
+            HeaderValue::from_str(&encoded).unwrap(),
+        );
+
+        let value = decode_task_runner_cli_arguments(&headers).unwrap();
+        assert_eq!(
+            value,
+            [
+                "value=from-cli",
+                "--timeout-seconds",
+                "5",
+                "--",
+                "one",
+                "two"
+            ]
+        );
+    }
+
+    #[test]
+    fn task_runner_cli_arguments_reject_non_array_json() {
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"not":"an array"}"#);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(TASK_RUNNER_ARGUMENTS_HEADER),
+            HeaderValue::from_str(&encoded).unwrap(),
+        );
+
+        assert!(decode_task_runner_cli_arguments(&headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn task_runner_cli_streams_stdin_and_separates_output_streams() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut tasks = BTreeMap::new();
+        tasks.insert(
+            "stream".into(),
+            crate::task_runner::TaskSpec {
+                command: "cat; printf 'diagnostic\\n' >&2".into(),
+                config_root: PathBuf::from("/tmp/task-root"),
+            },
+        );
+        let runner = TaskRunner::new(tasks, workspace.path().to_path_buf());
+        let process = runner
+            .spawn_streaming_cli(
+                "stream",
+                &[
+                    "value=unused".to_string(),
+                    "--".to_string(),
+                    "arg".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        let body = Body::from_stream(futures::stream::iter(vec![
+            Ok::<_, Infallible>(Bytes::from_static(b"hello ")),
+            Ok::<_, Infallible>(Bytes::from_static(b"stream\n")),
+        ]));
+        let mut stream = stream_task_runner_process(process, body);
+        let mut body = Vec::new();
+        while let Some(Ok(chunk)) = futures::StreamExt::next(&mut stream).await {
+            body.extend_from_slice(&chunk);
+        }
+
+        let frames: Vec<Value> = body
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        let stdout: Vec<u8> = frames
+            .iter()
+            .filter(|frame| frame["type"] == "data" && frame["stream"] == "stdout")
+            .flat_map(|frame| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(frame["data"].as_str().unwrap())
+                    .unwrap()
+            })
+            .collect();
+        let stderr: Vec<u8> = frames
+            .iter()
+            .filter(|frame| frame["type"] == "data" && frame["stream"] == "stderr")
+            .flat_map(|frame| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(frame["data"].as_str().unwrap())
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(stdout, b"hello stream\n");
+        assert_eq!(stderr, b"diagnostic\n");
+        assert_eq!(frames.last().unwrap()["type"], "exit");
+        assert_eq!(frames.last().unwrap()["code"], 0);
     }
 
     #[tokio::test]

@@ -1321,4 +1321,11 @@ mod tests {
         assert!(dockerfile.contains("/usr/local/bin/cursor-agent"));
         assert!(dockerfile.contains("exec cursor-agent"));
     }
+
+    #[test]
+    fn agent_image_includes_streaming_task_runner_cli() {
+        let dockerfile = include_str!("../docker/Dockerfile");
+        assert!(dockerfile.contains("COPY task-runner.mjs /usr/local/bin/task-runner"));
+        assert!(dockerfile.contains("chmod 0755 /usr/local/bin/task-runner"));
+    }
 }
