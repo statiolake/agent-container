@@ -10,8 +10,9 @@
 //!   task-runner commands and servers → tools. `Enter` activates the
 //!   highlighted row (expand/collapse, edit, add, or toggle).
 //!   The built-in `task-runner` always sits at the top of the tree; its
-//!   children are editable `name = command` entries that become MCP
-//!   tools for host-side command execution.
+//!   children are editable task definitions (`name = command`, with an
+//!   optional `allow stdin` setting) that become MCP tools for host-side
+//!   command execution.
 //!
 //! Cross-tab:
 //!
@@ -51,6 +52,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use crate::policy::McpPolicy;
 use crate::settings::{
     ClaudePolicy, DefaultAgent, FilesystemMount, FilesystemPolicy, GeneralPolicy, Scope,
+    TaskDefinition,
 };
 
 fn plain() -> Style {
@@ -370,8 +372,8 @@ pub struct TuiInput {
     pub codex_mcp_workspace: McpPolicy,
     /// Each scope's `[task_runner.tasks]` map. Workspace entries shadow
     /// global ones with the same name in the merged display.
-    pub tasks_global: BTreeMap<String, String>,
-    pub tasks_workspace: BTreeMap<String, String>,
+    pub tasks_global: BTreeMap<String, TaskDefinition>,
+    pub tasks_workspace: BTreeMap<String, TaskDefinition>,
 }
 
 pub struct TuiOutput {
@@ -392,8 +394,8 @@ pub struct TuiOutput {
     pub codex_mcp_workspace: McpPolicy,
     pub claude_tool_catalog: Vec<ToolEntry>,
     pub codex_tool_catalog: Vec<ToolEntry>,
-    pub tasks_global: BTreeMap<String, String>,
-    pub tasks_workspace: BTreeMap<String, String>,
+    pub tasks_global: BTreeMap<String, TaskDefinition>,
+    pub tasks_workspace: BTreeMap<String, TaskDefinition>,
 }
 
 pub enum Outcome {
@@ -505,6 +507,7 @@ enum Mode {
     TaskInput {
         name: TextField,
         command: TextField,
+        allow_stdin: bool,
         focus: TaskField,
         /// Original name of the task being edited, or None for a fresh
         /// add. Used on commit to delete the old key when a rename
@@ -581,13 +584,15 @@ struct ShortcutHint {
 enum TaskField {
     Name,
     Command,
+    AllowStdin,
 }
 
 impl TaskField {
     fn toggle(self) -> Self {
         match self {
             TaskField::Name => TaskField::Command,
-            TaskField::Command => TaskField::Name,
+            TaskField::Command => TaskField::AllowStdin,
+            TaskField::AllowStdin => TaskField::Name,
         }
     }
 }
@@ -1211,8 +1216,8 @@ struct McpState {
     /// Per-scope tasks. The visible list is derived: for `Workspace` we
     /// merge `tasks_global` ∪ `tasks_workspace` (workspace wins); for
     /// `Global` we show only `tasks_global`.
-    tasks_global: BTreeMap<String, String>,
-    tasks_workspace: BTreeMap<String, String>,
+    tasks_global: BTreeMap<String, TaskDefinition>,
+    tasks_workspace: BTreeMap<String, TaskDefinition>,
     /// Per-scope MCP policies. Edits go into the active scope's policy
     /// only; the other one is kept untouched until the next `t` switch
     /// or save-and-quit.
@@ -1240,8 +1245,8 @@ impl McpState {
         mut catalog: Vec<ToolEntry>,
         mcp_global: McpPolicy,
         mcp_workspace: McpPolicy,
-        tasks_global: BTreeMap<String, String>,
-        tasks_workspace: BTreeMap<String, String>,
+        tasks_global: BTreeMap<String, TaskDefinition>,
+        tasks_workspace: BTreeMap<String, TaskDefinition>,
     ) -> Self {
         catalog.sort_by(|a, b| {
             a.server_name
@@ -1355,7 +1360,7 @@ impl McpState {
     /// Tasks visible for `scope`. Workspace shows the merged view
     /// (workspace overlay wins on collisions); Global shows only its
     /// own map.
-    fn effective_tasks(&self, scope: Scope) -> BTreeMap<String, String> {
+    fn effective_tasks(&self, scope: Scope) -> BTreeMap<String, TaskDefinition> {
         match scope {
             Scope::Global => self.tasks_global.clone(),
             Scope::Workspace => {
@@ -1531,14 +1536,14 @@ impl McpState {
         }
     }
 
-    fn set_task_for(&mut self, scope: Scope, name: String, command: String) {
+    fn set_task_for(&mut self, scope: Scope, name: String, task: TaskDefinition) {
         match scope {
-            Scope::Global => self.tasks_global.insert(name, command),
-            Scope::Workspace => self.tasks_workspace.insert(name, command),
+            Scope::Global => self.tasks_global.insert(name, task),
+            Scope::Workspace => self.tasks_workspace.insert(name, task),
         };
     }
 
-    fn task_command_for(&self, scope: Scope, name: &str) -> Option<String> {
+    fn task_definition_for(&self, scope: Scope, name: &str) -> Option<TaskDefinition> {
         // For Workspace the editor preloads the merged value (so editing
         // a global-only task starts from its global definition), so the
         // user sees the same value the merged display showed them.
@@ -1593,8 +1598,8 @@ struct Snapshot {
     mcp_workspace: McpPolicy,
     codex_mcp_global: McpPolicy,
     codex_mcp_workspace: McpPolicy,
-    tasks_global: BTreeMap<String, String>,
-    tasks_workspace: BTreeMap<String, String>,
+    tasks_global: BTreeMap<String, TaskDefinition>,
+    tasks_workspace: BTreeMap<String, TaskDefinition>,
 }
 
 struct App {
@@ -1936,6 +1941,7 @@ fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) 
     let Mode::TaskInput {
         mut name,
         mut command,
+        mut allow_stdin,
         mut focus,
         editing,
     } = std::mem::replace(&mut app.mode, Mode::Normal)
@@ -1974,7 +1980,14 @@ fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) 
                         }
                     }
                 }
-                app.active_mcp_mut().set_task_for(scope, name_tr, cmd_tr);
+                app.active_mcp_mut().set_task_for(
+                    scope,
+                    name_tr,
+                    TaskDefinition {
+                        command: cmd_tr,
+                        allow_stdin,
+                    },
+                );
                 app.sync_tasks_from_active();
                 return;
             }
@@ -1982,34 +1995,41 @@ fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) 
         // Tab / Up / Down switch focus between the two fields. Up/Down
         // have no in-line meaning on a single-line field, so we repurpose
         // them for field navigation — matching most form-style TUIs.
+        KeyCode::Char(' ') if focus == TaskField::AllowStdin => {
+            allow_stdin = !allow_stdin;
+        }
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
             focus = focus.toggle();
         }
-        _ => {
-            let target = match focus {
-                TaskField::Name => &mut name,
-                TaskField::Command => &mut command,
-            };
-            apply_editing_key(target, code, modifiers);
-        }
+        _ => match focus {
+            TaskField::Name => {
+                apply_editing_key(&mut name, code, modifiers);
+            }
+            TaskField::Command => {
+                apply_editing_key(&mut command, code, modifiers);
+            }
+            TaskField::AllowStdin => {}
+        },
     }
 
     app.mode = Mode::TaskInput {
         name,
         command,
+        allow_stdin,
         focus,
         editing,
     };
 }
 
 fn start_task_edit(app: &mut App, name: String) {
-    let command = app
+    let definition = app
         .active_mcp()
-        .task_command_for(app.scope, &name)
+        .task_definition_for(app.scope, &name)
         .unwrap_or_default();
     app.mode = Mode::TaskInput {
         name: TextField::from_str(&name),
-        command: TextField::from_str(&command),
+        command: TextField::from_str(&definition.command),
+        allow_stdin: definition.allow_stdin,
         focus: TaskField::Command,
         editing: Some(name),
     };
@@ -2019,6 +2039,7 @@ fn start_task_add(app: &mut App) {
     app.mode = Mode::TaskInput {
         name: TextField::default(),
         command: TextField::default(),
+        allow_stdin: false,
         focus: TaskField::Name,
         editing: None,
     };
@@ -2659,11 +2680,20 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     if let Mode::TaskInput {
         ref name,
         ref command,
+        allow_stdin,
         focus,
         ref editing,
     } = app.mode
     {
-        render_task_input_modal(f, area, name, command, focus, editing.is_some());
+        render_task_input_modal(
+            f,
+            area,
+            name,
+            command,
+            allow_stdin,
+            focus,
+            editing.is_some(),
+        );
     }
 
     // Overlay modal for proxy input.
@@ -2934,15 +2964,21 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 ]))
             }
             McpRow::TaskRow(name) => {
-                let command = visible_tasks.get(&name).cloned().unwrap_or_default();
+                let task = visible_tasks.get(&name).cloned().unwrap_or_default();
                 let overlay =
                     scope == Scope::Workspace && app.active_mcp().task_is_workspace_override(&name);
+                let stdin = if task.allow_stdin {
+                    "  [allow stdin]"
+                } else {
+                    ""
+                };
                 ListItem::new(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(if overlay { "* " } else { "  " }.to_string(), heading()),
                     Span::styled(name, heading()),
                     Span::raw(" = "),
-                    Span::raw(command),
+                    Span::raw(task.command),
+                    Span::styled(stdin, muted()),
                 ]))
             }
             McpRow::TaskAddHint => ListItem::new(Line::from(vec![
@@ -3488,11 +3524,12 @@ fn render_task_input_modal(
     parent: Rect,
     name: &TextField,
     command: &TextField,
+    allow_stdin: bool,
     focus: TaskField,
     is_edit: bool,
 ) {
     let w = parent.width.min(80);
-    let h = parent.height.min(12);
+    let h = parent.height.min(14);
     let x = parent.x + (parent.width.saturating_sub(w)) / 2;
     let y = parent.y + (parent.height.saturating_sub(h)) / 2;
     let area = Rect::new(x, y, w, h);
@@ -3511,8 +3548,21 @@ fn render_task_input_modal(
         if f == row { selected_bold() } else { muted() }
     };
 
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
     let hint = Line::from(vec![Span::styled(
-        "Tab/↑↓ switch · Enter commit · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
+        "Tab/↑↓ switch · Space toggle · Enter commit · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
         muted(),
     )]);
     let name_line = Line::from(vec![
@@ -3520,28 +3570,23 @@ fn render_task_input_modal(
         Span::raw("  "),
         Span::raw(name.value()),
     ]);
-    f.render_widget(
-        Paragraph::new(vec![hint, Line::from(""), name_line]),
-        Rect::new(inner.x, inner.y, inner.width, inner.height.min(3)),
-    );
+    f.render_widget(Paragraph::new(hint), rows[0]);
+    f.render_widget(Paragraph::new(name_line), rows[2]);
 
     const FIELD_PREFIX_WIDTH: u16 = 11;
-    const COMMAND_ROW: u16 = 4;
-    if inner.height > COMMAND_ROW {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                " command ",
-                focus_style(focus, TaskField::Command),
-            ))),
-            Rect::new(inner.x, inner.y + COMMAND_ROW, inner.width, 1),
-        );
-    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " command ",
+            focus_style(focus, TaskField::Command),
+        ))),
+        rows[4],
+    );
 
     let command_area = Rect::new(
-        inner.x.saturating_add(FIELD_PREFIX_WIDTH),
-        inner.y.saturating_add(COMMAND_ROW),
+        rows[5].x.saturating_add(FIELD_PREFIX_WIDTH),
+        rows[5].y,
         inner.width.saturating_sub(FIELD_PREFIX_WIDTH),
-        inner.height.saturating_sub(COMMAND_ROW),
+        rows[5].height,
     );
     let wrapped = command.wrapped(command_area.width);
     let visible_height = usize::from(command_area.height.max(1));
@@ -3557,6 +3602,15 @@ fn render_task_input_modal(
         .collect();
     f.render_widget(Paragraph::new(command_lines), command_area);
 
+    let checkbox = if allow_stdin { "[x]" } else { "[ ]" };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            format!("{checkbox} Allow stdin"),
+            focus_style(focus, TaskField::AllowStdin),
+        )])),
+        rows[6],
+    );
+
     // Field text starts 11 cells in from the modal's inner-left: 9-char
     // label (" name    " / " command ") + 2-space separator. The command
     // is a soft-wrapped viewport whose scroll follows the logical caret.
@@ -3569,6 +3623,7 @@ fn render_task_input_modal(
             command_area.x + wrapped.cursor_col,
             command_area.y + (wrapped.cursor_row - command_scroll) as u16,
         ),
+        TaskField::AllowStdin => (rows[6].x, rows[6].y),
     };
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
@@ -3771,8 +3826,8 @@ mod tests {
         catalog: Vec<ToolEntry>,
         mcp_global: McpPolicy,
         mcp_workspace: McpPolicy,
-        tasks_global: BTreeMap<String, String>,
-        tasks_workspace: BTreeMap<String, String>,
+        tasks_global: BTreeMap<String, TaskDefinition>,
+        tasks_workspace: BTreeMap<String, TaskDefinition>,
     ) -> McpState {
         McpState::new(
             servers_from_catalog(&catalog),
@@ -3809,6 +3864,13 @@ mod tests {
         }
     }
 
+    fn task_definition(command: &str) -> TaskDefinition {
+        TaskDefinition {
+            command: command.into(),
+            allow_stdin: false,
+        }
+    }
+
     #[test]
     fn effective_tool_allowed_workspace_falls_through_to_global() {
         // Global has an explicit override that flips the read_only_hint
@@ -3830,7 +3892,7 @@ mod tests {
     #[test]
     fn mcp_rows_start_collapsed() {
         let mut tasks_global = BTreeMap::new();
-        tasks_global.insert("build".to_string(), "cargo build".to_string());
+        tasks_global.insert("build".to_string(), task_definition("cargo build"));
         let state = make_state(
             vec![entry("server", "tool", Some(true))],
             McpPolicy::default(),
@@ -3893,9 +3955,9 @@ mod tests {
     #[test]
     fn effective_tasks_show_global_only_for_global_scope() {
         let mut tg = BTreeMap::new();
-        tg.insert("a".to_string(), "echo a".to_string());
+        tg.insert("a".to_string(), task_definition("echo a"));
         let mut tw = BTreeMap::new();
-        tw.insert("b".to_string(), "echo b".to_string());
+        tw.insert("b".to_string(), task_definition("echo b"));
         let state = make_state(vec![], McpPolicy::default(), McpPolicy::default(), tg, tw);
         let g = state.effective_tasks(Scope::Global);
         assert_eq!(g.len(), 1);
@@ -3904,19 +3966,23 @@ mod tests {
 
         let w = state.effective_tasks(Scope::Workspace);
         assert_eq!(w.len(), 2);
-        assert_eq!(w.get("a").unwrap(), "echo a");
-        assert_eq!(w.get("b").unwrap(), "echo b");
+        assert_eq!(w.get("a").unwrap().command, "echo a");
+        assert_eq!(w.get("b").unwrap().command, "echo b");
     }
 
     #[test]
     fn effective_tasks_workspace_overrides_global_on_collision() {
         let mut tg = BTreeMap::new();
-        tg.insert("k".to_string(), "global".to_string());
+        tg.insert("k".to_string(), task_definition("global"));
         let mut tw = BTreeMap::new();
-        tw.insert("k".to_string(), "workspace".to_string());
+        tw.insert("k".to_string(), task_definition("workspace"));
         let state = make_state(vec![], McpPolicy::default(), McpPolicy::default(), tg, tw);
         assert_eq!(
-            state.effective_tasks(Scope::Workspace).get("k").unwrap(),
+            state
+                .effective_tasks(Scope::Workspace)
+                .get("k")
+                .unwrap()
+                .command,
             "workspace",
         );
     }
@@ -4193,8 +4259,31 @@ mod tests {
     fn has_unsaved_changes_detects_task_edit() {
         let mut app = App::new(fresh_input());
         app.mcp_claude
-            .set_task_for(Scope::Global, "new".into(), "echo new".into());
+            .set_task_for(Scope::Global, "new".into(), task_definition("echo new"));
         assert!(app.has_unsaved_changes());
+    }
+
+    #[test]
+    fn task_input_space_toggles_allow_stdin_checkbox() {
+        let mut app = App::new(fresh_input());
+        app.mode = Mode::TaskInput {
+            name: TextField::from_str("review"),
+            command: TextField::from_str("cat"),
+            allow_stdin: false,
+            focus: TaskField::AllowStdin,
+            editing: None,
+        };
+
+        handle_task_input_key(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+
+        assert!(matches!(
+            app.mode,
+            Mode::TaskInput {
+                allow_stdin: true,
+                focus: TaskField::AllowStdin,
+                ..
+            }
+        ));
     }
 
     #[test]

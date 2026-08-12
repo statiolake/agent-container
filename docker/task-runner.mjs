@@ -20,8 +20,9 @@ function usage() {
       "  --timeout-seconds N",
       "                     set the same timeout used by the task-runner MCP tool",
       "",
-      "stdin is streamed to the host task, and stdout/stderr are streamed back",
-      "to the corresponding local streams. For example:",
+      "stdin is streamed only for tasks with allow_stdin enabled, and",
+      "stdout/stderr are streamed back to the corresponding local streams.",
+      "For example:",
       "",
       "  task-runner deploy environment=staging",
       "  printf '%s\\n' \"$PR_BODY\" | task-runner review -- --format markdown",
@@ -68,7 +69,7 @@ function proxyFromEnvironment(target) {
   return proxy;
 }
 
-function openRequest(target, encodedArguments) {
+function openRequest(target, method, headers = {}) {
   const proxy = proxyFromEnvironment(target);
   const requestTarget = proxy
     ? target.href
@@ -77,18 +78,66 @@ function openRequest(target, encodedArguments) {
     protocol: proxy?.protocol || target.protocol,
     hostname: proxy?.hostname || target.hostname,
     port: proxy?.port || target.port || undefined,
-    method: "POST",
+    method,
     path: requestTarget,
     headers: {
       Host: target.host,
-      [ARGUMENTS_HEADER]: encodedArguments,
-      "Content-Type": "application/octet-stream",
-      "Transfer-Encoding": "chunked",
-      Accept: STREAM_CONTENT_TYPE,
+      ...headers,
       Connection: "close",
     },
   };
   return http.request(options);
+}
+
+function openTaskRequest(target, encodedArguments) {
+  return openRequest(target, "POST", {
+    [ARGUMENTS_HEADER]: encodedArguments,
+    "Content-Type": "application/octet-stream",
+    "Transfer-Encoding": "chunked",
+    Accept: STREAM_CONTENT_TYPE,
+  });
+}
+
+function fetchTaskInfo(target) {
+  return new Promise((resolve, reject) => {
+    const request = openRequest(target, "GET", {
+      Accept: "application/json",
+    });
+    let body = "";
+    request.on("response", (response) => {
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => {
+        body += chunk;
+      });
+      response.on("end", () => {
+        if (response.statusCode !== 200) {
+          reject(
+            new Error(
+              "broker rejected the task (" +
+                response.statusCode +
+                "): " +
+                body.trim(),
+            ),
+          );
+          return;
+        }
+        let info;
+        try {
+          info = JSON.parse(body);
+        } catch (error) {
+          reject(new Error("broker returned invalid task metadata: " + error.message));
+          return;
+        }
+        if (typeof info.allow_stdin !== "boolean") {
+          reject(new Error("broker returned invalid task metadata: allow_stdin is missing"));
+          return;
+        }
+        resolve(info);
+      });
+    });
+    request.on("error", reject);
+    request.end();
+  });
 }
 
 function handleStreamResponse(response) {
@@ -176,19 +225,7 @@ function handleStreamResponse(response) {
   });
 }
 
-let parsed;
-try {
-  parsed = parseArguments(process.argv.slice(2));
-} catch (error) {
-  fail(error.message);
-  parsed = null;
-}
-
-if (!parsed) {
-  if (process.argv.length <= 2) {
-    process.exitCode = 64;
-  }
-} else {
+async function run(parsed) {
   const endpoint = process.env.AGENT_CONTAINER_HOST_ENDPOINT;
   if (!endpoint) {
     fail("AGENT_CONTAINER_HOST_ENDPOINT is not set; run inside agent-container");
@@ -212,17 +249,42 @@ if (!parsed) {
       const encodedArguments = Buffer.from(
         JSON.stringify(parsed.arguments),
       ).toString("base64url");
-      const request = openRequest(target, encodedArguments);
+
+      let taskInfo;
+      try {
+        taskInfo = await fetchTaskInfo(target);
+      } catch (error) {
+        fail("broker request failed: " + error.message, 1);
+        return;
+      }
+
+      const request = openTaskRequest(target, encodedArguments);
       request.on("response", handleStreamResponse);
       request.on("error", (error) => {
         fail("broker request failed: " + error.message, 1);
       });
 
-      if (process.stdin.isTTY) {
+      if (!taskInfo.allow_stdin || process.stdin.isTTY) {
         request.end();
       } else {
         process.stdin.pipe(request);
       }
     }
   }
+}
+
+let parsed;
+try {
+  parsed = parseArguments(process.argv.slice(2));
+} catch (error) {
+  fail(error.message);
+  parsed = null;
+}
+
+if (!parsed) {
+  if (process.argv.length <= 2) {
+    process.exitCode = 64;
+  }
+} else {
+  run(parsed).catch((error) => fail(error.message, 1));
 }

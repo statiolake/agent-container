@@ -27,6 +27,10 @@
 //! lint = "cargo check"
 //! build = "cargo build --release"
 //!
+//! [task_runner.tasks.review]
+//! command = "review-tool"
+//! allow_stdin = true
+//!
 //! [filesystem]
 //! mounts = [{ path = "/Users/me/project-notes", readonly = true }]
 //! hide = ["(^|/)\\.env(\\..*)?$"]
@@ -43,6 +47,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 
 use crate::policy::McpPolicy;
@@ -127,14 +132,79 @@ impl ProxyPolicy {
     }
 }
 
+/// A user-defined shell command surfaced to the container as an MCP tool by
+/// the built-in `task-runner` server.
+///
+/// The legacy string form (`lint = "cargo check"`) is accepted on read and
+/// remains the serialized form when `allow_stdin` is false. Tasks that opt in
+/// to inherited CLI stdin use the detailed table form:
+///
+/// ```toml
+/// [task_runner.tasks.review]
+/// command = "review-tool"
+/// allow_stdin = true
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(from = "TaskDefinitionRepr")]
+pub struct TaskDefinition {
+    pub command: String,
+    #[serde(default)]
+    pub allow_stdin: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TaskDefinitionRepr {
+    Legacy(String),
+    Detailed {
+        command: String,
+        #[serde(default)]
+        allow_stdin: bool,
+    },
+}
+
+impl From<TaskDefinitionRepr> for TaskDefinition {
+    fn from(value: TaskDefinitionRepr) -> Self {
+        match value {
+            TaskDefinitionRepr::Legacy(command) => Self {
+                command,
+                allow_stdin: false,
+            },
+            TaskDefinitionRepr::Detailed {
+                command,
+                allow_stdin,
+            } => Self {
+                command,
+                allow_stdin,
+            },
+        }
+    }
+}
+
+impl Serialize for TaskDefinition {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if !self.allow_stdin {
+            return serializer.serialize_str(&self.command);
+        }
+
+        let mut state = serializer.serialize_struct("TaskDefinition", 2)?;
+        state.serialize_field("command", &self.command)?;
+        state.serialize_field("allow_stdin", &self.allow_stdin)?;
+        state.end()
+    }
+}
+
 /// User-defined shell commands surfaced to the container as MCP tools by
 /// the built-in `task-runner` server. Each key becomes a tool name; the
-/// value is the command line executed on the host when the tool is
+/// value describes the command line executed on the host when the tool is
 /// invoked.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRunnerPolicy {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub tasks: BTreeMap<String, String>,
+    pub tasks: BTreeMap<String, TaskDefinition>,
 }
 
 impl TaskRunnerPolicy {
@@ -446,8 +516,8 @@ impl Settings {
         for (name, sp) in overlay.codex.mcp.servers {
             self.codex.mcp.servers.insert(name, sp);
         }
-        for (name, cmd) in overlay.task_runner.tasks {
-            self.task_runner.tasks.insert(name, cmd);
+        for (name, task) in overlay.task_runner.tasks {
+            self.task_runner.tasks.insert(name, task);
         }
         append_unique(&mut self.filesystem.mounts, overlay.filesystem.mounts);
         append_unique(&mut self.filesystem.hide, overlay.filesystem.hide);
@@ -690,36 +760,60 @@ mounts = ["/tmp/notes"]
     #[test]
     fn merge_workspace_task_replaces_global_same_name() {
         let mut base = Settings::default();
-        base.task_runner
-            .tasks
-            .insert("lint".into(), "cargo check".into());
-        base.task_runner
-            .tasks
-            .insert("test".into(), "cargo test".into());
+        base.task_runner.tasks.insert(
+            "lint".into(),
+            TaskDefinition {
+                command: "cargo check".into(),
+                allow_stdin: false,
+            },
+        );
+        base.task_runner.tasks.insert(
+            "test".into(),
+            TaskDefinition {
+                command: "cargo test".into(),
+                allow_stdin: false,
+            },
+        );
 
         let mut overlay = Settings::default();
-        overlay
-            .task_runner
-            .tasks
-            .insert("lint".into(), "cargo clippy".into());
-        overlay
-            .task_runner
-            .tasks
-            .insert("build".into(), "cargo build --release".into());
+        overlay.task_runner.tasks.insert(
+            "lint".into(),
+            TaskDefinition {
+                command: "cargo clippy".into(),
+                allow_stdin: true,
+            },
+        );
+        overlay.task_runner.tasks.insert(
+            "build".into(),
+            TaskDefinition {
+                command: "cargo build --release".into(),
+                allow_stdin: false,
+            },
+        );
 
         base.merge_in_place(overlay);
         assert_eq!(
-            base.task_runner.tasks.get("lint").map(String::as_str),
+            base.task_runner
+                .tasks
+                .get("lint")
+                .map(|task| task.command.as_str()),
             Some("cargo clippy"),
             "overlay overrides same-named task"
         );
+        assert!(base.task_runner.tasks.get("lint").unwrap().allow_stdin);
         assert_eq!(
-            base.task_runner.tasks.get("test").map(String::as_str),
+            base.task_runner
+                .tasks
+                .get("test")
+                .map(|task| task.command.as_str()),
             Some("cargo test"),
             "untouched task survives"
         );
         assert_eq!(
-            base.task_runner.tasks.get("build").map(String::as_str),
+            base.task_runner
+                .tasks
+                .get("build")
+                .map(|task| task.command.as_str()),
             Some("cargo build --release"),
             "new task from overlay is added"
         );
@@ -730,16 +824,58 @@ mounts = ["/tmp/notes"]
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.toml");
         let mut written = Settings::default();
-        written
-            .task_runner
-            .tasks
-            .insert("lint".into(), "cargo check".into());
+        written.task_runner.tasks.insert(
+            "lint".into(),
+            TaskDefinition {
+                command: "cargo check".into(),
+                allow_stdin: false,
+            },
+        );
+        written.task_runner.tasks.insert(
+            "review".into(),
+            TaskDefinition {
+                command: "review-tool".into(),
+                allow_stdin: true,
+            },
+        );
         written.save_to(&path).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("[task_runner.tasks]"));
         assert!(raw.contains("lint"));
+        assert!(raw.contains("[task_runner.tasks.review]"));
+        assert!(raw.contains("allow_stdin = true"));
         let read = Settings::load_from(&path).unwrap();
         assert_eq!(read, written);
+    }
+
+    #[test]
+    fn task_runner_accepts_legacy_string_and_detailed_table_forms() {
+        let settings: Settings = toml::from_str(
+            r#"
+            [task_runner.tasks]
+            lint = "cargo check"
+
+            [task_runner.tasks.review]
+            command = "review-tool"
+            allow_stdin = true
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings.task_runner.tasks["lint"],
+            TaskDefinition {
+                command: "cargo check".into(),
+                allow_stdin: false,
+            }
+        );
+        assert_eq!(
+            settings.task_runner.tasks["review"],
+            TaskDefinition {
+                command: "review-tool".into(),
+                allow_stdin: true,
+            }
+        );
     }
 
     #[test]

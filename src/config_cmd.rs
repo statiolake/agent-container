@@ -22,7 +22,7 @@ use crate::mcp::{self, McpServer};
 use crate::oauth::{OAuthStore, load_from_keychain};
 use crate::paths::HostPaths;
 use crate::policy::McpPolicy;
-use crate::settings::{self, Scope, Settings};
+use crate::settings::{self, Scope, Settings, TaskDefinition};
 use crate::tui::{
     self, McpAgent, McpCatalogCommand, McpCatalogEvent, McpServerEntry, Outcome, ToolEntry,
     TuiInput,
@@ -424,10 +424,10 @@ fn spawn_fetch(
 /// `[task_runner.tasks]` sparse — workspace files only carry overrides,
 /// never redundant copies of global tasks.
 fn minimise_tasks_against_base(
-    mut final_tasks: BTreeMap<String, String>,
-    base: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    final_tasks.retain(|name, cmd| base.get(name).map(|b| b != cmd).unwrap_or(true));
+    mut final_tasks: BTreeMap<String, TaskDefinition>,
+    base: &BTreeMap<String, TaskDefinition>,
+) -> BTreeMap<String, TaskDefinition> {
+    final_tasks.retain(|name, task| base.get(name).map(|b| b != task).unwrap_or(true));
     final_tasks
 }
 

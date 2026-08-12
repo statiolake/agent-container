@@ -8,6 +8,8 @@
 //! it with `"$@"`. The reserved `stdin_path` argument can feed a
 //! workspace-local file into the command's standard input without forcing
 //! the model to paste large content into the conversation.
+//! The separate CLI only forwards inherited stdin for tasks whose
+//! `allow_stdin` setting is enabled.
 //!
 //! The broker serves this entirely in-process — there is no upstream
 //! process to forward to — so it implements just enough of the MCP
@@ -36,7 +38,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 /// in the container's `~/.claude.json` and in any Claude-Code-side UI
 /// (`mcp__task-runner__<tool>`).
 pub const NAME: &str = "task-runner";
-pub const CLI_GUIDANCE: &str = "The container image also includes a `task-runner` CLI for shell pipelines. Invoke `task-runner TASK [KEY=VALUE ...] [-- ARG ...]`; it streams stdin through the host broker and streams stdout/stderr back. The task-runner MCP server is authoritative for which task names are available, so this CLI cannot execute arbitrary commands or define new tasks.";
+pub const CLI_GUIDANCE: &str = "The container image also includes a `task-runner` CLI for shell pipelines. Invoke `task-runner TASK [KEY=VALUE ...] [-- ARG ...]`; it streams stdin through the host broker only when that task's `allow_stdin` setting is enabled and streams stdout/stderr back. Without that setting the CLI does not read its inherited stdin, so it is safe to call from a `while read` loop. The task-runner MCP server is authoritative for which task names are available, so this CLI cannot execute arbitrary commands or define new tasks.";
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const TIMEOUT_ARGUMENT: &str = "timeout_seconds";
@@ -53,6 +55,7 @@ pub struct TaskRunner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpec {
     pub command: String,
+    pub allow_stdin: bool,
     pub config_root: PathBuf,
 }
 
@@ -60,7 +63,7 @@ pub struct TaskSpec {
 /// broker's streaming HTTP adapter. The task itself has already gone through
 /// the same lookup and argument validation as an MCP `tools/call`.
 pub(crate) struct StreamingTask {
-    pub(crate) stdin: ChildStdin,
+    pub(crate) stdin: Option<ChildStdin>,
     pub(crate) stdout: ChildStdout,
     pub(crate) stderr: tokio::process::ChildStderr,
     pub(crate) child: Child,
@@ -93,26 +96,28 @@ pub fn load_specs_from_settings(workspace: &Path) -> Result<BTreeMap<String, Tas
 }
 
 fn specs_from_scopes(
-    global_tasks: BTreeMap<String, String>,
+    global_tasks: BTreeMap<String, crate::settings::TaskDefinition>,
     global_root: PathBuf,
-    workspace_tasks: BTreeMap<String, String>,
+    workspace_tasks: BTreeMap<String, crate::settings::TaskDefinition>,
     workspace_root: PathBuf,
 ) -> BTreeMap<String, TaskSpec> {
     let mut tasks = BTreeMap::new();
-    for (name, command) in global_tasks {
+    for (name, definition) in global_tasks {
         tasks.insert(
             name,
             TaskSpec {
-                command,
+                command: definition.command,
+                allow_stdin: definition.allow_stdin,
                 config_root: global_root.clone(),
             },
         );
     }
-    for (name, command) in workspace_tasks {
+    for (name, definition) in workspace_tasks {
         tasks.insert(
             name,
             TaskSpec {
-                command,
+                command: definition.command,
+                allow_stdin: definition.allow_stdin,
                 config_root: workspace_root.clone(),
             },
         );
@@ -143,16 +148,25 @@ impl TaskRunner {
             .clone();
 
         let mut cmd = command_for(&task, &invocation);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        if task.allow_stdin {
+            cmd.stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn task '{name}'"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("task process did not expose stdin")?;
+        let stdin = if task.allow_stdin {
+            Some(
+                child
+                    .stdin
+                    .take()
+                    .context("task process did not expose stdin")?,
+            )
+        } else {
+            None
+        };
         let stdout = child
             .stdout
             .take()
@@ -240,10 +254,15 @@ impl TaskRunner {
             .iter()
             .map(|(name, task)| {
                 let cmd = &task.command;
+                let cli_stdin = if task.allow_stdin {
+                    "The CLI may stream its inherited stdin for this task when invoked from a pipe or redirect."
+                } else {
+                    "The CLI does not read inherited stdin for this task; this keeps it safe to invoke from a `while read` loop."
+                };
                 json!({
                     "name": name,
                     "description": format!(
-                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. Pass `{ARGV_ARGUMENT}` as an ordered array when the command should receive positional parameters; the shell can forward them with \"$@\". Pass `{STDIN_PATH_ARGUMENT}` to feed a workspace-local file to stdin; relative paths are resolved from the workspace. If the file cannot be read from the shared workspace, move or copy it into the workspace and pass that path. `$CONFIG_ROOT` points at the host-side agent-container settings directory that defined this task. Set `{TIMEOUT_ARGUMENT}` to a positive number of seconds when this host task needs an explicit timeout; omit it to run without a task-runner timeout. {CLI_GUIDANCE}"
+                        "Run on the host via agent-container task-runner: `{cmd}`. Use this instead of ordinary container shell commands when the operation needs host-side capabilities, such as Docker/container lifecycle, host-only files, or network access that the container cannot perform directly. Pass named values as arguments; each key is exposed to the shell as an environment variable, so `$value` expands from an argument named `value`. Pass `{ARGV_ARGUMENT}` as an ordered array when the command should receive positional parameters; the shell can forward them with \"$@\". Pass `{STDIN_PATH_ARGUMENT}` to feed a workspace-local file to stdin; relative paths are resolved from the workspace. If the file cannot be read from the shared workspace, move or copy it into the workspace and pass that path. `$CONFIG_ROOT` points at the host-side agent-container settings directory that defined this task. Set `{TIMEOUT_ARGUMENT}` to a positive number of seconds when this host task needs an explicit timeout; omit it to run without a task-runner timeout. {cli_stdin} {CLI_GUIDANCE}"
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -510,6 +529,10 @@ async fn run_command(
     workspace: &Path,
     invocation: &CmdInvocation,
 ) -> Result<CmdOutput> {
+    // `allow_stdin` governs only the CLI's inherited process stdin. MCP
+    // callers opt in explicitly by supplying `stdin_path`, so that path
+    // remains available even for tasks that are safe to call from a shell
+    // loop.
     let mut cmd = command_for(task, invocation);
     match &invocation.stdin {
         Some(CmdStdin::Path(path)) => {
@@ -663,6 +686,15 @@ mod tests {
     fn task(command: impl Into<String>, config_root: impl Into<PathBuf>) -> TaskSpec {
         TaskSpec {
             command: command.into(),
+            allow_stdin: false,
+            config_root: config_root.into(),
+        }
+    }
+
+    fn task_with_stdin(command: impl Into<String>, config_root: impl Into<PathBuf>) -> TaskSpec {
+        TaskSpec {
+            command: command.into(),
+            allow_stdin: true,
             config_root: config_root.into(),
         }
     }
@@ -680,14 +712,26 @@ mod tests {
         let mut global = BTreeMap::new();
         global.insert(
             "deploy".to_string(),
-            "$CONFIG_ROOT/scripts/deploy".to_string(),
+            crate::settings::TaskDefinition {
+                command: "$CONFIG_ROOT/scripts/deploy".to_string(),
+                allow_stdin: false,
+            },
         );
-        global.insert("global-only".to_string(), "global".to_string());
+        global.insert(
+            "global-only".to_string(),
+            crate::settings::TaskDefinition {
+                command: "global".to_string(),
+                allow_stdin: true,
+            },
+        );
 
         let mut workspace = BTreeMap::new();
         workspace.insert(
             "deploy".to_string(),
-            "$CONFIG_ROOT/scripts/deploy-workspace".to_string(),
+            crate::settings::TaskDefinition {
+                command: "$CONFIG_ROOT/scripts/deploy-workspace".to_string(),
+                allow_stdin: false,
+            },
         );
 
         let specs = specs_from_scopes(
@@ -705,6 +749,7 @@ mod tests {
             specs["global-only"].config_root,
             PathBuf::from("/Users/example/.config/agent-container")
         );
+        assert!(specs["global-only"].allow_stdin);
     }
 
     #[tokio::test]
@@ -861,7 +906,7 @@ mod tests {
         let mut tasks = BTreeMap::new();
         tasks.insert(
             "stream".into(),
-            task(
+            task_with_stdin(
                 "cat; printf '%s:%s\\n' \"$value\" \"$CONFIG_ROOT\" >&2",
                 "/tmp/task-root",
             ),
@@ -879,9 +924,9 @@ mod tests {
             .await
             .unwrap();
 
-        process.stdin.write_all(b"streamed input\n").await.unwrap();
-        process.stdin.shutdown().await.unwrap();
-        drop(process.stdin);
+        let mut stdin = process.stdin.take().unwrap();
+        stdin.write_all(b"streamed input\n").await.unwrap();
+        stdin.shutdown().await.unwrap();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         process.stdout.read_to_end(&mut stdout).await.unwrap();
@@ -891,6 +936,29 @@ mod tests {
         assert!(status.success());
         assert_eq!(stdout, b"streamed input\n");
         assert_eq!(stderr, b"from-cli:/tmp/task-root\n");
+    }
+
+    #[tokio::test]
+    async fn streaming_task_without_allow_stdin_uses_null_stdin() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut tasks = BTreeMap::new();
+        tasks.insert(
+            "stream".into(),
+            task(
+                "if read value; then printf 'received:%s\\n' \"$value\"; else printf 'no-stdin\\n'; fi",
+                "/tmp/task-root",
+            ),
+        );
+        let runner = TaskRunner::new(tasks, workspace.path().to_path_buf());
+        let mut process = runner.spawn_streaming_cli("stream", &[]).await.unwrap();
+
+        assert!(process.stdin.is_none());
+        let mut stdout = Vec::new();
+        process.stdout.read_to_end(&mut stdout).await.unwrap();
+        let status = process.child.wait().await.unwrap();
+
+        assert!(status.success());
+        assert_eq!(stdout, b"no-stdin\n");
     }
 
     #[tokio::test]

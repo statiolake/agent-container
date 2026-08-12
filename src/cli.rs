@@ -179,8 +179,10 @@ proxy allowlist. Host-only
 operations should be exposed through `[task_runner.tasks]` instead of relying
 on ordinary container shell access. The image also provides a
 task-runner TASK [KEY=VALUE ...] [-- argv ...] CLI: it streams stdin through
-the host broker and can invoke only tasks currently exposed by the
-task-runner MCP server, which is authoritative for task availability.
+the host broker only for tasks with `allow_stdin = true`, and can invoke only
+tasks currently exposed by the task-runner MCP server, which is authoritative
+for task availability. Tasks without that option do not read inherited stdin,
+so they are safe to call from a `while read` loop.
 
 Arguments for the chosen agent are accepted only after `--`, for example
 `agent-container run -- --continue`. Pass `--tmux` when you want the agent
@@ -193,7 +195,9 @@ Inside the container, task-runner uses the same task names and argument
 validation as the task-runner MCP server. KEY=VALUE arguments become task
 environment variables, arguments after -- become "$@", and
 --timeout-seconds sets the same per-call timeout. Its standard input is
-streamed to the host task over HTTP; it cannot execute an arbitrary command."#;
+streamed to the host task over HTTP only when the task's `allow_stdin` option
+is enabled and stdin is a pipe or redirect; it cannot execute an arbitrary
+command."#;
 
 const SHELL_HELP: &str = r#"Open an interactive shell inside the same container environment used by `run`.
 
@@ -246,6 +250,10 @@ Supported TOML shape:
   build_image = "docker build -t my-app ."
   deploy = "\"$CONFIG_ROOT/scripts/deploy\" \"$env\""
 
+  [task_runner.tasks.review]
+  command = "review-tool"
+  allow_stdin = true
+
   [filesystem]
   mounts = [{ path = "/Users/me/project-notes", readonly = true }]
   hide = ["(^|/)\\.env(\\..*)?$"]
@@ -269,6 +277,10 @@ array argument that becomes the command's positional parameters, so commands can
 forward it with `"$@"`. `timeout_seconds` is a reserved per-call argument that
 sets a task-runner timeout and is not passed to the command environment; omit it
 to run without a task-runner timeout.
+`allow_stdin = true` opts a task into receiving CLI stdin from a pipe or
+redirect. It defaults to false so invoking a task from a `while read` loop
+does not consume the loop's input. The config TUI exposes this as the
+`Allow stdin` checkbox in the task editor.
 
 `filesystem` controls both container bind mounts and the built-in host-fs MCP
 server. The current workspace is always mounted. `filesystem.mounts` adds more

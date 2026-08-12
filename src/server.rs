@@ -27,7 +27,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get};
 use base64::Engine;
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -267,7 +267,10 @@ pub async fn spawn(config: SpawnConfig) -> Result<RunningServer> {
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/aws/credentials", get(handle_aws))
-        .route("/task-runner/:name", post(handle_task_runner_cli))
+        .route(
+            "/task-runner/:name",
+            get(handle_task_runner_cli_info).post(handle_task_runner_cli),
+        )
         .route("/mcp/:name", any(handle_mcp_root))
         .route("/mcp/:name/*rest", any(handle_mcp_nested))
         .with_state(state);
@@ -332,6 +335,31 @@ async fn handle_task_runner_cli(
         .header(axum::http::header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
         .expect("task-runner stream response should be valid")
+        .into_response()
+}
+
+async fn handle_task_runner_cli_info(
+    AxumPath(name): AxumPath<String>,
+    State(state): State<Arc<BrokerState>>,
+) -> Response {
+    let runner = match state.mcp.read().await.get(task_runner::NAME) {
+        Some(McpBackend::TaskRunner(r)) => r.clone(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                "task-runner is not enabled for this agent",
+            )
+                .into_response();
+        }
+    };
+    let Some(task) = runner.tasks.get(&name) else {
+        return (StatusCode::NOT_FOUND, format!("unknown task '{name}'")).into_response();
+    };
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "allow_stdin": task.allow_stdin })),
+    )
         .into_response()
 }
 
@@ -538,8 +566,11 @@ async fn produce_task_runner_stream(
 
 async fn forward_task_runner_stdin(
     body: Body,
-    mut stdin: tokio::process::ChildStdin,
+    stdin: Option<tokio::process::ChildStdin>,
 ) -> std::result::Result<(), String> {
+    let Some(mut stdin) = stdin else {
+        return Ok(());
+    };
     let mut body = body.into_data_stream();
     while let Some(chunk) = body.next().await {
         let chunk = chunk.map_err(|e| format!("failed to read task stdin: {e}"))?;
@@ -2278,6 +2309,7 @@ mod tests {
             "stream".into(),
             crate::task_runner::TaskSpec {
                 command: "cat; printf 'diagnostic\\n' >&2".into(),
+                allow_stdin: true,
                 config_root: PathBuf::from("/tmp/task-root"),
             },
         );

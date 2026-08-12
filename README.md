@@ -338,6 +338,18 @@ inventing environment variable names.
 The reserved argument `timeout_seconds` sets a per-call task-runner timeout
 and is not forwarded to the command environment; omit it to run without a
 task-runner timeout.
+`allow_stdin = true` opts a task into receiving CLI stdin from a pipe or
+redirect. It defaults to false so invoking a task from a `while read` loop
+does not consume the loop's input. The config TUI exposes this as the
+`Allow stdin` checkbox in the task editor.
+
+The detailed task form is:
+
+```toml
+[task_runner.tasks.review]
+command = "review-tool"
+allow_stdin = true
+```
 
 The container image also includes a task-runner CLI for scripts and shell
 pipelines. It accepts the same task names and argument model exposed by the
@@ -350,10 +362,12 @@ task-runner deploy environment=staging
 
 KEY=VALUE arguments become task environment variables, arguments after -- are
 forwarded as "$@", and --timeout-seconds has the same meaning as the MCP
-argument. stdin is streamed to the host broker over HTTP, while stdout and
-stderr are streamed back to their corresponding local streams. The CLI cannot
-run arbitrary commands; only tasks exposed by the task-runner MCP server can
-be run.
+argument. For tasks with `allow_stdin = true`, stdin is streamed to the host
+broker over HTTP only when it is a pipe or redirect; otherwise the CLI leaves
+stdin untouched. This default makes tasks safe to call from a `while read`
+loop. stdout and stderr are streamed back to their corresponding local
+streams. The CLI cannot run arbitrary commands; only tasks exposed by the
+task-runner MCP server can be run.
 
 ## Known limitations
 
