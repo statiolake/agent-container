@@ -7,8 +7,9 @@
 //! - **Proxy** — a scope-local list of tinyproxy allow regex patterns.
 //! - **Filesystem** — a tree of host path mounts and filter patterns.
 //! - **MCP (Claude Code)** and **MCP (Codex)** — collapsible trees of
-//!   task-runner commands and servers → tools. `Enter` activates the
-//!   highlighted row (expand/collapse, edit, add, or toggle).
+//!   task-runner commands and servers → tools. `Space` expands/collapses
+//!   trees and toggles tool checkboxes; `Enter` opens the highlighted row's
+//!   menu or accepts an add/edit form.
 //!   The built-in `task-runner` always sits at the top of the tree; its
 //!   children are editable task definitions (`name = command`, with an
 //!   optional `allow stdin` setting) that become MCP tools for host-side
@@ -18,14 +19,16 @@
 //!
 //! - ←/→ or `h`/`l` (or Tab/Shift+Tab) switch tabs.
 //! - ↑/↓ or `j`/`k` move within the current tab.
-//! - `Enter` activates the highlighted row.
+//! - `Space` toggles the highlighted tree or checkbox where applicable.
+//! - `Enter` opens a row menu, or accepts the current menu/form choice.
 //! - `a` adds an item in the highlighted row's context.
 //! - `d` removes the highlighted row when it is owned by the active scope.
 //! - `s` saves the active scope and exits.
 //! - `t` toggles the scope target between Global and Workspace (the save
 //!   destination). Each scope keeps its own in-memory proxy allow list so
 //!   switching back and forth preserves edits.
-//! - `q` opens the save/discard/continue exit dialog.
+//! - `q` opens the save/discard/continue exit dialog when there are changes;
+//!   otherwise it exits immediately.
 //!
 //! The alternate screen is entered so the prior terminal contents come
 //! back untouched on exit.
@@ -377,9 +380,11 @@ pub struct TuiInput {
 }
 
 pub struct TuiOutput {
-    /// Which scope was active when the user hit `s`. The save pass writes
-    /// only this scope; the other scope's buffer is discarded.
+    /// Which scope was active when the user hit `s`.
     pub saved_scope: Scope,
+    /// Scope-changing an item edits both layers, so the save pass must write
+    /// both buffers instead of discarding the other one.
+    pub save_both_scopes: bool,
     pub general_global: GeneralPolicy,
     pub general_workspace: GeneralPolicy,
     pub claude_global: ClaudePolicy,
@@ -527,6 +532,9 @@ enum Mode {
         target: ItemActionTarget,
         cursor: usize,
     },
+    McpFilter {
+        buffer: TextField,
+    },
     McpServerAction {
         agent: McpAgent,
         server_name: String,
@@ -542,18 +550,28 @@ enum Mode {
 
 #[derive(Clone)]
 enum ItemActionTarget {
+    General(GeneralRow),
     Proxy(ProxyRow),
     Filesystem(FilesystemRow),
     Task(String),
+    McpTool(usize),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ItemAction {
     Edit,
     Remove,
+    ChangeScope,
+    Toggle,
 }
 
-const ITEM_ACTION_CHOICES: [ItemAction; 2] = [ItemAction::Edit, ItemAction::Remove];
+const EDIT_REMOVE_SCOPE_CHOICES: [ItemAction; 3] = [
+    ItemAction::Edit,
+    ItemAction::ChangeScope,
+    ItemAction::Remove,
+];
+const EDIT_SCOPE_CHOICES: [ItemAction; 2] = [ItemAction::Edit, ItemAction::ChangeScope];
+const TOGGLE_SCOPE_CHOICES: [ItemAction; 2] = [ItemAction::Toggle, ItemAction::ChangeScope];
 
 #[derive(Clone, Copy)]
 enum McpServerAction {
@@ -632,6 +650,13 @@ impl ProxyOrigin {
         match scope {
             Scope::Global => ProxyOrigin::Global,
             Scope::Workspace => ProxyOrigin::Workspace,
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Self::Global => Self::Workspace,
+            Self::Workspace => Self::Global,
         }
     }
 }
@@ -770,6 +795,28 @@ impl ProxyState {
         }
     }
 
+    fn move_row(&mut self, scope: Scope, row: ProxyRow) -> bool {
+        let active = ProxyOrigin::from_scope(scope);
+        if row.origin != active {
+            return false;
+        }
+        let value = {
+            let list = self.list_mut(row.origin);
+            if row.idx_within_scope >= list.len() {
+                return false;
+            }
+            list.remove(row.idx_within_scope)
+        };
+        let destination = self.list_mut(row.origin.other());
+        if !destination.contains(&value) {
+            destination.push(value);
+        }
+        self.cursor = self
+            .cursor
+            .min(self.visible_rows(scope).len().saturating_sub(1));
+        true
+    }
+
     /// Apply an upsert at the active scope. When `editing` points at a
     /// row owned by the active scope, replace it. When it points at a
     /// foreign-scope row (an inherited global pattern visible while
@@ -825,6 +872,8 @@ struct FilesystemState {
     global: FilesystemPolicy,
     workspace: FilesystemPolicy,
     cursor: usize,
+    path_expanded: bool,
+    filter_expanded: bool,
 }
 
 impl FilesystemState {
@@ -833,6 +882,8 @@ impl FilesystemState {
             global,
             workspace,
             cursor: 0,
+            path_expanded: true,
+            filter_expanded: true,
         }
     }
 
@@ -896,24 +947,28 @@ impl FilesystemState {
         let entries = self.entry_rows(scope);
         let mut rows = Vec::new();
         rows.push(FilesystemViewRow::Section(FilesystemSection::Path));
-        rows.extend(
-            entries
-                .iter()
-                .filter(|row| row.field == FilesystemField::Mount)
-                .cloned()
-                .map(FilesystemViewRow::Entry),
-        );
-        rows.push(FilesystemViewRow::Add(FilesystemField::Mount));
+        if self.path_expanded {
+            rows.extend(
+                entries
+                    .iter()
+                    .filter(|row| row.field == FilesystemField::Mount)
+                    .cloned()
+                    .map(FilesystemViewRow::Entry),
+            );
+            rows.push(FilesystemViewRow::Add(FilesystemField::Mount));
+        }
         rows.push(FilesystemViewRow::Section(FilesystemSection::Filter));
-        rows.extend(
-            entries
-                .iter()
-                .filter(|row| row.field != FilesystemField::Mount)
-                .cloned()
-                .map(FilesystemViewRow::Entry),
-        );
-        rows.push(FilesystemViewRow::Add(FilesystemField::Hide));
-        rows.push(FilesystemViewRow::Add(FilesystemField::Readonly));
+        if self.filter_expanded {
+            rows.extend(
+                entries
+                    .iter()
+                    .filter(|row| row.field != FilesystemField::Mount)
+                    .cloned()
+                    .map(FilesystemViewRow::Entry),
+            );
+            rows.push(FilesystemViewRow::Add(FilesystemField::Hide));
+            rows.push(FilesystemViewRow::Add(FilesystemField::Readonly));
+        }
         rows
     }
 
@@ -939,6 +994,33 @@ impl FilesystemState {
 
     fn current_row(&self, scope: Scope) -> Option<FilesystemViewRow> {
         self.visible_rows(scope).into_iter().nth(self.cursor)
+    }
+
+    fn toggle_section(&mut self, section: FilesystemSection, scope: Scope) {
+        match section {
+            FilesystemSection::Path => self.path_expanded = !self.path_expanded,
+            FilesystemSection::Filter => self.filter_expanded = !self.filter_expanded,
+        }
+        self.clamp_cursor(scope);
+    }
+
+    fn toggle_mount_readonly(&mut self, scope: Scope, row: FilesystemRow) -> bool {
+        if row.field != FilesystemField::Mount || row.origin != ProxyOrigin::from_scope(scope) {
+            return false;
+        }
+        let policy = self.policy_mut(row.origin);
+        let Some(mount) = policy.mounts.get_mut(row.idx_within_scope) else {
+            return false;
+        };
+        mount.readonly = !mount.readonly;
+        true
+    }
+
+    fn clamp_cursor(&mut self, scope: Scope) {
+        let len = self.visible_rows(scope).len();
+        if self.cursor >= len {
+            self.cursor = len.saturating_sub(1);
+        }
     }
 
     fn upsert(
@@ -1009,6 +1091,51 @@ impl FilesystemState {
         if self.cursor >= len {
             self.cursor = len.saturating_sub(1);
         }
+    }
+
+    fn move_row(&mut self, scope: Scope, row: FilesystemRow) -> bool {
+        let active = ProxyOrigin::from_scope(scope);
+        if row.origin != active {
+            return false;
+        }
+        let value = match row.field {
+            FilesystemField::Mount => {
+                let policy = self.policy_mut(row.origin);
+                if row.idx_within_scope >= policy.mounts.len() {
+                    return false;
+                }
+                let mount = policy.mounts.remove(row.idx_within_scope);
+                (mount.path, mount.readonly)
+            }
+            field => {
+                let policy = self.policy_mut(row.origin);
+                let list = Self::filter_list_mut(policy, field);
+                if row.idx_within_scope >= list.len() {
+                    return false;
+                }
+                (list.remove(row.idx_within_scope), false)
+            }
+        };
+        let destination = self.policy_mut(row.origin.other());
+        match row.field {
+            FilesystemField::Mount => {
+                if !destination.mounts.iter().any(|mount| mount.path == value.0) {
+                    destination
+                        .mounts
+                        .push(FilesystemMount::new(value.0, value.1));
+                }
+            }
+            field => {
+                let list = Self::filter_list_mut(destination, field);
+                if !list.contains(&value.0) {
+                    list.push(value.0);
+                }
+            }
+        }
+        self.cursor = self
+            .cursor
+            .min(self.visible_rows(scope).len().saturating_sub(1));
+        true
     }
 }
 
@@ -1091,6 +1218,43 @@ impl GeneralState {
 
     fn set_agent(&mut self, scope: Scope, agent: Option<DefaultAgent>) {
         self.active_policy_mut(scope).default_agent = agent;
+    }
+
+    fn is_configured(&self, scope: Scope, row: GeneralRow) -> bool {
+        match row {
+            GeneralRow::DefaultAgent => self.configured_agent(scope).is_some(),
+            GeneralRow::BedrockRegion => self.configured_bedrock_region(scope).is_some(),
+            GeneralRow::BypassWarning => self.configured_skip_bypass_warning(scope).is_some(),
+        }
+    }
+
+    fn move_setting(&mut self, scope: Scope, row: GeneralRow) -> bool {
+        if !self.is_configured(scope, row) {
+            return false;
+        }
+        let destination = match scope {
+            Scope::Global => Scope::Workspace,
+            Scope::Workspace => Scope::Global,
+        };
+        match row {
+            GeneralRow::DefaultAgent => {
+                let value = self.active_policy_mut(scope).default_agent.take();
+                self.active_policy_mut(destination).default_agent = value;
+            }
+            GeneralRow::BedrockRegion => {
+                let value = self.active_policy_mut(scope).bedrock_region.take();
+                self.active_policy_mut(destination).bedrock_region = value;
+            }
+            GeneralRow::BypassWarning => {
+                let value = self
+                    .active_claude_policy_mut(scope)
+                    .skip_bypass_permissions_warning
+                    .take();
+                self.active_claude_policy_mut(destination)
+                    .skip_bypass_permissions_warning = value
+            }
+        }
+        true
     }
 
     fn active_claude_policy_mut(&mut self, scope: Scope) -> &mut ClaudePolicy {
@@ -1228,7 +1392,7 @@ struct McpState {
     server_transports: HashMap<String, String>,
     server_status: HashMap<String, McpServerStatus>,
     /// Per-server collapse state. The config UI starts with only
-    /// top-level MCP rows visible; `Enter` expands the focused server.
+    /// top-level MCP rows visible; `Space` expands the focused server.
     expanded: Vec<bool>,
     /// Static catalog of (server, tool, hint, description) tuples — the
     /// tool inventory itself doesn't change between scopes.
@@ -1237,6 +1401,7 @@ struct McpState {
     /// so expand/collapse doesn't have to scan the full list each frame.
     server_ranges: HashMap<String, (usize, usize)>,
     cursor: usize,
+    filter: String,
 }
 
 impl McpState {
@@ -1294,6 +1459,7 @@ impl McpState {
             catalog,
             server_ranges,
             cursor: 0,
+            filter: String::new(),
         }
     }
 
@@ -1373,6 +1539,33 @@ impl McpState {
         }
     }
 
+    fn filter_matches(&self, text: &str) -> bool {
+        let query = self.filter.trim().to_lowercase();
+        query.is_empty() || text.to_lowercase().contains(&query)
+    }
+
+    fn task_matches(&self, name: &str, task: &TaskDefinition) -> bool {
+        self.filter_matches(name) || self.filter_matches(&task.command)
+    }
+
+    fn server_matches(&self, name: &str) -> bool {
+        self.filter_matches(name)
+            || self
+                .server_transports
+                .get(name)
+                .is_some_and(|transport| self.filter_matches(transport))
+            || match self.server_status.get(name) {
+                Some(McpServerStatus::Failed { message, .. }) => self.filter_matches(message),
+                _ => false,
+            }
+    }
+
+    fn tool_matches(&self, entry: &ToolEntry) -> bool {
+        self.filter_matches(&entry.server_name)
+            || self.filter_matches(&entry.tool_name)
+            || self.filter_matches(&entry.description)
+    }
+
     /// Whether a task at the given key is currently overridden in the
     /// active scope (used for the `[W]` annotation while editing
     /// Workspace).
@@ -1436,24 +1629,54 @@ impl McpState {
         policy.set_tool(&entry.server_name, &entry.tool_name, enabled);
     }
 
-    /// Flat list of currently-visible rows (respecting expanded state)
-    /// for the active scope.
+    /// Flat list of currently-visible rows (respecting filter and expanded
+    /// state) for the active scope.
     fn visible_rows(&self, scope: Scope) -> Vec<McpRow> {
         let mut rows = Vec::new();
-        rows.push(McpRow::TaskRunnerHeader);
-        if self.task_runner_expanded {
-            for name in self.effective_tasks(scope).keys() {
-                rows.push(McpRow::TaskRow(name.clone()));
+        let filter_active = !self.filter.trim().is_empty();
+        let tasks = self.effective_tasks(scope);
+        let task_runner_matches = !filter_active
+            || self.filter_matches("task-runner")
+            || tasks
+                .iter()
+                .any(|(name, task)| self.task_matches(name, task));
+        if task_runner_matches {
+            rows.push(McpRow::TaskRunnerHeader);
+            if self.task_runner_expanded {
+                for (name, task) in &tasks {
+                    if !filter_active || self.task_matches(name, task) {
+                        rows.push(McpRow::TaskRow(name.clone()));
+                    }
+                }
+                if !filter_active {
+                    rows.push(McpRow::TaskAddHint);
+                }
             }
-            rows.push(McpRow::TaskAddHint);
         }
         for (si, name) in self.server_names.iter().enumerate() {
+            let Some((start, count)) = self.server_ranges.get(name).copied() else {
+                if !filter_active || self.server_matches(name) {
+                    rows.push(McpRow::Server(si));
+                }
+                continue;
+            };
+            let server_matches = self.server_matches(name);
+            let matching_tools = (start..start + count)
+                .filter(|index| self.tool_matches(&self.catalog[*index]))
+                .collect::<Vec<_>>();
+            if filter_active && !server_matches && matching_tools.is_empty() {
+                continue;
+            }
             rows.push(McpRow::Server(si));
-            if self.expanded[si]
-                && let Some((start, count)) = self.server_ranges.get(name).copied()
-            {
-                for t in 0..count {
-                    rows.push(McpRow::Tool(start + t));
+            if self.expanded[si] {
+                if !filter_active || server_matches {
+                    for t in 0..count {
+                        rows.push(McpRow::Tool(start + t));
+                    }
+                } else {
+                    for index in matching_tools {
+                        rows.push(McpRow::Tool(index));
+                    }
                 }
             }
         }
@@ -1484,37 +1707,96 @@ impl McpState {
         self.cursor = len.saturating_sub(1);
     }
 
-    /// Toggle the currently-focused row. Returns a [`RowAction`] when the
-    /// row can't handle the toggle locally (e.g. a task row needs the
-    /// outer event loop to spawn an input modal).
-    fn toggle(&mut self, scope: Scope) -> RowAction {
+    fn clamp_cursor(&mut self, scope: Scope) {
+        let len = self.visible_rows(scope).len();
+        if self.cursor >= len {
+            self.cursor = len.saturating_sub(1);
+        }
+    }
+
+    fn set_filter(&mut self, filter: String, scope: Scope) {
+        self.filter = filter;
+        self.cursor = 0;
+        self.clamp_cursor(scope);
+    }
+
+    /// Toggle the currently-focused tree or checkbox row from `Space`.
+    fn space_toggle(&mut self, scope: Scope) {
         match self.current_row(scope) {
             Some(McpRow::TaskRunnerHeader) => {
                 self.task_runner_expanded = !self.task_runner_expanded;
-                RowAction::Handled
             }
             Some(McpRow::Server(si)) => {
-                let name = self.server_names[si].clone();
-                match self.server_status.get(&name) {
-                    Some(McpServerStatus::Failed { can_auth, .. }) => RowAction::McpServerAction {
-                        server_name: name,
-                        can_auth: *can_auth,
-                    },
-                    _ => {
-                        self.expanded[si] = !self.expanded[si];
-                        RowAction::Handled
-                    }
+                if !matches!(
+                    self.server_status.get(&self.server_names[si]),
+                    Some(McpServerStatus::Failed { .. })
+                ) {
+                    self.expanded[si] = !self.expanded[si];
                 }
             }
             Some(McpRow::Tool(ti)) => {
                 let cur = self.effective_tool_allowed(scope, ti);
                 self.set_tool_for(scope, ti, !cur);
-                RowAction::Handled
             }
+            Some(McpRow::TaskRow(_) | McpRow::TaskAddHint) | None => {}
+        }
+    }
+
+    fn enter_action(&self, scope: Scope) -> RowAction {
+        match self.current_row(scope) {
             Some(McpRow::TaskRow(name)) => RowAction::EditTask(name),
             Some(McpRow::TaskAddHint) => RowAction::AddTask,
+            Some(McpRow::Server(si)) => {
+                let name = self.server_names[si].clone();
+                let can_auth = matches!(
+                    self.server_status.get(&name),
+                    Some(McpServerStatus::Failed { can_auth: true, .. })
+                );
+                RowAction::McpServerAction {
+                    server_name: name,
+                    can_auth,
+                }
+            }
+            Some(McpRow::Tool(ti)) => RowAction::McpToolAction(ti),
+            Some(McpRow::TaskRunnerHeader) => RowAction::AddTask,
             None => RowAction::Handled,
         }
+    }
+
+    fn tool_is_configured(&self, scope: Scope, idx: usize) -> bool {
+        let entry = &self.catalog[idx];
+        let policy = match scope {
+            Scope::Global => &self.mcp_global,
+            Scope::Workspace => &self.mcp_workspace,
+        };
+        policy
+            .servers
+            .get(&entry.server_name)
+            .and_then(|server| server.tools.get(&entry.tool_name))
+            .is_some()
+    }
+
+    fn move_tool_scope(&mut self, scope: Scope, idx: usize) -> bool {
+        let entry = &self.catalog[idx];
+        let value = match scope {
+            Scope::Global => self
+                .mcp_global
+                .servers
+                .get_mut(&entry.server_name)
+                .and_then(|server| server.tools.remove(&entry.tool_name)),
+            Scope::Workspace => self
+                .mcp_workspace
+                .servers
+                .get_mut(&entry.server_name)
+                .and_then(|server| server.tools.remove(&entry.tool_name)),
+        };
+        let Some(value) = value else { return false };
+        let destination = match scope {
+            Scope::Global => &mut self.mcp_workspace,
+            Scope::Workspace => &mut self.mcp_global,
+        };
+        destination.set_tool(&entry.server_name, &entry.tool_name, value);
+        true
     }
 
     /// Delete the task focused by the cursor under `scope`. Workspace
@@ -1557,6 +1839,31 @@ impl McpState {
         }
     }
 
+    fn task_is_configured(&self, scope: Scope, name: &str) -> bool {
+        match scope {
+            Scope::Global => self.tasks_global.contains_key(name),
+            Scope::Workspace => self.tasks_workspace.contains_key(name),
+        }
+    }
+
+    fn move_task_scope(&mut self, scope: Scope, name: &str) -> bool {
+        let task = match scope {
+            Scope::Global => self.tasks_global.remove(name),
+            Scope::Workspace => self.tasks_workspace.remove(name),
+        };
+        let Some(task) = task else { return false };
+        match scope {
+            Scope::Global => {
+                self.tasks_workspace.insert(name.to_string(), task);
+            }
+            Scope::Workspace => {
+                self.tasks_global.insert(name.to_string(), task);
+            }
+        }
+        self.clamp_cursor(scope);
+        true
+    }
+
     fn enabled_count_for(&self, scope: Scope, server_idx: usize) -> (usize, usize) {
         let Some(name) = self.server_names.get(server_idx) else {
             return (0, 0);
@@ -1579,11 +1886,11 @@ enum RowAction {
     EditTask(String),
     AddTask,
     McpServerAction { server_name: String, can_auth: bool },
+    McpToolAction(usize),
 }
 
 /// Frozen snapshot of every editable buffer at TUI launch. Used to
 /// decide whether `q` should pop a confirm-quit dialog.
-#[cfg(test)]
 #[derive(Clone)]
 struct Snapshot {
     general_global: GeneralPolicy,
@@ -1617,15 +1924,14 @@ struct App {
     mcp_commands: Option<tokio::sync::mpsc::UnboundedSender<McpCatalogCommand>>,
     mode: Mode,
     list_state: ListState,
-    #[cfg(test)]
     initial: Snapshot,
+    save_both_scopes: bool,
 }
 
 impl App {
     fn new(input: TuiInput) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
-        #[cfg(test)]
         let initial = Snapshot {
             general_global: input.general_global.clone(),
             general_workspace: input.general_workspace.clone(),
@@ -1676,12 +1982,11 @@ impl App {
             mcp_commands: input.mcp_commands,
             mode: Mode::Normal,
             list_state,
-            #[cfg(test)]
             initial,
+            save_both_scopes: false,
         }
     }
 
-    #[cfg(test)]
     fn has_unsaved_changes(&self) -> bool {
         self.proxy.global != self.initial.proxy_global
             || self.general.global != self.initial.general_global
@@ -1699,11 +2004,20 @@ impl App {
             || self.mcp_claude.tasks_workspace != self.initial.tasks_workspace
     }
 
+    fn is_dirty(&self) -> bool {
+        self.has_unsaved_changes()
+    }
+
     fn toggle_scope(&mut self) {
-        self.scope = match self.scope {
+        let scope = match self.scope {
             Scope::Global => Scope::Workspace,
             Scope::Workspace => Scope::Global,
         };
+        self.set_scope(scope);
+    }
+
+    fn set_scope(&mut self, scope: Scope) {
+        self.scope = scope;
         // Keep the cursor inside the new visible-row count for whichever
         // panel happens to be active. The MCP cursor is naturally bounded
         // by visible_rows(); for the proxy panel we re-clamp here so an
@@ -1716,14 +2030,18 @@ impl App {
                 self.proxy.cursor = len.saturating_sub(1);
             }
         } else if self.tab == TopTab::HostFs {
-            let len = self.filesystem.visible_rows(self.scope).len();
-            if self.filesystem.cursor >= len {
-                self.filesystem.cursor = len.saturating_sub(1);
-            }
+            self.filesystem.clamp_cursor(self.scope);
+        } else if matches!(self.tab, TopTab::McpClaude | TopTab::McpCodex) {
+            let scope = self.scope;
+            self.active_mcp_mut().clamp_cursor(scope);
         }
     }
 
     fn sync_list_state(&mut self) {
+        if matches!(self.tab, TopTab::McpClaude | TopTab::McpCodex) {
+            let scope = self.scope;
+            self.active_mcp_mut().clamp_cursor(scope);
+        }
         let cur = match self.tab {
             TopTab::General => self.general.cursor,
             TopTab::Proxy => self.proxy.cursor,
@@ -1737,6 +2055,7 @@ impl App {
     fn into_output(self) -> TuiOutput {
         TuiOutput {
             saved_scope: self.scope,
+            save_both_scopes: self.save_both_scopes,
             general_global: self.general.global,
             general_workspace: self.general.workspace,
             claude_global: self.general.claude_global,
@@ -2021,6 +2340,28 @@ fn handle_task_input_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) 
     };
 }
 
+fn handle_mcp_filter_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    let Mode::McpFilter { mut buffer } = std::mem::replace(&mut app.mode, Mode::Normal) else {
+        return;
+    };
+
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    match code {
+        KeyCode::Esc => return,
+        KeyCode::Char('c') if ctrl => return,
+        KeyCode::Enter => {
+            let filter = buffer.value().trim().to_string();
+            let scope = app.scope;
+            app.active_mcp_mut().set_filter(filter, scope);
+            return;
+        }
+        _ => {
+            apply_editing_key(&mut buffer, code, modifiers);
+        }
+    }
+    app.mode = Mode::McpFilter { buffer };
+}
+
 fn start_task_edit(app: &mut App, name: String) {
     let definition = app
         .active_mcp()
@@ -2153,9 +2494,36 @@ fn shortcut_hints(app: &App) -> Vec<ShortcutHint> {
         },
         ShortcutHint {
             key: "Enter",
-            label: "select",
+            label: "menu / accept",
         },
     ];
+    let space_toggle = match app.tab {
+        TopTab::HostFs => matches!(
+            app.filesystem.current_row(app.scope),
+            Some(FilesystemViewRow::Section(_))
+                | Some(FilesystemViewRow::Entry(FilesystemRow {
+                    field: FilesystemField::Mount,
+                    ..
+                }))
+        ),
+        TopTab::McpClaude | TopTab::McpCodex => matches!(
+            app.active_mcp().current_row(app.scope),
+            Some(McpRow::TaskRunnerHeader | McpRow::Server(_) | McpRow::Tool(_))
+        ),
+        TopTab::General | TopTab::Proxy => false,
+    };
+    if space_toggle {
+        hints.push(ShortcutHint {
+            key: "Space",
+            label: "toggle",
+        });
+    }
+    if matches!(app.tab, TopTab::McpClaude | TopTab::McpCodex) {
+        hints.push(ShortcutHint {
+            key: "/",
+            label: "filter",
+        });
+    }
     if can_add_for_current_context(app) {
         hints.push(ShortcutHint {
             key: "a",
@@ -2277,6 +2645,29 @@ fn handle_bypass_warning_select_key(app: &mut App, code: KeyCode) {
 
 fn start_item_edit(app: &mut App, target: ItemActionTarget) {
     match target {
+        ItemActionTarget::General(row) => match row {
+            GeneralRow::DefaultAgent => {
+                app.mode = Mode::DefaultAgentSelect {
+                    cursor: default_agent_index(app.general.configured_agent(app.scope)),
+                };
+            }
+            GeneralRow::BedrockRegion => {
+                app.mode = Mode::BedrockRegionInput {
+                    buffer: TextField::from_str(
+                        app.general
+                            .configured_bedrock_region(app.scope)
+                            .unwrap_or(""),
+                    ),
+                };
+            }
+            GeneralRow::BypassWarning => {
+                app.mode = Mode::BypassWarningSelect {
+                    cursor: bypass_warning_index(
+                        app.general.configured_skip_bypass_warning(app.scope),
+                    ),
+                };
+            }
+        },
         ItemActionTarget::Proxy(row) => {
             app.mode = Mode::ProxyInput {
                 target: PatternTarget::Proxy,
@@ -2297,12 +2688,14 @@ fn start_item_edit(app: &mut App, target: ItemActionTarget) {
         ItemActionTarget::Task(name) => {
             start_task_edit(app, name);
         }
+        ItemActionTarget::McpTool(_) => {}
     }
 }
 
 fn remove_item(app: &mut App, target: ItemActionTarget) {
     let scope = app.scope;
     match target {
+        ItemActionTarget::General(_) | ItemActionTarget::McpTool(_) => {}
         ItemActionTarget::Proxy(row) => {
             app.proxy.remove_row(scope, row);
         }
@@ -2316,15 +2709,68 @@ fn remove_item(app: &mut App, target: ItemActionTarget) {
     }
 }
 
+fn item_action_choices(app: &App, target: &ItemActionTarget) -> Vec<ItemAction> {
+    match target {
+        ItemActionTarget::General(row) => {
+            if app.general.is_configured(app.scope, *row) {
+                EDIT_SCOPE_CHOICES.to_vec()
+            } else {
+                vec![ItemAction::Edit]
+            }
+        }
+        ItemActionTarget::Proxy(_) | ItemActionTarget::Filesystem(_) => {
+            EDIT_REMOVE_SCOPE_CHOICES.to_vec()
+        }
+        ItemActionTarget::Task(name) => {
+            if app.active_mcp().task_is_configured(app.scope, name) {
+                EDIT_REMOVE_SCOPE_CHOICES.to_vec()
+            } else {
+                vec![ItemAction::Edit]
+            }
+        }
+        ItemActionTarget::McpTool(index) => {
+            if app.active_mcp().tool_is_configured(app.scope, *index) {
+                TOGGLE_SCOPE_CHOICES.to_vec()
+            } else {
+                vec![ItemAction::Toggle]
+            }
+        }
+    }
+}
+
+fn change_item_scope(app: &mut App, target: &ItemActionTarget) -> bool {
+    let scope = app.scope;
+    let moved = match target {
+        ItemActionTarget::General(row) => app.general.move_setting(scope, *row),
+        ItemActionTarget::Proxy(row) => app.proxy.move_row(scope, row.clone()),
+        ItemActionTarget::Filesystem(row) => app.filesystem.move_row(scope, row.clone()),
+        ItemActionTarget::Task(name) => app.active_mcp_mut().move_task_scope(scope, name),
+        ItemActionTarget::McpTool(index) => app.active_mcp_mut().move_tool_scope(scope, *index),
+    };
+    if moved {
+        app.save_both_scopes = true;
+        let next_scope = match scope {
+            Scope::Global => Scope::Workspace,
+            Scope::Workspace => Scope::Global,
+        };
+        app.set_scope(next_scope);
+        if matches!(target, ItemActionTarget::Task(_)) {
+            app.sync_tasks_from_active();
+        }
+    }
+    moved
+}
+
 fn handle_item_action_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     let Mode::ItemAction { target, mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal)
     else {
         return;
     };
 
+    let choices = item_action_choices(app, &target);
     match code {
         KeyCode::Esc => return,
-        KeyCode::Char('d') if modifiers.is_empty() => {
+        KeyCode::Char('d') if modifiers.is_empty() && choices.contains(&ItemAction::Remove) => {
             remove_item(app, target);
             return;
         }
@@ -2332,7 +2778,7 @@ fn handle_item_action_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             cursor = cursor.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Right | KeyCode::Tab | KeyCode::Char('j')
-            if cursor + 1 < ITEM_ACTION_CHOICES.len() =>
+            if cursor + 1 < choices.len() =>
         {
             cursor += 1;
         }
@@ -2340,15 +2786,27 @@ fn handle_item_action_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             cursor = 0;
         }
         KeyCode::End => {
-            cursor = ITEM_ACTION_CHOICES.len().saturating_sub(1);
+            cursor = choices.len().saturating_sub(1);
         }
-        KeyCode::Enter => match ITEM_ACTION_CHOICES.get(cursor).copied() {
+        KeyCode::Enter => match choices.get(cursor).copied() {
             Some(ItemAction::Edit) => {
                 start_item_edit(app, target);
                 return;
             }
             Some(ItemAction::Remove) => {
                 remove_item(app, target);
+                return;
+            }
+            Some(ItemAction::ChangeScope) => {
+                change_item_scope(app, &target);
+                return;
+            }
+            Some(ItemAction::Toggle) => {
+                if let ItemActionTarget::McpTool(index) = target {
+                    let scope = app.scope;
+                    let current = app.active_mcp().effective_tool_allowed(scope, index);
+                    app.active_mcp_mut().set_tool_for(scope, index, !current);
+                }
                 return;
             }
             None => {}
@@ -2453,6 +2911,10 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             handle_task_input_key(&mut app, key.code, key.modifiers);
             continue;
         }
+        if matches!(app.mode, Mode::McpFilter { .. }) {
+            handle_mcp_filter_key(&mut app, key.code, key.modifiers);
+            continue;
+        }
         if matches!(app.mode, Mode::DefaultAgentSelect { .. }) {
             handle_default_agent_select_key(&mut app, key.code);
             continue;
@@ -2475,9 +2937,6 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
         }
         if let Mode::ConfirmQuit { mut cursor } = std::mem::replace(&mut app.mode, Mode::Normal) {
             match key.code {
-                KeyCode::Char('s') if key.modifiers.is_empty() => {
-                    break Outcome::Save(Box::new(app.into_output()));
-                }
                 KeyCode::Esc | KeyCode::Char('q') => {}
                 KeyCode::Up | KeyCode::Char('k') => {
                     cursor = cursor.saturating_sub(1);
@@ -2521,7 +2980,11 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             _ => false,
         };
         if want_quit {
-            app.mode = Mode::ConfirmQuit { cursor: 0 };
+            if app.is_dirty() {
+                app.mode = Mode::ConfirmQuit { cursor: 0 };
+            } else {
+                break Outcome::Cancel;
+            }
             continue;
         }
 
@@ -2538,6 +3001,28 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
             KeyCode::Char('d') if key.modifiers.is_empty() => {
                 remove_current_context_item(&mut app);
             }
+            KeyCode::Char('/') if key.modifiers.is_empty() => {
+                if matches!(app.tab, TopTab::McpClaude | TopTab::McpCodex) {
+                    app.mode = Mode::McpFilter {
+                        buffer: TextField::from_str(&app.active_mcp().filter),
+                    };
+                }
+            }
+            KeyCode::Char(' ') if key.modifiers.is_empty() => match app.tab {
+                TopTab::HostFs => match app.filesystem.current_row(scope) {
+                    Some(FilesystemViewRow::Section(section)) => {
+                        app.filesystem.toggle_section(section, scope);
+                    }
+                    Some(FilesystemViewRow::Entry(row)) => {
+                        app.filesystem.toggle_mount_readonly(scope, row);
+                    }
+                    Some(FilesystemViewRow::Add(_)) | None => {}
+                },
+                TopTab::McpClaude | TopTab::McpCodex => {
+                    app.active_mcp_mut().space_toggle(scope);
+                }
+                TopTab::General | TopTab::Proxy => {}
+            },
             KeyCode::Up | KeyCode::Char('k') => match app.tab {
                 TopTab::General => app.general.move_up(),
                 TopTab::Proxy => app.proxy.move_up(),
@@ -2563,28 +3048,14 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                 TopTab::McpClaude | TopTab::McpCodex => app.active_mcp_mut().jump_end(scope),
             },
             KeyCode::Enter => match app.tab {
-                TopTab::General => match app.general.current_row(scope) {
-                    Some(GeneralRow::DefaultAgent) => {
-                        app.mode = Mode::DefaultAgentSelect {
-                            cursor: default_agent_index(app.general.configured_agent(scope)),
+                TopTab::General => {
+                    if let Some(row) = app.general.current_row(scope) {
+                        app.mode = Mode::ItemAction {
+                            target: ItemActionTarget::General(row),
+                            cursor: 0,
                         };
                     }
-                    Some(GeneralRow::BedrockRegion) => {
-                        app.mode = Mode::BedrockRegionInput {
-                            buffer: TextField::from_str(
-                                app.general.configured_bedrock_region(scope).unwrap_or(""),
-                            ),
-                        };
-                    }
-                    Some(GeneralRow::BypassWarning) => {
-                        app.mode = Mode::BypassWarningSelect {
-                            cursor: bypass_warning_index(
-                                app.general.configured_skip_bypass_warning(scope),
-                            ),
-                        };
-                    }
-                    None => {}
-                },
+                }
                 TopTab::Proxy => {
                     match app.proxy.current_row(scope) {
                         Some(ProxyViewRow::Entry(row))
@@ -2606,45 +3077,57 @@ pub fn run_selection(input: TuiInput) -> Result<Outcome> {
                     }
                 }
                 TopTab::HostFs => match app.filesystem.current_row(scope) {
-                    Some(FilesystemViewRow::Entry(row)) => {
-                        if row.origin == ProxyOrigin::from_scope(scope) {
-                            app.mode = Mode::ItemAction {
-                                target: ItemActionTarget::Filesystem(row),
-                                cursor: 0,
-                            };
-                        }
+                    Some(FilesystemViewRow::Entry(row))
+                        if row.origin == ProxyOrigin::from_scope(scope) =>
+                    {
+                        app.mode = Mode::ItemAction {
+                            target: ItemActionTarget::Filesystem(row),
+                            cursor: 0,
+                        };
                     }
                     Some(FilesystemViewRow::Add(field)) => {
                         start_filesystem_add(&mut app, field);
                     }
-                    Some(FilesystemViewRow::Section(_)) | None => {}
-                },
-                TopTab::McpClaude | TopTab::McpCodex => match app.active_mcp_mut().toggle(scope) {
-                    RowAction::Handled => app.sync_tasks_from_active(),
-                    RowAction::EditTask(name) => {
-                        app.mode = Mode::ItemAction {
-                            target: ItemActionTarget::Task(name),
-                            cursor: 0,
-                        };
+                    Some(FilesystemViewRow::Section(_)) => {
+                        start_add_for_current_context(&mut app);
                     }
-                    RowAction::AddTask => start_task_add(&mut app),
-                    RowAction::McpServerAction {
-                        server_name,
-                        can_auth,
-                    } => {
-                        let agent = if app.tab == TopTab::McpCodex {
-                            McpAgent::Codex
-                        } else {
-                            McpAgent::Claude
-                        };
-                        app.mode = Mode::McpServerAction {
-                            agent,
+                    Some(FilesystemViewRow::Entry(_)) => {}
+                    None => {}
+                },
+                TopTab::McpClaude | TopTab::McpCodex => {
+                    match app.active_mcp().enter_action(scope) {
+                        RowAction::Handled => app.sync_tasks_from_active(),
+                        RowAction::EditTask(name) => {
+                            app.mode = Mode::ItemAction {
+                                target: ItemActionTarget::Task(name),
+                                cursor: 0,
+                            };
+                        }
+                        RowAction::AddTask => start_task_add(&mut app),
+                        RowAction::McpServerAction {
                             server_name,
                             can_auth,
-                            cursor: 0,
-                        };
+                        } => {
+                            let agent = if app.tab == TopTab::McpCodex {
+                                McpAgent::Codex
+                            } else {
+                                McpAgent::Claude
+                            };
+                            app.mode = Mode::McpServerAction {
+                                agent,
+                                server_name,
+                                can_auth,
+                                cursor: 0,
+                            };
+                        }
+                        RowAction::McpToolAction(index) => {
+                            app.mode = Mode::ItemAction {
+                                target: ItemActionTarget::McpTool(index),
+                                cursor: 0,
+                            };
+                        }
                     }
-                },
+                }
             },
             _ => {}
         }
@@ -2738,7 +3221,11 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App) {
     }
 
     if let Mode::ItemAction { ref target, cursor } = app.mode {
-        render_item_action_modal(f, area, target, cursor);
+        render_item_action_modal(f, area, app, target, cursor);
+    }
+
+    if let Mode::McpFilter { ref buffer } = app.mode {
+        render_mcp_filter_modal(f, area, buffer);
     }
 
     if let Mode::McpServerAction {
@@ -2905,8 +3392,10 @@ fn render_filesystem(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         .map(|row| match row {
             FilesystemViewRow::Section(section) => {
                 let title = match section {
-                    FilesystemSection::Path => "▾ Path",
-                    FilesystemSection::Filter => "▾ Filter",
+                    FilesystemSection::Path if app.filesystem.path_expanded => "▾ Path",
+                    FilesystemSection::Path => "▸ Path",
+                    FilesystemSection::Filter if app.filesystem.filter_expanded => "▾ Filter",
+                    FilesystemSection::Filter => "▸ Filter",
                 };
                 ListItem::new(Line::from(Span::styled(title, heading())))
             }
@@ -2953,7 +3442,14 @@ fn render_mcp(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 } else {
                     "▸"
                 };
-                let count = visible_tasks.len();
+                let count = if app.active_mcp().filter.is_empty() {
+                    visible_tasks.len()
+                } else {
+                    visible_tasks
+                        .iter()
+                        .filter(|(name, task)| app.active_mcp().task_matches(name, task))
+                        .count()
+                };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{marker} task-runner"), heading()),
                     Span::styled(
@@ -3115,11 +3611,24 @@ fn render_footer(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             let enabled = (0..total)
                 .filter(|i| mcp.effective_tool_allowed(app.scope, *i))
                 .count();
-            let task_count = mcp.effective_tasks(app.scope).len();
+            let tasks = mcp.effective_tasks(app.scope);
+            let task_count = if mcp.filter.is_empty() {
+                tasks.len()
+            } else {
+                tasks
+                    .iter()
+                    .filter(|(name, task)| mcp.task_matches(name, task))
+                    .count()
+            };
+            let filter_suffix = if mcp.filter.is_empty() {
+                String::new()
+            } else {
+                format!(" · filter: {}", mcp.filter)
+            };
             Line::from(vec![Span::styled(
                 format!(
-                    "{task_count} task(s) · {enabled}/{total} tool(s) enabled across {} server(s)",
-                    mcp.server_names.len()
+                    "{task_count} task(s) · {enabled}/{total} tool(s) enabled across {} server(s){filter_suffix}",
+                    mcp.server_names.len(),
                 ),
                 muted(),
             )])
@@ -3158,7 +3667,7 @@ fn render_proxy_input_modal(
     f.render_widget(block, area);
 
     let hint = Line::from(vec![Span::styled(
-        "POSIX extended regex. Enter commit · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
+        "POSIX extended regex. Enter accept · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
         muted(),
     )]);
     let body = Line::from(vec![Span::raw("> "), Span::raw(buffer.value())]);
@@ -3279,7 +3788,7 @@ fn render_confirm_quit_modal(f: &mut ratatui::Frame<'_>, parent: Rect, cursor: u
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "↑/↓ j/k move · Enter select · Esc cancel",
+        "↑/↓ j/k move · Enter accept · Esc cancel",
         muted(),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -3317,7 +3826,7 @@ fn render_default_agent_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, c
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "↑/↓ j/k move · Enter select · Esc cancel",
+        "↑/↓ j/k move · Enter accept · Esc cancel",
         muted(),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -3345,7 +3854,7 @@ fn render_bedrock_region_input_modal(f: &mut ratatui::Frame<'_>, parent: Rect, b
     )]);
     let body = Line::from(vec![Span::raw("> "), Span::raw(buffer.value())]);
     let help = Line::from(Span::styled(
-        "Enter commit · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
+        "Enter accept · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
         muted(),
     ));
     let para = Paragraph::new(vec![hint, Line::from(""), body, help]);
@@ -3393,7 +3902,7 @@ fn render_bypass_warning_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, 
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "↑/↓ j/k move · Enter select · Esc cancel",
+        "↑/↓ j/k move · Enter accept · Esc cancel",
         muted(),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -3401,6 +3910,7 @@ fn render_bypass_warning_select_modal(f: &mut ratatui::Frame<'_>, parent: Rect, 
 
 fn item_action_title(target: &ItemActionTarget) -> &'static str {
     match target {
+        ItemActionTarget::General(_) => " Setting ",
         ItemActionTarget::Proxy(_) => " Proxy allow pattern ",
         ItemActionTarget::Filesystem(row) => match row.field {
             FilesystemField::Mount => " Filesystem path ",
@@ -3408,25 +3918,37 @@ fn item_action_title(target: &ItemActionTarget) -> &'static str {
             FilesystemField::Readonly => " Readonly filter ",
         },
         ItemActionTarget::Task(_) => " Task runner command ",
+        ItemActionTarget::McpTool(_) => " MCP tool ",
     }
 }
 
-fn item_action_value(target: &ItemActionTarget) -> String {
+fn item_action_value(app: &App, target: &ItemActionTarget) -> String {
     match target {
+        ItemActionTarget::General(row) => match row {
+            GeneralRow::DefaultAgent => "Default agent".to_string(),
+            GeneralRow::BedrockRegion => "Bedrock region".to_string(),
+            GeneralRow::BypassWarning => "Bypass permissions warning".to_string(),
+        },
         ItemActionTarget::Proxy(row) => row.pattern.clone(),
         ItemActionTarget::Filesystem(row) => row.value.clone(),
         ItemActionTarget::Task(name) => name.clone(),
+        ItemActionTarget::McpTool(index) => {
+            let entry = &app.active_mcp().catalog[*index];
+            format!("{}::{}", entry.server_name, entry.tool_name)
+        }
     }
 }
 
 fn render_item_action_modal(
     f: &mut ratatui::Frame<'_>,
     parent: Rect,
+    app: &App,
     target: &ItemActionTarget,
     cursor: usize,
 ) {
     let w = parent.width.clamp(40, 56);
-    let h: u16 = 8;
+    let choices = item_action_choices(app, target);
+    let h: u16 = 6 + choices.len() as u16;
     let x = parent.x + (parent.width.saturating_sub(w)) / 2;
     let y = parent.y + (parent.height.saturating_sub(h)) / 2;
     let area = Rect::new(x, y, w, h);
@@ -3441,15 +3963,27 @@ fn render_item_action_modal(
     f.render_widget(block, area);
 
     let mut lines = vec![
-        Line::from(Span::styled(item_action_value(target), plain())),
+        Line::from(Span::styled(item_action_value(app, target), plain())),
         Line::from(""),
     ];
-    for (idx, action) in ITEM_ACTION_CHOICES.iter().copied().enumerate() {
+    for (idx, action) in choices.iter().copied().enumerate() {
         let selected = idx == cursor;
         let marker = if selected { ">" } else { " " };
-        let (label, style) = match action {
-            ItemAction::Edit => ("Edit", plain()),
-            ItemAction::Remove => ("Remove", danger()),
+        let label = match action {
+            ItemAction::Edit => "Edit".to_string(),
+            ItemAction::Remove => "Remove".to_string(),
+            ItemAction::ChangeScope => {
+                let destination = match app.scope {
+                    Scope::Global => "Workspace",
+                    Scope::Workspace => "Global",
+                };
+                format!("Move to {destination}")
+            }
+            ItemAction::Toggle => "Toggle enabled".to_string(),
+        };
+        let style = match action {
+            ItemAction::Remove => danger(),
+            ItemAction::Edit | ItemAction::ChangeScope | ItemAction::Toggle => plain(),
         };
         let style = if selected {
             style.add_modifier(Modifier::BOLD)
@@ -3464,10 +3998,38 @@ fn render_item_action_modal(
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "↑/↓ j/k move · Enter select · Esc cancel",
+        "↑/↓ j/k move · Enter accept · Esc cancel",
         muted(),
     )));
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_mcp_filter_modal(f: &mut ratatui::Frame<'_>, parent: Rect, buffer: &TextField) {
+    let w = parent.width.clamp(42, 72);
+    let h: u16 = 5;
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    let y = parent.y + (parent.height.saturating_sub(h)) / 2;
+    let area = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Filter MCP tools ")
+        .border_style(muted())
+        .title_style(heading());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let hint = Line::from(Span::styled(
+        "Matches server names, task names, tool names, and descriptions.",
+        muted(),
+    ));
+    let body = Line::from(vec![Span::raw("/ "), Span::raw(buffer.value())]);
+    let help = Line::from(Span::styled("Enter accept · Esc cancel", muted()));
+    f.render_widget(Paragraph::new(vec![hint, body, help]), inner);
+    f.set_cursor_position(Position::new(
+        inner.x + 2 + buffer.prefix_width(),
+        inner.y + 1,
+    ));
 }
 
 fn render_mcp_server_action_modal(
@@ -3513,7 +4075,7 @@ fn render_mcp_server_action_modal(
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "↑/↓ j/k move · Enter select · Esc cancel",
+        "↑/↓ j/k move · Enter accept · Esc cancel",
         muted(),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -3562,7 +4124,7 @@ fn render_task_input_modal(
         .split(inner);
 
     let hint = Line::from(vec![Span::styled(
-        "Tab/↑↓ switch · Space toggle · Enter commit · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
+        "Tab/↑↓ switch · Space toggle · Enter accept · Esc cancel · readline keys (^A/^E/^W/M-b/M-f…)",
         muted(),
     )]);
     let name_line = Line::from(vec![
@@ -3911,6 +4473,69 @@ mod tests {
     }
 
     #[test]
+    fn mcp_space_toggles_tree_expansion() {
+        let mut state = make_state(
+            vec![entry("server", "tool", Some(true))],
+            McpPolicy::default(),
+            McpPolicy::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        state.cursor = 0;
+        state.space_toggle(Scope::Global);
+        assert!(state.task_runner_expanded);
+
+        state.cursor = 2;
+        state.space_toggle(Scope::Global);
+        assert!(state.expanded[0]);
+    }
+
+    #[test]
+    fn mcp_filter_keeps_matching_tools_under_their_server() {
+        let mut catalog = vec![
+            entry("github", "list_issues", Some(true)),
+            entry("mail", "send", Some(false)),
+        ];
+        catalog[0].description = "Fetch issue details".into();
+        catalog[1].description = "Send an email".into();
+        let mut state = make_state(
+            catalog,
+            McpPolicy::default(),
+            McpPolicy::default(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        state.expanded = vec![true, true];
+        state.set_filter("issue".into(), Scope::Global);
+
+        assert!(matches!(
+            state.visible_rows(Scope::Global).as_slice(),
+            [McpRow::Server(0), McpRow::Tool(0)]
+        ));
+    }
+
+    #[test]
+    fn mcp_filter_keeps_matching_task_without_add_hint() {
+        let mut tasks = BTreeMap::new();
+        tasks.insert("build".into(), task_definition("cargo build"));
+        tasks.insert("lint".into(), task_definition("cargo clippy"));
+        let mut state = make_state(
+            vec![],
+            McpPolicy::default(),
+            McpPolicy::default(),
+            tasks,
+            BTreeMap::new(),
+        );
+        state.task_runner_expanded = true;
+        state.set_filter("clippy".into(), Scope::Global);
+
+        assert!(matches!(
+            state.visible_rows(Scope::Global).as_slice(),
+            [McpRow::TaskRunnerHeader, McpRow::TaskRow(name)] if name == "lint"
+        ));
+    }
+
+    #[test]
     fn effective_tool_allowed_workspace_override_wins() {
         // Global says enabled; workspace explicitly turns it off.
         let mut g = McpPolicy::default();
@@ -3985,6 +4610,43 @@ mod tests {
                 .command,
             "workspace",
         );
+    }
+
+    #[test]
+    fn filesystem_space_toggles_tree_sections() {
+        let mut state = FilesystemState::new(
+            FilesystemPolicy {
+                mounts: vec![FilesystemMount::new("/tmp/shared".into(), false)],
+                ..Default::default()
+            },
+            FilesystemPolicy::default(),
+        );
+        assert!(matches!(
+            state.current_row(Scope::Global),
+            Some(FilesystemViewRow::Section(FilesystemSection::Path))
+        ));
+        state.toggle_section(FilesystemSection::Path, Scope::Global);
+        assert!(matches!(
+            state.current_row(Scope::Global),
+            Some(FilesystemViewRow::Section(FilesystemSection::Path))
+        ));
+        assert!(matches!(
+            state.visible_rows(Scope::Global).as_slice(),
+            [
+                FilesystemViewRow::Section(FilesystemSection::Path),
+                FilesystemViewRow::Section(FilesystemSection::Filter),
+                FilesystemViewRow::Add(FilesystemField::Hide),
+                FilesystemViewRow::Add(FilesystemField::Readonly),
+            ]
+        ));
+
+        state.path_expanded = true;
+        state.cursor = 1;
+        let Some(FilesystemViewRow::Entry(row)) = state.current_row(Scope::Global) else {
+            panic!("expected mount row");
+        };
+        assert!(state.toggle_mount_readonly(Scope::Global, row));
+        assert!(state.global.mounts[0].readonly);
     }
 
     fn fresh_input() -> TuiInput {
@@ -4452,13 +5114,49 @@ mod tests {
         };
         app.mode = Mode::ItemAction {
             target: ItemActionTarget::Filesystem(row),
-            cursor: 1,
+            cursor: 2,
         };
 
         handle_item_action_key(&mut app, KeyCode::Enter, KeyModifiers::empty());
 
         assert!(app.filesystem.workspace.hide.is_empty());
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn task_change_scope_moves_definition_and_marks_both_layers_for_save() {
+        let mut app = App::new(fresh_input());
+        app.tab = TopTab::McpClaude;
+        app.scope = Scope::Workspace;
+        app.mcp_claude
+            .tasks_workspace
+            .insert("review".into(), task_definition("review-tool"));
+        let target = ItemActionTarget::Task("review".into());
+
+        assert!(change_item_scope(&mut app, &target));
+        assert!(app.mcp_claude.tasks_workspace.is_empty());
+        assert_eq!(
+            app.mcp_claude
+                .tasks_global
+                .get("review")
+                .map(|task| task.command.as_str()),
+            Some("review-tool")
+        );
+        assert_eq!(app.scope, Scope::Global);
+        assert!(app.save_both_scopes);
+    }
+
+    #[test]
+    fn inherited_task_menu_only_offers_edit() {
+        let mut app = App::new(fresh_input());
+        app.tab = TopTab::McpClaude;
+        app.scope = Scope::Workspace;
+        app.mcp_claude
+            .tasks_global
+            .insert("review".into(), task_definition("review-tool"));
+
+        let choices = item_action_choices(&app, &ItemActionTarget::Task("review".into()));
+        assert_eq!(choices, vec![ItemAction::Edit]);
     }
 
     #[test]

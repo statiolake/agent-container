@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -131,61 +132,15 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
     match tui::run_selection(input)? {
         Outcome::Save(out) => {
             let out = *out;
-            let saved_scope = out.saved_scope;
-            let claude_catalog = out.claude_tool_catalog.clone();
-            let codex_catalog = out.codex_tool_catalog.clone();
-            // Base for MCP/task minimisation is the *other* scope. For
-            // Global there is no lower layer, so base falls back to the
-            // policy default.
-            let (base_mcp, base_tasks) = match saved_scope {
-                Scope::Workspace => (
-                    global_settings.claude_code.mcp.clone(),
-                    global_settings.task_runner.tasks.clone(),
-                ),
-                Scope::Global => (McpPolicy::default(), BTreeMap::new()),
+            let scopes = if out.save_both_scopes {
+                vec![Scope::Global, Scope::Workspace]
+            } else {
+                vec![out.saved_scope]
             };
-            // Load the target scope fresh (not merged) so untouched sections
-            // of its settings.toml survive this save verbatim.
-            let mut target = Settings::load_scope(saved_scope, &host.workspace)
-                .context("failed to reload target-scope settings for save")?;
-            target.proxy.allow = match saved_scope {
-                Scope::Global => out.proxy_allow_global,
-                Scope::Workspace => out.proxy_allow_workspace,
-            };
-            target.general = match saved_scope {
-                Scope::Global => out.general_global,
-                Scope::Workspace => out.general_workspace,
-            };
-            target.claude = match saved_scope {
-                Scope::Global => out.claude_global,
-                Scope::Workspace => out.claude_workspace,
-            };
-            target.filesystem = match saved_scope {
-                Scope::Global => out.filesystem_global,
-                Scope::Workspace => out.filesystem_workspace,
-            };
-            target.claude_code.mcp = match saved_scope {
-                Scope::Global => out.mcp_global,
-                Scope::Workspace => out.mcp_workspace,
-            };
-            minimise_policy_against_base(&mut target.claude_code.mcp, &base_mcp, &claude_catalog);
-            let base_codex_mcp = match saved_scope {
-                Scope::Workspace => global_settings.codex.mcp.clone(),
-                Scope::Global => McpPolicy::default(),
-            };
-            target.codex.mcp = match saved_scope {
-                Scope::Global => out.codex_mcp_global,
-                Scope::Workspace => out.codex_mcp_workspace,
-            };
-            minimise_policy_against_base(&mut target.codex.mcp, &base_codex_mcp, &codex_catalog);
-            let edited_tasks = match saved_scope {
-                Scope::Global => out.tasks_global,
-                Scope::Workspace => out.tasks_workspace,
-            };
-            target.task_runner.tasks = minimise_tasks_against_base(edited_tasks, &base_tasks);
-            let path = settings::path(saved_scope, &host.workspace)?;
-            target.save_to(&path).context("failed to save settings")?;
-            println!("Saved to {} ({:?} scope)", path.display(), saved_scope);
+            for scope in scopes {
+                let path = save_tui_scope(&out, scope, &host, &global_settings)?;
+                println!("Saved to {} ({:?} scope)", path.display(), scope);
+            }
             println!("Re-run `agent-container run` to pick up changes.");
         }
         Outcome::Cancel => {
@@ -194,6 +149,80 @@ pub async fn run_editor(initial_scope: Scope) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Save one layer of the TUI output while preserving unrelated settings in
+/// that layer. When a scope move happened, the workspace layer must be
+/// minimised against the final Global buffers from the same TUI session;
+/// otherwise a promoted task or MCP override could be immediately written
+/// back as a redundant workspace entry.
+fn save_tui_scope(
+    out: &tui::TuiOutput,
+    scope: Scope,
+    host: &HostPaths,
+    global_settings: &Settings,
+) -> Result<PathBuf> {
+    let default_mcp = McpPolicy::default();
+    let default_tasks = BTreeMap::new();
+    let (base_mcp, base_codex_mcp, base_tasks) = match scope {
+        Scope::Global => (&default_mcp, &default_mcp, &default_tasks),
+        Scope::Workspace if out.save_both_scopes => {
+            (&out.mcp_global, &out.codex_mcp_global, &out.tasks_global)
+        }
+        Scope::Workspace => (
+            &global_settings.claude_code.mcp,
+            &global_settings.codex.mcp,
+            &global_settings.task_runner.tasks,
+        ),
+    };
+
+    // Load the target scope fresh (not merged) so untouched sections of its
+    // settings.toml survive this save verbatim.
+    let mut target = Settings::load_scope(scope, &host.workspace)
+        .context("failed to reload target-scope settings for save")?;
+    target.proxy.allow = match scope {
+        Scope::Global => out.proxy_allow_global.clone(),
+        Scope::Workspace => out.proxy_allow_workspace.clone(),
+    };
+    target.general = match scope {
+        Scope::Global => out.general_global.clone(),
+        Scope::Workspace => out.general_workspace.clone(),
+    };
+    target.claude = match scope {
+        Scope::Global => out.claude_global.clone(),
+        Scope::Workspace => out.claude_workspace.clone(),
+    };
+    target.filesystem = match scope {
+        Scope::Global => out.filesystem_global.clone(),
+        Scope::Workspace => out.filesystem_workspace.clone(),
+    };
+    target.claude_code.mcp = match scope {
+        Scope::Global => out.mcp_global.clone(),
+        Scope::Workspace => out.mcp_workspace.clone(),
+    };
+    minimise_policy_against_base(
+        &mut target.claude_code.mcp,
+        base_mcp,
+        &out.claude_tool_catalog,
+    );
+    target.codex.mcp = match scope {
+        Scope::Global => out.codex_mcp_global.clone(),
+        Scope::Workspace => out.codex_mcp_workspace.clone(),
+    };
+    minimise_policy_against_base(
+        &mut target.codex.mcp,
+        base_codex_mcp,
+        &out.codex_tool_catalog,
+    );
+    let edited_tasks = match scope {
+        Scope::Global => out.tasks_global.clone(),
+        Scope::Workspace => out.tasks_workspace.clone(),
+    };
+    target.task_runner.tasks = minimise_tasks_against_base(edited_tasks, base_tasks);
+
+    let path = settings::path(scope, &host.workspace)?;
+    target.save_to(&path).context("failed to save settings")?;
+    Ok(path)
 }
 
 /// `config show` — print the settings TOML for the requested scope (or
