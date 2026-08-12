@@ -10,7 +10,8 @@
 //!   container only sees its own workspace. The container uses the same
 //!   absolute workspace path as the host so Claude Code resume keys stay
 //!   stable across native and containerised runs.
-//! - `~/.claude/settings.json` — user-level settings, copied as-is.
+//! - `~/.claude/settings.json` — user-level settings with host-bound values
+//!   filtered; hook definitions are preserved.
 //! - `~/.claude/skills/`, `~/.claude/commands/`, `~/.claude/agents/` — user-
 //!   authored extensions (custom skills, slash commands, subagents).
 //! - Plugin-provided `skills/` and `commands/` are flattened into the same
@@ -18,8 +19,12 @@
 //!   itself is not copied, because Claude Code treats that tree as managed
 //!   marketplace state and may try to refresh it over the network.
 //!
-//! Not copied: user-level hooks, the raw MCP configuration, other projects,
-//! or anything under `~/.claude/` not listed above.
+//! Hooks are copied as configured. A hook that invokes a host-only command may
+//! fail inside the container, but preserving the configuration lets hooks
+//! that are container-compatible continue to run.
+//!
+//! Not copied: the raw MCP configuration, other projects, or anything under
+//! `~/.claude/` not listed above.
 
 use std::fs;
 use std::path::Path;
@@ -37,7 +42,6 @@ use crate::paths::HostPaths;
 /// container, or would be bypassed regardless:
 /// - `mcpServers` + friends: handled separately by the container's proxy path.
 /// - `env`: exports can reference host tool paths that don't exist here.
-/// - `hooks`: shell commands that typically shell out to host binaries.
 /// - `permissions`: we run Claude Code in bypass-permissions mode anyway.
 /// - `sandbox`: Claude Code's in-process sandbox is redundant (and noisy)
 ///   inside the container. The top-level settings.json gets an explicit
@@ -52,7 +56,6 @@ const COMMON_STRIP: &[&str] = &[
     "enabledMcpServers",
     "disabledMcpServers",
     "env",
-    "hooks",
     "permissions",
     "sandbox",
 ];
@@ -607,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn filtering_drops_mcp_and_preserves_workspace_path() {
+    fn filtering_drops_host_bound_config_and_preserves_hooks() {
         let tmp_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
         let workspace = tmp_home.path().join("work/repo");
@@ -663,9 +666,10 @@ mod tests {
             &fs::read_to_string(container_home.path().join(".claude.json")).unwrap(),
         )
         .unwrap();
-        for key in ["mcpServers", "hooks", "permissions", "sandbox"] {
+        for key in ["mcpServers", "permissions", "sandbox"] {
             assert!(out.get(key).is_none(), "top-level {key} must be removed");
         }
+        assert_eq!(out["hooks"], serde_json::json!({"PreToolUse": ["echo hi"]}));
         let env = out["env"].as_object().expect("agent env injected");
         assert_eq!(
             env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"].as_str(),
@@ -679,12 +683,16 @@ mod tests {
         let projects = out["projects"].as_object().unwrap();
         assert_eq!(projects.len(), 1, "only current workspace survives");
         let entry = &projects[&host.container_workspace().display().to_string()];
-        for key in ["mcpServers", "env", "hooks", "permissions", "sandbox"] {
+        for key in ["mcpServers", "env", "permissions", "sandbox"] {
             assert!(
                 entry.get(key).is_none(),
                 "per-project {key} must be removed"
             );
         }
+        assert_eq!(
+            entry["hooks"],
+            serde_json::json!({"SessionStart": ["tool"]})
+        );
         assert_eq!(entry["allowedTools"], serde_json::json!(["bash"]));
         assert_eq!(entry["lastCost"], serde_json::json!(1.23));
         assert!(out.get("awsAuthRefresh").is_none());
@@ -894,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_json_is_filtered() {
+    fn settings_json_filters_host_bound_values_but_preserves_hooks() {
         let tmp_home = tempfile::tempdir().unwrap();
         let container_home = tempfile::tempdir().unwrap();
         let workspace = tmp_home.path().join("work");
@@ -938,9 +946,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["theme"], serde_json::json!("dark"));
-        for key in ["hooks", "permissions", "mcpServers"] {
+        for key in ["permissions", "mcpServers"] {
             assert!(out.get(key).is_none(), "{key} should be stripped");
         }
+        assert_eq!(out["hooks"], serde_json::json!({"PreToolUse": ["echo"]}));
         let env = out["env"].as_object().expect("agent env injected");
         assert_eq!(
             env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"].as_str(),

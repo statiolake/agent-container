@@ -284,10 +284,12 @@ host history/auth paths into the container's ephemeral `$HOME`:
 - `~/.claude.json` — top-level preferences and the current workspace's
   project entry. Top-level and current-project `mcpServers` are collected
   and rewritten through the agent-container broker; raw `mcpServers` /
-  `env` / `hooks` / `permissions` / `sandbox` values are stripped from the
-  staged copy. Every other project entry is dropped because their keys are
-  host-absolute paths.
-- `~/.claude/settings.json` — same stripping.
+  `env` / `permissions` / `sandbox` values are stripped from the staged
+  copy, while hook definitions are preserved. Every other project entry is
+  dropped because their keys are host-absolute paths.
+- `~/.claude/settings.json` — host-bound values are stripped, but hook
+  definitions are preserved. Hooks that call host-only commands may fail
+  inside the container; hooks using tools available in the image still run.
 - `~/.claude/commands/`, `~/.claude/agents/`, `~/.claude/skills/` —
   user-authored slash commands, subagents and skills are mirrored.
 - Plugin-provided `commands/` and `skills/` are flattened into those same

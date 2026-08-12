@@ -1160,7 +1160,7 @@ mod tests {
         std::fs::write(workspace.join("private/token.txt"), "secret").unwrap();
         std::fs::write(
             workspace.join(".claude/settings.json"),
-            r#"{"mcpServers":{"local":{"command":"/opt/host/bin/server"}},"theme":"dark"}"#,
+            r#"{"mcpServers":{"local":{"command":"/opt/host/bin/server"}},"hooks":{"SessionStart":["echo ready"]},"theme":"dark"}"#,
         )
         .unwrap();
         std::fs::write(workspace.join("README.md"), "ok").unwrap();
@@ -1230,6 +1230,7 @@ mod tests {
             .unwrap();
         let settings = std::fs::read_to_string(&settings_mount.source).unwrap();
         assert!(!settings.contains("mcpServers"));
+        assert!(settings.contains("SessionStart"));
         assert!(settings.contains("theme"));
     }
 
