@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 
 const ARGUMENTS_HEADER = "x-agent-container-task-arguments";
+const REQUEST_ID_HEADER = "x-agent-container-task-request-id";
 const STREAM_CONTENT_TYPE =
   "application/x-agent-container-task-runner-stream; version=1";
 
@@ -89,19 +91,29 @@ function openRequest(target, method, headers = {}) {
   return http.request(options);
 }
 
-function openTaskRequest(target, encodedArguments) {
+function openTaskRequest(target, encodedArguments, requestId) {
   return openRequest(target, "POST", {
     [ARGUMENTS_HEADER]: encodedArguments,
+    [REQUEST_ID_HEADER]: requestId,
     "Content-Type": "application/octet-stream",
     "Transfer-Encoding": "chunked",
     Accept: STREAM_CONTENT_TYPE,
   });
 }
 
-function fetchTaskInfo(target) {
+function describeRequestError(error) {
+  const message = error?.message || String(error);
+  const details = [error?.code, error?.syscall]
+    .filter(Boolean)
+    .join(", ");
+  return details ? `${message} (${details})` : message;
+}
+
+function fetchTaskInfo(target, requestId) {
   return new Promise((resolve, reject) => {
     const request = openRequest(target, "GET", {
       Accept: "application/json",
+      [REQUEST_ID_HEADER]: requestId,
     });
     let body = "";
     request.on("response", (response) => {
@@ -140,7 +152,34 @@ function fetchTaskInfo(target) {
   });
 }
 
-function handleStreamResponse(response) {
+function handleStreamResponse(response, requestId) {
+  let responseEnded = false;
+  let responseFailureReported = false;
+
+  const reportResponseFailure = (message) => {
+    if (responseEnded || responseFailureReported) {
+      return;
+    }
+    responseFailureReported = true;
+    fail(message, 1);
+  };
+
+  response.on("aborted", () => {
+    reportResponseFailure(
+      `broker stream response aborted (request_id=${requestId})`,
+    );
+  });
+  response.on("error", (error) => {
+    reportResponseFailure(
+      `broker stream response error (request_id=${requestId}): ${describeRequestError(error)}`,
+    );
+  });
+  response.on("close", () => {
+    reportResponseFailure(
+      `broker stream response closed before end (request_id=${requestId})`,
+    );
+  });
+
   if (response.statusCode !== 200) {
     let body = "";
     response.setEncoding("utf8");
@@ -148,11 +187,13 @@ function handleStreamResponse(response) {
       body += chunk;
     });
     response.on("end", () => {
+      responseEnded = true;
       fail(
         "broker rejected the task (" +
           response.statusCode +
           "): " +
-          body.trim(),
+          body.trim() +
+          ` (request_id=${requestId})`,
         1,
       );
     });
@@ -161,7 +202,10 @@ function handleStreamResponse(response) {
 
   const contentType = response.headers["content-type"] || "";
   if (!contentType.startsWith(STREAM_CONTENT_TYPE)) {
-    fail("broker returned an unexpected content type: " + contentType, 1);
+    fail(
+      `broker returned an unexpected content type: ${contentType} (request_id=${requestId})`,
+      1,
+    );
     response.resume();
     return;
   }
@@ -190,6 +234,8 @@ function handleStreamResponse(response) {
         response.pause();
         destination.once("drain", () => response.resume());
       }
+    } else if (frame.type === "keepalive") {
+      // Keep the HTTP stream active through idle-timeout proxies.
     } else if (frame.type === "error") {
       process.stderr.write(
         "task-runner: " + (frame.message || "task failed") + "\n",
@@ -209,13 +255,15 @@ function handleStreamResponse(response) {
     }
   });
   response.on("end", () => {
+    responseEnded = true;
     if (pending.trim()) {
       consumeLine(pending);
     }
     if (!exitFrame) {
       fail(
-        responseError ||
-          "broker closed the task stream without an exit frame",
+        responseError
+          ? `${responseError} (request_id=${requestId})`
+          : `broker closed the task stream without an exit frame (request_id=${requestId})`,
         1,
       );
       return;
@@ -249,19 +297,28 @@ async function run(parsed) {
       const encodedArguments = Buffer.from(
         JSON.stringify(parsed.arguments),
       ).toString("base64url");
+      const requestId = randomUUID();
 
       let taskInfo;
       try {
-        taskInfo = await fetchTaskInfo(target);
+        taskInfo = await fetchTaskInfo(target, requestId);
       } catch (error) {
-        fail("broker request failed: " + error.message, 1);
+        fail(
+          `broker metadata GET failed (request_id=${requestId}): ${describeRequestError(error)}`,
+          1,
+        );
         return;
       }
 
-      const request = openTaskRequest(target, encodedArguments);
-      request.on("response", handleStreamResponse);
+      const request = openTaskRequest(target, encodedArguments, requestId);
+      request.on("response", (response) =>
+        handleStreamResponse(response, requestId),
+      );
       request.on("error", (error) => {
-        fail("broker request failed: " + error.message, 1);
+        fail(
+          `broker stream POST failed (request_id=${requestId}): ${describeRequestError(error)}`,
+          1,
+        );
       });
 
       if (!taskInfo.allow_stdin || process.stdin.isTTY) {

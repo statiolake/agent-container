@@ -927,6 +927,7 @@ mod tests {
         let mut stdin = process.stdin.take().unwrap();
         stdin.write_all(b"streamed input\n").await.unwrap();
         stdin.shutdown().await.unwrap();
+        drop(stdin);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         process.stdout.read_to_end(&mut stdout).await.unwrap();

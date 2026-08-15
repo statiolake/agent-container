@@ -46,9 +46,11 @@ use crate::stdio_mcp::{self, PathBridge, StdioHandle};
 use crate::task_runner::{self, TaskRunner};
 
 const TASK_RUNNER_ARGUMENTS_HEADER: &str = "x-agent-container-task-arguments";
+const TASK_RUNNER_REQUEST_ID_HEADER: &str = "x-agent-container-task-request-id";
 const TASK_RUNNER_STREAM_CONTENT_TYPE: &str =
     "application/x-agent-container-task-runner-stream; version=1";
 const MAX_TASK_RUNNER_ARGUMENTS: usize = 64 * 1024;
+const TASK_RUNNER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 enum McpBackend {
     Http(HttpMcpServer),
@@ -289,9 +291,31 @@ async fn handle_task_runner_cli(
     State(state): State<Arc<BrokerState>>,
     req: Request,
 ) -> Response {
+    let request_id = task_runner_request_id(req.headers());
+    tracing::info!(
+        task = %name,
+        request_id = %request_id,
+        method = %req.method(),
+        transfer_encoding = req
+            .headers()
+            .get(axum::http::header::TRANSFER_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-"),
+        content_length = req
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-"),
+        "task-runner CLI request received",
+    );
     let runner = match state.mcp.read().await.get(task_runner::NAME) {
         Some(McpBackend::TaskRunner(r)) => r.clone(),
         _ => {
+            tracing::warn!(
+                task = %name,
+                request_id = %request_id,
+                "task-runner CLI request rejected: backend disabled",
+            );
             return (
                 StatusCode::NOT_FOUND,
                 "task-runner is not enabled for this agent",
@@ -300,12 +324,23 @@ async fn handle_task_runner_cli(
         }
     };
     if !runner.tasks.contains_key(&name) {
+        tracing::warn!(
+            task = %name,
+            request_id = %request_id,
+            "task-runner CLI request rejected: unknown task",
+        );
         return (StatusCode::NOT_FOUND, format!("unknown task '{name}'")).into_response();
     }
 
     let arguments = match decode_task_runner_cli_arguments(req.headers()) {
         Ok(arguments) => arguments,
         Err(e) => {
+            tracing::warn!(
+                task = %name,
+                request_id = %request_id,
+                error = %e,
+                "task-runner CLI request rejected: invalid arguments",
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 format!("invalid task arguments: {e:#}"),
@@ -317,6 +352,12 @@ async fn handle_task_runner_cli(
     let process = match runner.spawn_streaming_cli(&name, &arguments).await {
         Ok(process) => process,
         Err(e) => {
+            tracing::error!(
+                task = %name,
+                request_id = %request_id,
+                error = %e,
+                "task-runner CLI failed to spawn task",
+            );
             return (
                 StatusCode::BAD_REQUEST,
                 format!("cannot start task '{name}': {e:#}"),
@@ -325,7 +366,7 @@ async fn handle_task_runner_cli(
         }
     };
 
-    let stream = stream_task_runner_process(process, body);
+    let stream = stream_task_runner_process(process, body, name, request_id);
     Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -341,10 +382,17 @@ async fn handle_task_runner_cli(
 async fn handle_task_runner_cli_info(
     AxumPath(name): AxumPath<String>,
     State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
 ) -> Response {
+    let request_id = task_runner_request_id(&headers);
     let runner = match state.mcp.read().await.get(task_runner::NAME) {
         Some(McpBackend::TaskRunner(r)) => r.clone(),
         _ => {
+            tracing::warn!(
+                task = %name,
+                request_id = %request_id,
+                "task-runner CLI metadata rejected: backend disabled",
+            );
             return (
                 StatusCode::NOT_FOUND,
                 "task-runner is not enabled for this agent",
@@ -353,14 +401,35 @@ async fn handle_task_runner_cli_info(
         }
     };
     let Some(task) = runner.tasks.get(&name) else {
+        tracing::warn!(
+            task = %name,
+            request_id = %request_id,
+            "task-runner CLI metadata rejected: unknown task",
+        );
         return (StatusCode::NOT_FOUND, format!("unknown task '{name}'")).into_response();
     };
+
+    tracing::info!(
+        task = %name,
+        request_id = %request_id,
+        allow_stdin = task.allow_stdin,
+        "task-runner CLI metadata returned",
+    );
 
     (
         StatusCode::OK,
         axum::Json(json!({ "allow_stdin": task.allow_stdin })),
     )
         .into_response()
+}
+
+fn task_runner_request_id(headers: &HeaderMap) -> String {
+    headers
+        .get(TASK_RUNNER_REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-")
+        .to_string()
 }
 
 fn decode_task_runner_cli_arguments(headers: &HeaderMap) -> Result<Vec<String>> {
@@ -423,10 +492,12 @@ type TaskRunnerHttpStream = ReceiverStream<std::result::Result<Bytes, Infallible
 fn stream_task_runner_process(
     process: task_runner::StreamingTask,
     body: Body,
+    task_name: String,
+    request_id: String,
 ) -> TaskRunnerHttpStream {
     let (tx, rx) = mpsc::channel(32);
     tokio::spawn(async move {
-        produce_task_runner_stream(process, body, tx).await;
+        produce_task_runner_stream(process, body, tx, task_name, request_id).await;
     });
     ReceiverStream::new(rx)
 }
@@ -435,7 +506,14 @@ async fn produce_task_runner_stream(
     process: task_runner::StreamingTask,
     body: Body,
     tx: mpsc::Sender<std::result::Result<Bytes, Infallible>>,
+    task_name: String,
+    request_id: String,
 ) {
+    tracing::debug!(
+        task = %task_name,
+        request_id = %request_id,
+        "task-runner CLI stream started",
+    );
     let task_runner::StreamingTask {
         stdin,
         stdout,
@@ -461,10 +539,20 @@ async fn produce_task_runner_stream(
     let mut input_finished = false;
     let mut exit_result = None;
     let mut stream_error = None;
+    let mut heartbeat = tokio::time::interval(TASK_RUNNER_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` ticks immediately on its first call; consume that tick so
+    // the first keepalive is sent after the configured idle interval.
+    heartbeat.tick().await;
 
     while finished_readers < 2 || !input_finished || exit_result.is_none() {
         tokio::select! {
             _ = tx.closed() => {
+                tracing::warn!(
+                    task = %task_name,
+                    request_id = %request_id,
+                    "task-runner CLI client disconnected",
+                );
                 input_task.abort();
                 stdout_task.abort();
                 stderr_task.abort();
@@ -479,6 +567,11 @@ async fn produce_task_runner_stream(
                             "stream": stream.as_str(),
                             "data": base64::engine::general_purpose::STANDARD.encode(bytes),
                         })).await {
+                            tracing::warn!(
+                                task = %task_name,
+                                request_id = %request_id,
+                                "task-runner CLI response stream closed while sending output",
+                            );
                             input_task.abort();
                             stdout_task.abort();
                             stderr_task.abort();
@@ -509,11 +602,34 @@ async fn produce_task_runner_stream(
                     Err(error) => Err(format!("task wait failed: {error}")),
                 });
             }
+            _ = heartbeat.tick() => {
+                if !send_task_runner_frame(&tx, json!({"type": "keepalive"})).await {
+                    tracing::warn!(
+                        task = %task_name,
+                        request_id = %request_id,
+                        "task-runner CLI response stream closed while sending keepalive",
+                    );
+                    input_task.abort();
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    wait_task.abort();
+                    return;
+                }
+            }
         }
     }
 
     stdout_task.abort();
     stderr_task.abort();
+
+    if let Some(message) = &stream_error {
+        tracing::warn!(
+            task = %task_name,
+            request_id = %request_id,
+            error = %message,
+            "task-runner CLI stream encountered an I/O error",
+        );
+    }
 
     if let Some(message) = stream_error
         && !send_task_runner_frame(
@@ -535,6 +651,12 @@ async fn produce_task_runner_stream(
     let (code, success) = match exit_result.expect("task wait must complete") {
         Ok(status) => (status.code(), status.success()),
         Err(message) => {
+            tracing::error!(
+                task = %task_name,
+                request_id = %request_id,
+                error = %message,
+                "task-runner CLI task wait failed",
+            );
             if !send_task_runner_frame(
                 &tx,
                 json!({
@@ -562,6 +684,13 @@ async fn produce_task_runner_stream(
         }),
     )
     .await;
+    tracing::info!(
+        task = %task_name,
+        request_id = %request_id,
+        code = ?code,
+        success,
+        "task-runner CLI task finished",
+    );
 }
 
 async fn forward_task_runner_stdin(
@@ -2329,7 +2458,12 @@ mod tests {
             Ok::<_, Infallible>(Bytes::from_static(b"hello ")),
             Ok::<_, Infallible>(Bytes::from_static(b"stream\n")),
         ]));
-        let mut stream = stream_task_runner_process(process, body);
+        let mut stream = stream_task_runner_process(
+            process,
+            body,
+            "stream".to_string(),
+            "test-request".to_string(),
+        );
         let mut body = Vec::new();
         while let Some(Ok(chunk)) = futures::StreamExt::next(&mut stream).await {
             body.extend_from_slice(&chunk);
