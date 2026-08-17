@@ -595,7 +595,7 @@ fn should_explain_config_instead_of_tui(cli: &Cli) -> bool {
 
 async fn run_cmd(
     agent_override: Option<AgentKind>,
-    rebuild_image: bool,
+    rebuild_images: bool,
     tmux: bool,
     bedrock_profile: Option<String>,
     bedrock_region: Option<String>,
@@ -608,7 +608,7 @@ async fn run_cmd(
         .unwrap_or_else(|| agent_kind_from_default(merged_settings.general.default_agent()));
 
     let image_task = tokio::spawn(async move {
-        docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
+        docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_images)
             .await
             .context("failed to build or locate container images")
     });
@@ -981,10 +981,10 @@ fn validate_tmux_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> {
+async fn shell_cmd(rebuild_images: bool, passthrough: Vec<String>) -> Result<()> {
     let host = paths::HostPaths::detect()?;
     let image_task = tokio::spawn(async move {
-        docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_image)
+        docker::ensure_images(&docker::default_dockerfile_dir(), rebuild_images)
             .await
             .context("failed to build or locate container images")
     });
@@ -1103,11 +1103,11 @@ async fn shell_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> 
     std::process::exit(exit);
 }
 
-async fn exec_cmd(rebuild_image: bool, passthrough: Vec<String>) -> Result<()> {
+async fn exec_cmd(rebuild_images: bool, passthrough: Vec<String>) -> Result<()> {
     if passthrough.is_empty() {
         bail!("agent-container exec requires a command after `--`");
     }
-    shell_cmd(rebuild_image, passthrough).await
+    shell_cmd(rebuild_images, passthrough).await
 }
 
 struct PreparedAuths {

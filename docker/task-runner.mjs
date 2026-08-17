@@ -82,6 +82,11 @@ function openRequest(target, method, headers = {}) {
     port: proxy?.port || target.port || undefined,
     method,
     path: requestTarget,
+    // The metadata GET is followed immediately by the streaming POST. A
+    // proxy may close the GET socket after its response, so do not let
+    // Node's global Agent put that socket back in its pool and reuse it
+    // before the close notification has arrived.
+    agent: false,
     headers: {
       Host: target.host,
       ...headers,

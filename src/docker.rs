@@ -24,15 +24,20 @@ const OWNER_LABEL: &str = "dev.statiolake.agent-container";
 const PROJECT_LABEL: &str = "dev.statiolake.agent-container.project";
 const OWNER_PID_LABEL: &str = "dev.statiolake.agent-container.owner-pid";
 
-/// Build required images. The agent image can be force-built on demand;
-/// the proxy image is still only built when missing.
-pub async fn ensure_images(dockerfile_dir: &Path, rebuild_agent: bool) -> Result<()> {
-    ensure_one(AGENT_IMAGE_TAG, dockerfile_dir, "Dockerfile", rebuild_agent).await?;
+/// Build required images, optionally forcing both images to rebuild.
+pub async fn ensure_images(dockerfile_dir: &Path, rebuild_images: bool) -> Result<()> {
+    ensure_one(
+        AGENT_IMAGE_TAG,
+        dockerfile_dir,
+        "Dockerfile",
+        rebuild_images,
+    )
+    .await?;
     ensure_one(
         PROXY_IMAGE_TAG,
         &dockerfile_dir.join("proxy"),
         "Dockerfile",
-        false,
+        rebuild_images,
     )
     .await?;
     Ok(())

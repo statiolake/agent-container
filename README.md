@@ -102,7 +102,7 @@ The container images (`agent-container:dev` and
 agent-container run                         # Claude Code
 agent-container run --agent codex           # Codex
 agent-container run --agent cursor          # Cursor Agent with --yolo
-agent-container run --rebuild-image         # rebuild agent-container:dev first
+agent-container run --rebuild-image         # rebuild agent and proxy images first
 agent-container run --tmux                  # run the agent inside tmux
 agent-container run --agent codex -- exec "what does this repo do?"
 ```

@@ -24,9 +24,8 @@ pub enum Commands {
         /// call the other one from inside.
         #[arg(long, value_enum)]
         agent: Option<AgentKind>,
-        /// Rebuild the agent container image before starting, even if it
-        /// already exists locally. The proxy image is still built only if
-        /// missing.
+        /// Rebuild the agent and proxy container images before starting,
+        /// even if they already exist locally.
         #[arg(long)]
         rebuild_image: bool,
         /// Run the agent inside tmux. Without this flag, the agent binary is
@@ -52,8 +51,8 @@ pub enum Commands {
     /// binary so you can poke at the filesystem, curl endpoints, etc.
     #[command(long_about = SHELL_HELP)]
     Shell {
-        /// Rebuild the agent container image before starting the shell,
-        /// even if it already exists locally.
+        /// Rebuild the agent and proxy container images before starting the
+        /// shell, even if they already exist locally.
         #[arg(long)]
         rebuild_image: bool,
         /// Optional command to exec inside bash instead of dropping to a
@@ -65,8 +64,8 @@ pub enum Commands {
     /// Run a non-interactive command in the container and tear it down.
     #[command(hide = true)]
     Exec {
-        /// Rebuild the agent container image before starting, even if it
-        /// already exists locally.
+        /// Rebuild the agent and proxy container images before starting,
+        /// even if they already exist locally.
         #[arg(long)]
         rebuild_image: bool,
         /// Command to run inside bash. Must appear after `--`.
